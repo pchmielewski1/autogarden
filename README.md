@@ -52,6 +52,16 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 - **Daily heartbeat report** — automated snapshot with sensor readings, water budget, and trends.
 - **Reconnect with backoff** — Wi-Fi auto-reconnects (5 s → 5 min exponential backoff), never blocks the watering task.
 
+### Implementation Status
+| Area | Status |
+|---|---|
+| Core watering FSM + pump safety | Implemented |
+| Multi-task runtime (Control/UI/Net/Config) | Implemented |
+| Config + runtime persistence (NVS) | Implemented |
+| Captive portal provisioning (embedded HTML) | Implemented |
+| Telegram command handling | Partial (stubs present) |
+| NTP-based scheduling helpers | Partial (fallback active) |
+
 ### Configuration & Persistence
 - **NVS storage** — all settings persist across reboots (mode, profiles, reservoir, vacation, calibration).
 - **Schema versioning** — automatic migration on firmware update; safe fallback to defaults on mismatch.
@@ -182,15 +192,13 @@ All settings are accessible from the on-device **Settings screen** (press BtnA t
 ```
 autogarden/
 ├── platformio.ini          # PlatformIO build configuration
-├── data/
-│   └── portal.html         # Captive portal page for WiFi provisioning
 └── src/
     ├── main.cpp            # Boot, FreeRTOS tasks, tick orchestration
     ├── config.h / .cpp     # Configuration structs, NVS persistence, plant profiles
     ├── hardware.h / .cpp   # All hardware drivers (PbHUB, sensors, actuators)
     ├── watering.h / .cpp   # Watering FSM, scheduling, safety, water budget
     ├── ui.h / .cpp         # LCD GUI rendering, button handling, settings
-    ├── network.h / .cpp    # WiFi, Telegram bot, AP mode, captive portal
+    ├── network.h / .cpp    # WiFi, Telegram bot, AP mode, captive portal (embedded HTML)
     ├── analysis.h / .cpp   # EMA filters, trend analysis, dusk/dawn detector, solar clock
     └── events.h            # Event types and FreeRTOS event queue
 ```

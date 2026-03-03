@@ -463,7 +463,13 @@ bool PumpActuator::on(uint32_t nowMs, uint32_t plannedDurationMs) {
 
 bool PumpActuator::off(uint32_t nowMs, const char* reason) {
     if (!_isOn && !reason) return true;  // już OFF
-    if (_bus) _bus->digitalWrite(_channel, _pin, false);
+    if (_bus) {
+        if (!_bus->digitalWrite(_channel, _pin, false)) {
+            Serial.printf("[PUMP] CH%d.pin%d OFF failed reason=%s\n",
+                          _channel, _pin, reason ? reason : "none");
+            return false;
+        }
+    }
     uint32_t dur = _isOn ? (nowMs - _onSinceMs) : 0;
     _isOn = false;
     Serial.printf("[PUMP] CH%d.pin%d OFF reason=%s duration=%dms\n",

@@ -67,6 +67,20 @@ NetworkState    g_netState;
 static SemaphoreHandle_t s_snapMutex = nullptr;
 static SensorSnapshot    s_latestSnap;
 
+struct SharedState {
+    Config        config;
+    NetConfig     netConfig;
+    WaterBudget   budget;
+    WateringCycle cycles[kMaxPots];
+    TrendState    trends[kMaxPots];
+    DuskPhase     duskPhase = DuskPhase::NIGHT;
+    bool          wifiConnected = false;
+    uint8_t       selectedPot = 0;
+};
+
+static SemaphoreHandle_t s_stateMutex = nullptr;
+static SharedState       s_sharedState;
+
 // Config save request — debounced
 static QueueHandle_t     s_saveQueue = nullptr;
 
@@ -88,6 +102,42 @@ static SensorSnapshot readSnapshot() {
         xSemaphoreGive(s_snapMutex);
     }
     return snap;
+}
+
+static void publishSharedStateFromControl() {
+    if (xSemaphoreTake(s_stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        s_sharedState.config = g_config;
+        s_sharedState.netConfig = g_netConfig;
+        s_sharedState.budget = g_budget;
+        memcpy(s_sharedState.cycles, g_cycles, sizeof(g_cycles));
+        memcpy(s_sharedState.trends, g_trendStates, sizeof(g_trendStates));
+        s_sharedState.duskPhase = g_duskDetector.phase;
+        xSemaphoreGive(s_stateMutex);
+    }
+}
+
+static void publishSharedNetStatus(bool wifiConnected) {
+    if (xSemaphoreTake(s_stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        s_sharedState.netConfig = g_netConfig;
+        s_sharedState.wifiConnected = wifiConnected;
+        xSemaphoreGive(s_stateMutex);
+    }
+}
+
+static SharedState readSharedState() {
+    SharedState state{};
+    if (xSemaphoreTake(s_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        state = s_sharedState;
+        xSemaphoreGive(s_stateMutex);
+    }
+    return state;
+}
+
+static void setSelectedPotFromUi(uint8_t selectedPot) {
+    if (xSemaphoreTake(s_stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        s_sharedState.selectedPot = selectedPot;
+        xSemaphoreGive(s_stateMutex);
+    }
 }
 
 // ============================================================================
@@ -121,7 +171,10 @@ static void configTaskFn(void* /*param*/) {
 // Helper: kolejkuj zapis configu (nie blokuje)
 static void requestConfigSave(const Config& cfg) {
     if (s_saveQueue) {
-        xQueueOverwrite(s_saveQueue, &cfg);
+        if (xQueueSend(s_saveQueue, &cfg, 0) != pdTRUE) {
+            xQueueReset(s_saveQueue);
+            xQueueSend(s_saveQueue, &cfg, 0);
+        }
     }
 }
 
@@ -196,6 +249,21 @@ static void saveRuntimeNow(uint32_t& lastSaveMs) {
     }
     s_runtimeDirty = false;
     lastSaveMs = millis();
+}
+
+static bool forcePumpOffWithRetry(uint8_t potIdx, uint32_t nowMs,
+                                  const char* reason,
+                                  uint8_t retries = 3) {
+    PumpActuator& pump = g_hardware.pump(potIdx);
+    for (uint8_t attempt = 0; attempt < retries; ++attempt) {
+        if (pump.off(nowMs, reason)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    Serial.printf("[POT%d] SAFETY_BLOCK reason=pump_off_failed src=%s\n",
+                  potIdx, reason ? reason : "unknown");
+    return false;
 }
 
 // ============================================================================
@@ -311,8 +379,9 @@ static void controlTaskFn(void* /*param*/) {
             lastTick10ms = now;
             // 10ms: odczyt Dual Button, manual pump
             DualButtonState dualBtn = g_hardware.dualButton().read(now);
+            SharedState shared = readSharedState();
             manualPumpTick(now, dualBtn, snap, g_config, g_manual,
-                           g_uiState.selectedPot, g_budget, g_hardware);
+                           shared.selectedPot, g_budget, g_hardware);
         }
 
         if (now - lastTick100ms >= 100) {
@@ -347,7 +416,7 @@ static void controlTaskFn(void* /*param*/) {
                     if (g_cycles[i].phase != WateringPhase::IDLE) {
                         if (g_cycles[i].phase == WateringPhase::PULSE &&
                             g_hardware.pump(i).isOn()) {
-                            g_hardware.pump(i).off(now, "mode_switch");
+                            forcePumpOffWithRetry(i, now, "mode_switch");
                         }
                         Serial.printf("[POT%d] CYCLE_ABORT reason=mode_switch phase=%d\n",
                                       i, static_cast<int>(g_cycles[i].phase));
@@ -360,7 +429,7 @@ static void controlTaskFn(void* /*param*/) {
             for (uint8_t i = 0; i < g_config.numPots; ++i) {
                 PumpActuator& p = g_hardware.pump(i);
                 if (p.isOn() && p.onDuration(now) > g_config.pumpOnMsMax) {
-                    p.off(now, "HW_SAFETY_TIMEOUT");
+                    forcePumpOffWithRetry(i, now, "HW_SAFETY_TIMEOUT");
                     Serial.printf("[POT%d] HW_SAFETY: pump forced off after %dms\n",
                                   i, p.onDuration(now));
                 }
@@ -368,6 +437,8 @@ static void controlTaskFn(void* /*param*/) {
 
             // Budżet rezerwuaru
             updateWaterBudget(now, snap, g_budget, g_config);
+
+            publishSharedStateFromControl();
 
             // ── Runtime state save triggers ──
             // Immediate save when water was pumped (budget changed materially)
@@ -413,17 +484,31 @@ static void controlTaskFn(void* /*param*/) {
             // Sensor history
             SensorSample sample{};
             sample.timestampMs = now;
-            sample.moistureRaw = snap.pots[0].moistureRaw;  // TODO: per-pot history
+            uint32_t rawSum = 0;
+            uint8_t rawCount = 0;
+            bool anyOverflow = false;
+            for (uint8_t pi = 0; pi < g_config.numPots; ++pi) {
+                if (!g_config.pots[pi].enabled) continue;
+                rawSum += snap.pots[pi].moistureRaw;
+                rawCount++;
+                if (snap.pots[pi].waterGuards.potMax == WaterLevelState::TRIGGERED) {
+                    anyOverflow = true;
+                }
+            }
+            sample.moistureRaw = (rawCount > 0)
+                ? static_cast<uint16_t>(rawSum / rawCount)
+                : 0;
             sample.tempC_x10  = (int16_t)(snap.env.tempC * 10);
             sample.lux         = (uint16_t)fminf(snap.env.lux, 65535.0f);
             sample.flags       = 0;
             if (g_budget.reservoirLow)          sample.flags |= 0x01;
-            if (snap.pots[0].waterGuards.potMax == WaterLevelState::TRIGGERED)
-                                                sample.flags |= 0x02;
+            if (anyOverflow)                    sample.flags |= 0x02;
             for (uint8_t i = 0; i < kMaxPots; ++i) {
                 if (g_hardware.pump(i).isOn())  sample.flags |= 0x04;
             }
             historyTick(now, sample, g_history);
+
+            publishSharedStateFromControl();
         }
 
         // ==================== 30s PERIODIC STATUS DUMP ====================
@@ -558,9 +643,10 @@ static void controlTaskFn(void* /*param*/) {
         // Independent heartbeat via ESP logger (same path as WiFiGeneric logs)
         if (now - lastEspAliveLog >= 10000) {
             lastEspAliveLog = now;
+            SharedState shared = readSharedState();
             ESP_LOGI(kLogTag, "ctrl alive, mode=%s, wifi=%s, heap=%u",
                      g_config.mode == Mode::AUTO ? "AUTO" : "MANUAL",
-                     g_netState.wifiConnected ? "up" : "down",
+                     shared.wifiConnected ? "up" : "down",
                      (unsigned)ESP.getFreeHeap());
         }
 
@@ -569,9 +655,10 @@ static void controlTaskFn(void* /*param*/) {
         while (g_eventQueue.pop(evt, 0)) {
             switch (evt.type) {
                 case EventType::REQUEST_SET_MODE:
-                    g_config.mode = static_cast<Mode>(evt.payload.config.key);
+                    g_config.mode = static_cast<Mode>(evt.payload.config.valueU16);
                     requestConfigSave(g_config);
                     Serial.printf("[CTRL] mode=%d\n", (int)g_config.mode);
+                    publishSharedStateFromControl();
                     break;
 
                 case EventType::REQUEST_SET_PLANT: {
@@ -581,6 +668,7 @@ static void controlTaskFn(void* /*param*/) {
                         g_config.pots[pot].plantProfileIndex = prof;
                         requestConfigSave(g_config);
                         Serial.printf("[CTRL] pot%d profile=%d\n", pot, prof);
+                        publishSharedStateFromControl();
                     }
                     break;
                 }
@@ -595,6 +683,7 @@ static void controlTaskFn(void* /*param*/) {
                             g_config.pots[i].enabled = false;
                         requestConfigSave(g_config);
                         Serial.printf("[CTRL] numPots=%d\n", n);
+                        publishSharedStateFromControl();
                     }
                     break;
                 }
@@ -606,7 +695,42 @@ static void controlTaskFn(void* /*param*/) {
                         g_budget.reservoirCapacityMl = cap;
                         requestConfigSave(g_config);
                         Serial.printf("[CTRL] reservoir=%.0f ml\n", cap);
+                        publishSharedStateFromControl();
                     }
+                    break;
+                }
+
+                case EventType::REQUEST_SET_RESERVOIR_LOW: {
+                    float low = evt.payload.config.valueF;
+                    if (low >= 100.0f && low < g_config.reservoirCapacityMl) {
+                        g_config.reservoirLowThresholdMl = low;
+                        g_budget.reservoirLowThresholdMl = low;
+                        requestConfigSave(g_config);
+                        Serial.printf("[CTRL] reservoir_low=%.0f ml\n", low);
+                        publishSharedStateFromControl();
+                    }
+                    break;
+                }
+
+                case EventType::REQUEST_SET_PULSE_ML: {
+                    uint16_t pulseMl = evt.payload.config.valueU16;
+                    if (pulseMl >= 10 && pulseMl <= 100) {
+                        for (uint8_t pi = 0; pi < kMaxPots; ++pi) {
+                            g_config.pots[pi].pulseWaterMl = pulseMl;
+                        }
+                        requestConfigSave(g_config);
+                        Serial.printf("[CTRL] pulse=%uml\n", pulseMl);
+                        publishSharedStateFromControl();
+                    }
+                    break;
+                }
+
+                case EventType::REQUEST_SET_VACATION: {
+                    bool enable = evt.payload.config.valueU16 != 0;
+                    handleVacationToggle(enable, g_config);
+                    requestConfigSave(g_config);
+                    Serial.printf("[CTRL] vacation=%d\n", g_config.vacationMode);
+                    publishSharedStateFromControl();
                     break;
                 }
 
@@ -615,12 +739,21 @@ static void controlTaskFn(void* /*param*/) {
                     s_runtimeDirty = true;
                     saveRuntimeNow(lastRuntimeSave);
                     Serial.println("[CTRL] reservoir refilled + runtime saved");
+                    publishSharedStateFromControl();
                     break;
 
                 case EventType::REQUEST_VACATION_TOGGLE:
                     handleVacationToggle(!g_config.vacationMode, g_config);
                     requestConfigSave(g_config);
                     Serial.printf("[CTRL] vacation=%d\n", g_config.vacationMode);
+                    publishSharedStateFromControl();
+                    break;
+
+                case EventType::REQUEST_START_WIFI_SETUP:
+                    if (!g_netState.apActive) {
+                        startApNonBlocking(g_netConfig, g_netState);
+                        publishSharedNetStatus(g_netState.wifiConnected);
+                    }
                     break;
 
                 case EventType::SYSTEM_FACTORY_RESET:
@@ -640,6 +773,7 @@ static void controlTaskFn(void* /*param*/) {
                         }
                     }
                     requestConfigSave(g_config);
+                    publishSharedStateFromControl();
                     break;
 
                 default:
@@ -716,13 +850,96 @@ static void checkFactoryReset(uint32_t nowMs) {
     }
 }
 
+static void dispatchUiSettingsChanges(const Config& beforeCfg,
+                                      const Config& afterCfg,
+                                      const WaterBudget& beforeBudget,
+                                      const WaterBudget& afterBudget,
+                                      bool changed) {
+    bool anyRequest = false;
+    Event evt{};
+
+    if (beforeCfg.numPots != afterCfg.numPots) {
+        evt.type = EventType::REQUEST_SET_NUM_POTS;
+        evt.payload.config.valueU16 = afterCfg.numPots;
+        g_eventQueue.push(evt);
+        anyRequest = true;
+    }
+
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        if (beforeCfg.pots[i].plantProfileIndex != afterCfg.pots[i].plantProfileIndex) {
+            evt = Event{};
+            evt.type = EventType::REQUEST_SET_PLANT;
+            evt.payload.config.key = i;
+            evt.payload.config.valueU16 = afterCfg.pots[i].plantProfileIndex;
+            g_eventQueue.push(evt);
+            anyRequest = true;
+        }
+    }
+
+    if (beforeCfg.reservoirCapacityMl != afterCfg.reservoirCapacityMl) {
+        evt = Event{};
+        evt.type = EventType::REQUEST_SET_RESERVOIR;
+        evt.payload.config.valueF = afterCfg.reservoirCapacityMl;
+        g_eventQueue.push(evt);
+        anyRequest = true;
+    }
+
+    if (beforeCfg.reservoirLowThresholdMl != afterCfg.reservoirLowThresholdMl) {
+        evt = Event{};
+        evt.type = EventType::REQUEST_SET_RESERVOIR_LOW;
+        evt.payload.config.valueF = afterCfg.reservoirLowThresholdMl;
+        g_eventQueue.push(evt);
+        anyRequest = true;
+    }
+
+    if (beforeCfg.pots[0].pulseWaterMl != afterCfg.pots[0].pulseWaterMl) {
+        evt = Event{};
+        evt.type = EventType::REQUEST_SET_PULSE_ML;
+        evt.payload.config.valueU16 = afterCfg.pots[0].pulseWaterMl;
+        g_eventQueue.push(evt);
+        anyRequest = true;
+    }
+
+    if (beforeCfg.mode != afterCfg.mode) {
+        evt = Event{};
+        evt.type = EventType::REQUEST_SET_MODE;
+        evt.payload.config.valueU16 = static_cast<uint16_t>(afterCfg.mode);
+        g_eventQueue.push(evt);
+        anyRequest = true;
+    }
+
+    if (beforeCfg.vacationMode != afterCfg.vacationMode) {
+        evt = Event{};
+        evt.type = EventType::REQUEST_SET_VACATION;
+        evt.payload.config.valueU16 = afterCfg.vacationMode ? 1 : 0;
+        g_eventQueue.push(evt);
+        anyRequest = true;
+    }
+
+    if (beforeBudget.totalPumpedMl != afterBudget.totalPumpedMl &&
+        afterBudget.totalPumpedMl == 0.0f) {
+        evt = Event{};
+        evt.type = EventType::REQUEST_REFILL;
+        g_eventQueue.push(evt);
+        anyRequest = true;
+    }
+
+    if (changed && !anyRequest) {
+        evt = Event{};
+        evt.type = EventType::REQUEST_START_WIFI_SETUP;
+        g_eventQueue.push(evt);
+    }
+}
+
 static void uiTaskFn(void* /*param*/) {
     Serial.println("[UI] started");
     uiInit();
+    setSelectedPotFromUi(g_uiState.selectedPot);
 
     for (;;) {
         uint32_t now = millis();
         M5.update();
+        SharedState shared = readSharedState();
 
         // --- Factory reset check ---
         checkFactoryReset(now);
@@ -750,17 +967,19 @@ static void uiTaskFn(void* /*param*/) {
                 g_uiState.settingsIndex = 0;
             } else {
                 // W Settings: zmień wartość (select)
-                bool changed = uiHandleBtnBLong(g_uiState, g_config, g_budget);
-                if (changed) {
-                    g_eventQueue.push(Event{EventType::CONFIG_SAVE_REQUEST});
-                }
+                Config editedCfg = shared.config;
+                WaterBudget editedBudget = shared.budget;
+                bool changed = uiHandleBtnBLong(g_uiState, editedCfg, editedBudget);
+                dispatchUiSettingsChanges(shared.config, editedCfg,
+                                          shared.budget, editedBudget, changed);
             }
             g_uiState.needsRedraw = true;
         }
 
         // BtnB: nawigacja (w Settings: następna opcja, w MAIN: przełącz widok)
         if (M5.BtnB.wasClicked()) {
-            uiHandleBtnB(g_uiState, g_config);
+            uiHandleBtnB(g_uiState, shared.config);
+            setSelectedPotFromUi(g_uiState.selectedPot);
             g_uiState.needsRedraw = true;
         }
 
@@ -769,10 +988,11 @@ static void uiTaskFn(void* /*param*/) {
         if (M5.BtnB.pressedFor(800) && !s_btnBLongHandled) {
             s_btnBLongHandled = true;
             if (g_uiState.screen == UiScreen::SETTINGS) {
-                bool changed = uiHandleBtnBLong(g_uiState, g_config, g_budget);
-                if (changed) {
-                    g_eventQueue.push(Event{EventType::CONFIG_SAVE_REQUEST});
-                }
+                Config editedCfg = shared.config;
+                WaterBudget editedBudget = shared.budget;
+                bool changed = uiHandleBtnBLong(g_uiState, editedCfg, editedBudget);
+                dispatchUiSettingsChanges(shared.config, editedCfg,
+                                          shared.budget, editedBudget, changed);
                 g_uiState.needsRedraw = true;
             }
         }
@@ -787,12 +1007,12 @@ static void uiTaskFn(void* /*param*/) {
             // Zbuduj UiSnap
             UiSnap uSnap{};
             uSnap.sensors       = readSnapshot();
-            memcpy(uSnap.cycles, g_cycles, sizeof(g_cycles));
-            uSnap.budget        = g_budget;
-            uSnap.config        = g_config;
-            uSnap.netConfig     = g_netConfig;
-            uSnap.duskPhase     = g_duskDetector.phase;
-            uSnap.wifiConnected = g_netState.wifiConnected;
+            memcpy(uSnap.cycles, shared.cycles, sizeof(shared.cycles));
+            uSnap.budget        = shared.budget;
+            uSnap.config        = shared.config;
+            uSnap.netConfig     = shared.netConfig;
+            uSnap.duskPhase     = shared.duskPhase;
+            uSnap.wifiConnected = shared.wifiConnected;
 
             uiTick(now, g_uiState, uSnap);
         }
@@ -814,16 +1034,18 @@ static void netTaskFn(void* /*param*/) {
         uint32_t now = millis();
 
         netTaskTick(now, g_netState, g_netConfig);
+        publishSharedNetStatus(g_netState.wifiConnected);
 
         // Heartbeat check
         if (g_netState.wifiConnected && g_netState.telegramEnabled) {
+            SharedState shared = readSharedState();
             if (isDailyHeartbeatTime(now, g_solarClock, g_duskDetector,
                                      false /* NTP TODO */, g_netState)) {
                 DailyReportData rptData{};
                 rptData.sensors  = readSnapshot();
-                rptData.budget   = g_budget;
-                memcpy(rptData.trends, g_trendStates, sizeof(g_trendStates));
-                rptData.config   = g_config;
+                rptData.budget   = shared.budget;
+                memcpy(rptData.trends, shared.trends, sizeof(shared.trends));
+                rptData.config   = shared.config;
                 rptData.uptimeMs = now;
 
                 char buf[512];
@@ -916,20 +1138,7 @@ void setup() {
         Serial.println("[BOOT] WiFi provisioned — trying quick connect...");
         WiFi.mode(WIFI_STA);
         WiFi.begin(g_netConfig.wifiSsid, g_netConfig.wifiPass);
-
-        // Krótki timeout — max 8s, nie blokuj dłużej
-        uint32_t wifiDeadline = millis() + 8000;
-        while (WiFi.status() != WL_CONNECTED && millis() < wifiDeadline) {
-            delay(100);
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-            g_netState.wifiConnected = true;
-            MDNS.begin("autogarden");
-            Serial.printf("[BOOT] WiFi OK: %s\n", WiFi.localIP().toString().c_str());
-        } else {
-            Serial.println("[BOOT] WiFi not connected — will retry in NetTask");
-            WiFi.disconnect();
-        }
+        Serial.println("[BOOT] WiFi connect started — continue boot (NetTask handles retries)");
     } else {
         Serial.println("[BOOT] WiFi not provisioned — offline mode");
         Serial.println("[BOOT] Configure WiFi from Settings > WiFi");
@@ -945,7 +1154,12 @@ void setup() {
     // --- Inicjalizacja eventów i synchronizacji ---
     g_eventQueue.init();
     s_snapMutex = xSemaphoreCreateMutex();
-    s_saveQueue = xQueueCreate(1, sizeof(Config));  // overwrite queue (1 slot)
+    s_stateMutex = xSemaphoreCreateMutex();
+    s_saveQueue = xQueueCreate(8, sizeof(Config));
+
+    // Initial shared snapshot
+    publishSharedStateFromControl();
+    publishSharedNetStatus(false);
 
     Serial.println("[BOOT] creating FreeRTOS tasks...");
 

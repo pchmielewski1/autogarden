@@ -887,18 +887,8 @@ bool uiHandleBtnBLong(UiState& state, Config& cfg, WaterBudget& budget) {
         changed = true;
         break;
     case 8: {
-        Serial.println("SETTINGS WiFi setup");
-        M5.Display.fillScreen(COL_BG);
-        M5.Display.setTextColor(COL_TEXT);
-        M5.Display.setTextSize(1);
-        M5.Display.setCursor(5, 20);
-        M5.Display.println("WiFi Setup");
-        M5.Display.println("AP: autogarden");
-        M5.Display.println("192.168.4.1");
-        M5.Display.println("");
-        M5.Display.println("Auto-off: 5 min");
-        extern NetConfig g_netConfig;
-        enterApMode(g_netConfig);
+        Serial.println("SETTINGS WiFi setup request");
+        changed = true;  // handled event-driven in ControlTask
         break;
     }
     case 9:

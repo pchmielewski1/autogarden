@@ -311,6 +311,24 @@ bool runtimeStateLoad(RuntimeState& rs) {
 // Helper: aktywny profil per-pot
 // ---------------------------------------------------------------------------
 const PlantProfile& getActiveProfile(const Config& cfg, uint8_t potIdx) {
-    // TODO: jeśli plantProfileIndex == CUSTOM, zbuduj profil z custom overrides
-    return kProfiles[cfg.pots[potIdx].plantProfileIndex];
+    const PotConfig& pot = cfg.pots[potIdx];
+    uint8_t idx = pot.plantProfileIndex;
+    if (idx >= kNumProfiles) idx = 0;
+
+    // Custom profile runtime materialization (index 5)
+    if (idx == (kNumProfiles - 1)) {
+        static PlantProfile s_custom[kMaxPots];
+        PlantProfile custom = kProfiles[idx];
+        custom.targetMoisturePct = pot.customTargetPct;
+        custom.criticalLowPct = pot.customCriticalLowPct;
+        custom.maxMoisturePct = pot.customMaxMoisturePct;
+        custom.hysteresisPct = pot.customHysteresisPct;
+        custom.soakTimeMs = pot.customSoakTimeMs;
+        custom.pulseWaterMl = pot.customPulseWaterMl;
+        custom.maxPulsesPerCycle = pot.customMaxPulsesPerCycle;
+        s_custom[potIdx] = custom;
+        return s_custom[potIdx];
+    }
+
+    return kProfiles[idx];
 }

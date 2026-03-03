@@ -512,17 +512,24 @@ void duskBootstrap(DuskDetector& det, float lux) {
 // ===========================================================================
 void updateSolarClock(const DuskDetector& det, SolarClock& clk) {
     if (det.dayLengthMs > 0 && det.nightLengthMs > 0) {
+        bool transitionUpdated = (det.lastDawnMs != clk.lastDawnMs) ||
+                                 (det.lastDuskMs != clk.lastDuskMs);
+
         clk.dayLengthMs   = det.dayLengthMs;
         clk.nightLengthMs = det.nightLengthMs;
         clk.estimatedDayMs = clk.dayLengthMs + clk.nightLengthMs;
-        clk.lastDawnMs = det.lastDawnMs;
-        clk.lastDuskMs = det.lastDuskMs;
+        if (transitionUpdated) {
+            clk.lastDawnMs = det.lastDawnMs;
+            clk.lastDuskMs = det.lastDuskMs;
+            if (det.lastDawnMs > 0 && det.lastDuskMs > 0) {
+                clk.cycleCount++;
+            }
+            Serial.printf("SOLAR_CLOCK day=%dh%dm night=%dh%dm cycle=%d\n",
+                          clk.dayLengthMs / 3600000, (clk.dayLengthMs / 60000) % 60,
+                          clk.nightLengthMs / 3600000, (clk.nightLengthMs / 60000) % 60,
+                          clk.cycleCount);
+        }
         clk.calibrated = true;
-        clk.cycleCount++;
-        Serial.printf("SOLAR_CLOCK day=%dh%dm night=%dh%dm cycle=%d\n",
-                      clk.dayLengthMs / 3600000, (clk.dayLengthMs / 60000) % 60,
-                      clk.nightLengthMs / 3600000, (clk.nightLengthMs / 60000) % 60,
-                      clk.cycleCount);
     }
 }
 
@@ -578,6 +585,58 @@ template class RingBuffer<WateringRecord, 100>;
 // SensorHistory — tick + NVS flush
 // ===========================================================================
 void historyTick(uint32_t nowMs, const SensorSample& sample, SensorHistory& hist) {
+    auto averageLevel1Tail = [&](uint16_t samplesToAvg, SensorSample& out) -> bool {
+        uint16_t size = hist.level1.size();
+        if (size == 0) return false;
+        uint16_t n = std::min<uint16_t>(samplesToAvg, size);
+        uint32_t sumMoist = 0;
+        int32_t sumTemp = 0;
+        uint32_t sumLux = 0;
+        uint8_t flagsOr = 0;
+        uint32_t ts = 0;
+        for (uint16_t i = size - n; i < size; ++i) {
+            const auto& s = hist.level1.at(i);
+            sumMoist += s.moistureRaw;
+            sumTemp += s.tempC_x10;
+            sumLux += s.lux;
+            flagsOr |= s.flags;
+            ts = s.timestampMs;
+        }
+        out.timestampMs = ts;
+        out.moistureRaw = static_cast<uint16_t>(sumMoist / n);
+        out.tempC_x10 = static_cast<int16_t>(sumTemp / static_cast<int32_t>(n));
+        out.lux = static_cast<uint16_t>(sumLux / n);
+        out.flags = flagsOr;
+        out._pad = 0;
+        return true;
+    };
+
+    auto averageLevel2Tail = [&](uint16_t samplesToAvg, SensorSample& out) -> bool {
+        uint16_t size = hist.level2.size();
+        if (size == 0) return false;
+        uint16_t n = std::min<uint16_t>(samplesToAvg, size);
+        uint32_t sumMoist = 0;
+        int32_t sumTemp = 0;
+        uint32_t sumLux = 0;
+        uint8_t flagsOr = 0;
+        uint32_t ts = 0;
+        for (uint16_t i = size - n; i < size; ++i) {
+            const auto& s = hist.level2.at(i);
+            sumMoist += s.moistureRaw;
+            sumTemp += s.tempC_x10;
+            sumLux += s.lux;
+            flagsOr |= s.flags;
+            ts = s.timestampMs;
+        }
+        out.timestampMs = ts;
+        out.moistureRaw = static_cast<uint16_t>(sumMoist / n);
+        out.tempC_x10 = static_cast<int16_t>(sumTemp / static_cast<int32_t>(n));
+        out.lux = static_cast<uint16_t>(sumLux / n);
+        out.flags = flagsOr;
+        out._pad = 0;
+        return true;
+    };
+
     // Level 1: co 10 s
     if ((nowMs - hist.lastLevel1AddMs) >= 10000) {
         hist.level1.push(sample);
@@ -586,11 +645,11 @@ void historyTick(uint32_t nowMs, const SensorSample& sample, SensorHistory& hist
 
     // Level 2: co 5 min — downsample z level1
     if ((nowMs - hist.lastLevel2FlushMs) >= 300000) {
-        // Uśrednij ostatnie 30 próbek level1 (5 min / 10 s)
         if (!hist.level1.empty()) {
-            SensorSample avg = sample;  // fallback to current
-            // TODO(history): proper averaging of level1 tail
-            hist.level2.push(avg);
+            SensorSample avg = sample;
+            if (averageLevel1Tail(30, avg)) {
+                hist.level2.push(avg);
+            }
         }
         hist.lastLevel2FlushMs = nowMs;
     }
@@ -599,12 +658,11 @@ void historyTick(uint32_t nowMs, const SensorSample& sample, SensorHistory& hist
     if ((nowMs - hist.lastLevel3FlushMs) >= 3600000) {
         if (!hist.level2.empty()) {
             SensorSample avg = sample;
-            // TODO(history): proper averaging of level2 tail
-            hist.level3.push(avg);
+            if (averageLevel2Tail(12, avg)) {
+                hist.level3.push(avg);
+            }
         }
         hist.lastLevel3FlushMs = nowMs;
-
-        // TODO(history): flush level2/level3 to NVS (co 15 min / 1h)
     }
 }
 

@@ -52,28 +52,14 @@ struct NetworkState {
 };
 
 // ---------------------------------------------------------------------------
-// API — provisioning (wywoływane w setup() przed taskami)
-// ---------------------------------------------------------------------------
-
-// Sprawdź NetConfig i uruchom WiFi lub AP mode.
-// Jeśli AP mode → blokuje do momentu zapisu configu i ESP.restart().
-// Jeśli WiFi OK → zwraca true (kontynuuj boot).
-// Jeśli WiFi fail po 3 próbach → resetuje i restartuje.
-bool networkProvisioning(NetConfig& netCfg);
-
-// ---------------------------------------------------------------------------
 // API — provisioning helpers
 // ---------------------------------------------------------------------------
-void enterApMode(NetConfig& netCfg);
 
 // Non-blocking AP mode — startuje AP + captive portal, zwraca od razu.
 // apTick() musi być wywoływany w pętli NetTask.
 void startApNonBlocking(NetConfig& netCfg, NetworkState& ns);
 void apTick(NetworkState& ns);
 void stopAp(NetworkState& ns);
-
-bool tryConnectWifi(const NetConfig& netCfg, uint8_t maxRetries = 3,
-                    uint32_t timeoutPerRetryMs = 15000);
 
 // ---------------------------------------------------------------------------
 // API — NetTask tick (wywoływane w pętli NetTask)

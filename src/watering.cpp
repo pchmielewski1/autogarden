@@ -12,8 +12,11 @@
 #include "watering.h"
 #include <Arduino.h>   // Serial, millis
 #include <cstring>
+#include <algorithm>
 
 #include "analysis.h"
+
+extern SensorHistory g_history;
 
 // ===========================================================================
 // Helpers — lokalne
@@ -468,8 +471,18 @@ void wateringTick(uint32_t nowMs,
                           potIdx, cycle.pulseCount, cycle.totalPumpedMl,
                           cycle.moistureBeforeCycle, cycle.moistureAfterLastSoak);
 
-            // TODO(history): addWateringEvent do ring bufferu
-            // TODO(events): push WATERING_CYCLE_DONE event
+            WateringRecord rec{};
+            rec.timestampMs = nowMs;
+            rec.potIndex = potIdx;
+            rec.pulseCount = cycle.pulseCount;
+            rec.totalPumpedMl_x10 = static_cast<uint16_t>(
+                std::min(65535.0f, cycle.totalPumpedMl * 10.0f));
+            rec.moistureBefore_x10 = static_cast<uint16_t>(
+                std::min(65535.0f, cycle.moistureBeforeCycle * 10.0f));
+            rec.moistureAfter_x10 = static_cast<uint16_t>(
+                std::min(65535.0f, cycle.moistureAfterLastSoak * 10.0f));
+            rec.reason = 0;
+            historyAddWatering(g_history, rec);
 
             actuator.lastCycleDoneMs[potIdx] = nowMs;
             cycle.reset();
@@ -546,6 +559,9 @@ void manualPumpTick(uint32_t nowMs,
             // Anti-spam: rejestracja w historii
             if (manual.pressCount < ManualState::kMaxHistory) {
                 manual.pressHistory[manual.pressCount++] = nowMs;
+            } else {
+                // Saturated history still counts as spam pressure
+                manual.pressCount = ManualState::kMaxHistory;
             }
         }
 
@@ -612,7 +628,8 @@ void manualPumpTick(uint32_t nowMs,
     }
     manual.pressCount = newCount;
 
-    if (manual.pressCount > 10) {
+    constexpr uint8_t kSpamThreshold = 5;
+    if (manual.pressCount >= kSpamThreshold) {
         manual.locked = true;
         manual.lockUntilMs = nowMs + 20000;
         manual.blueHeldMs = 0;

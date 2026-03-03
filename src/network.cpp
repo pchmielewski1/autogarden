@@ -15,7 +15,6 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
-#include <M5Unified.h>
 
 // TODO(telegram): #include <UniversalTelegramBot.h>
 // TODO(telegram): #include <WiFiClientSecure.h>
@@ -193,87 +192,6 @@ static void handleSave() {
     ESP.restart();
 }
 
-// ---------------------------------------------------------------------------
-// enterApMode — blokuje do restartu
-// ---------------------------------------------------------------------------
-void enterApMode(NetConfig& netCfg) {
-    Serial.println("PROV state=AP_MODE");
-
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("autogarden", "");   // open, no password
-    WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
-                      IPAddress(192, 168, 4, 1),
-                      IPAddress(255, 255, 255, 0));
-
-    // DNS captive portal
-    static DNSServer dnsServer;
-    g_dnsServer = &dnsServer;
-    dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-
-    // mDNS backup
-    MDNS.begin("autogarden");
-
-    // Web server
-    static WebServer webServer(80);
-    g_webServer = &webServer;
-    g_apNetCfg = &netCfg;
-
-    webServer.on("/",     handleRoot);
-    webServer.on("/scan", handleScan);
-    webServer.on("/save", HTTP_POST, handleSave);
-    webServer.on("/skip", []() {
-        if (g_webServer) {
-            g_webServer->send(200, "text/plain", "OK");
-            Serial.println("PROV skip WiFi — restarting offline");
-            delay(500);
-            ESP.restart();
-        }
-    });
-    // Captive portal detection paths (Android, iOS, Windows, etc.)
-    webServer.on("/generate_204",      handleRoot);
-    webServer.on("/gen_204",           handleRoot);
-    webServer.on("/hotspot-detect.html", handleRoot);
-    webServer.on("/library/test/success.html", handleRoot);
-    webServer.on("/connecttest.txt",   handleRoot);
-    webServer.on("/redirect",          handleRoot);
-    webServer.on("/canonical.html",    handleRoot);
-    webServer.on("/success.txt",       handleRoot);
-    webServer.on("/ncsi.txt",          handleRoot);
-    webServer.on("/favicon.ico",       []() {
-        if (g_webServer) g_webServer->send(204, "text/plain", " ");
-    });
-    webServer.onNotFound(handleRoot);
-    webServer.begin();
-
-    // LCD info
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setTextColor(TFT_WHITE);
-    M5.Display.setCursor(0, 0);
-    M5.Display.println("WiFi Setup");
-    M5.Display.println("AP: autogarden");
-    M5.Display.println("http://192.168.4.1");
-
-    uint32_t apNoClientSinceMs = millis();
-
-    // Blocking loop — AP mode
-    for (;;) {
-        dnsServer.processNextRequest();
-        webServer.handleClient();
-        M5.update();
-
-        // Auto-off: 5 min bez klienta
-        if (WiFi.softAPgetStationNum() > 0) {
-            apNoClientSinceMs = millis();
-        } else if ((millis() - apNoClientSinceMs) >= NetworkState::kApAutoOffMs) {
-            Serial.println("AP auto-off: no client 5 min");
-            WiFi.softAPdisconnect(true);
-            delay(2000);
-            ESP.restart();
-        }
-
-        delay(1);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Non-blocking AP mode — startuje AP + captive portal, zwraca od razu.
@@ -368,71 +286,6 @@ void stopAp(NetworkState& ns) {
 
     ns.apActive = false;
     Serial.println("[AP] AP mode stopped — offline");
-}
-
-// ---------------------------------------------------------------------------
-// tryConnectWifi — max retries z timeoutem
-// ---------------------------------------------------------------------------
-bool tryConnectWifi(const NetConfig& netCfg, uint8_t maxRetries,
-                    uint32_t timeoutPerRetryMs)
-{
-    Serial.printf("PROV state=WIFI_CONNECTING ssid=%s\n", netCfg.wifiSsid);
-    WiFi.mode(WIFI_STA);
-
-    for (uint8_t attempt = 1; attempt <= maxRetries; ++attempt) {
-        M5.Display.fillScreen(TFT_BLACK);
-        M5.Display.setCursor(0, 0);
-        M5.Display.printf("WiFi %d/%d...", attempt, maxRetries);
-
-        WiFi.begin(netCfg.wifiSsid, netCfg.wifiPass);
-
-        uint32_t deadline = millis() + timeoutPerRetryMs;
-        while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
-            delay(100);
-            M5.update();
-        }
-
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("PROV WIFI_CONNECTED ip=%s\n",
-                          WiFi.localIP().toString().c_str());
-            M5.Display.printf("\nOK: %s", WiFi.localIP().toString().c_str());
-            return true;
-        }
-
-        Serial.printf("PROV wifi attempt %d failed status=%d\n",
-                      attempt, WiFi.status());
-        WiFi.disconnect();
-        delay(1000);
-    }
-
-    Serial.println("PROV WIFI_FAILED after retries");
-    return false;
-}
-
-// ---------------------------------------------------------------------------
-// networkProvisioning — wywoływane w setup()
-// ---------------------------------------------------------------------------
-bool networkProvisioning(NetConfig& netCfg) {
-    if (!netCfg.provisioned || strlen(netCfg.wifiSsid) == 0) {
-        enterApMode(netCfg);   // blokuje — nigdy nie wraca (restart)
-        return false;          // unreachable
-    }
-
-    if (tryConnectWifi(netCfg)) {
-        MDNS.begin("autogarden");
-        return true;
-    }
-
-    // WiFi fail → reset provisioned, restart → AP mode
-    netCfg.provisioned = false;
-    netConfigSave(netCfg);
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setCursor(0, 0);
-    M5.Display.println("WiFi FAILED!");
-    M5.Display.println("Entering setup...");
-    delay(2000);
-    ESP.restart();
-    return false;  // unreachable
 }
 
 // ---------------------------------------------------------------------------
