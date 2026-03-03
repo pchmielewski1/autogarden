@@ -1,0 +1,746 @@
+// ============================================================================
+// hardware.cpp — Implementacja driverów hardware
+// ============================================================================
+// Źródło prawdy: docs/PLAN.md → "Warstwa hardware — dekompozycja abstrakcji"
+// Architektura:  docs/ARCHITECTURE.md
+//
+// UWAGA AGENTOWI:
+//   I2C: SDA=G9, SCL=G10, 100kHz. NIE ZMIENIAJ PINÓW!
+//   PbHUB v1.1 komendy (docs/pbhub_v1.1_firmware_reference.md):
+//     cmd byte = ch_base | cmd_nibble
+//     0x00/0x01 = Digital Write pin0/pin1
+//     0x04/0x05 = Digital Read  pin0/pin1
+//     0x06      = ADC Read 12-bit (pin0 ONLY)
+//   Między Wire.endTransmission() a Wire.requestFrom() → delay(_delayMs)
+// ============================================================================
+
+#include "hardware.h"
+#include <Wire.h>
+#include <Arduino.h>
+
+// Out-of-class definition for static constexpr (ODR-used)
+constexpr uint8_t PbHubBus::kChBase[6];
+
+// ===== PbHubBus =============================================================
+
+bool PbHubBus::init(uint8_t i2cAddr, uint8_t delayMs) {
+    _addr = i2cAddr;
+    _delayMs = delayMs;
+
+    // Wire.begin() wywoływane w main.cpp (lub HardwareManager::init)
+    // Tutaj tylko probePresent
+    return probePresent();
+}
+
+bool PbHubBus::probePresent() {
+    Wire.beginTransmission(_addr);
+    return Wire.endTransmission() == 0;
+}
+
+uint8_t PbHubBus::fwVersion() {
+    uint8_t ver = 0;
+    Wire.beginTransmission(_addr);
+    Wire.write(0xFE);   // firmware version register
+    Wire.endTransmission();
+    delay(_delayMs);
+    Wire.requestFrom(_addr, (uint8_t)1);
+    if (Wire.available()) ver = Wire.read();
+    return ver;
+}
+
+uint8_t PbHubBus::cmdRead(uint8_t ch, uint8_t pin) const {
+    // Digital read: base + 0x04 + pin  (per pbhub_v1.1_firmware_reference.md)
+    return kChBase[ch] + 0x04 + pin;
+}
+
+uint8_t PbHubBus::cmdWrite(uint8_t ch, uint8_t pin) const {
+    // Digital write: base + 0x00 + pin  (per pbhub_v1.1_firmware_reference.md)
+    return kChBase[ch] + 0x00 + pin;
+}
+
+bool PbHubBus::i2cWrite(uint8_t cmd, uint8_t data) {
+    Wire.beginTransmission(_addr);
+    Wire.write(cmd);
+    Wire.write(data);
+    return Wire.endTransmission() == 0;
+}
+
+bool PbHubBus::i2cRead16(uint8_t cmd, uint16_t& out) {
+    Wire.beginTransmission(_addr);
+    Wire.write(cmd);
+    if (Wire.endTransmission() != 0) return false;
+    delay(_delayMs);
+    Wire.requestFrom(_addr, (uint8_t)2);
+    if (Wire.available() < 2) return false;
+    uint8_t lo = Wire.read();
+    uint8_t hi = Wire.read();
+    out = (hi << 8) | lo;
+    return true;
+}
+
+bool PbHubBus::i2cRead8(uint8_t cmd, uint8_t& out) {
+    Wire.beginTransmission(_addr);
+    Wire.write(cmd);
+    if (Wire.endTransmission() != 0) return false;
+    delay(_delayMs);
+    Wire.requestFrom(_addr, (uint8_t)1);
+    if (!Wire.available()) return false;
+    out = Wire.read();
+    return true;
+}
+
+ReadResult<uint16_t> PbHubBus::analogRead(uint8_t channel) {
+    // ADC Read 12-bit: base + 0x06 (pin0 only, per pbhub_v1.1_firmware_reference.md)
+    // PbHUB reconfigures pin0 to GPIO_MODE_ANALOG, reads STM32 ADC channel = ch num
+    ReadResult<uint16_t> r;
+    r.readAtMs = millis();
+    uint8_t cmd = kChBase[channel] + 0x06;
+    if (!i2cRead16(cmd, r.value)) {
+        r.health = SensorHealth::FAIL;
+        r.value = 0;
+    }
+    return r;
+}
+
+ReadResult<bool> PbHubBus::digitalRead(uint8_t channel, uint8_t pin) {
+    ReadResult<bool> r;
+    r.readAtMs = millis();
+    uint8_t cmd = kChBase[channel] + 0x04 + pin;
+    uint8_t val = 0;
+    if (!i2cRead8(cmd, val)) {
+        r.health = SensorHealth::FAIL;
+        r.value = false;
+    } else {
+        r.value = (val != 0);
+    }
+    return r;
+}
+
+bool PbHubBus::digitalWrite(uint8_t channel, uint8_t pin, bool level) {
+    // Digital write: base + 0x00 + pin (per pbhub_v1.1_firmware_reference.md)
+    // cmd 0x00 = pin0, cmd 0x01 = pin1. Data: 0x00=LOW, 0x01=HIGH
+    uint8_t cmd = kChBase[channel] + 0x00 + pin;
+    return i2cWrite(cmd, level ? 0x01 : 0x00);
+}
+
+// ===== SoilMoistureSensor ===================================================
+
+void SoilMoistureSensor::init(PbHubBus* bus, uint8_t channel) {
+    _bus = bus;
+    _channel = channel;
+}
+
+ReadResult<uint16_t> SoilMoistureSensor::readRaw(uint32_t nowMs) {
+    // PbHUB ADC cmd 0x06 always reads pin0 — the IN-side pin of the channel.
+    // Watering Unit: pin0 = AOUT (moisture), so this is correct.
+    ReadResult<uint16_t> r;
+    r.readAtMs = nowMs;
+    if (!_bus) { r.health = SensorHealth::FAIL; r.value = 0; return r; }
+    r = _bus->analogRead(_channel);
+    r.readAtMs = nowMs;
+    return r;
+}
+
+// ===== WaterLevelSensor =====================================================
+
+void WaterLevelSensor::init(PbHubBus* bus, uint8_t channel, uint8_t pin, bool activeLow) {
+    _bus = bus;
+    _channel = channel;
+    _pin = pin;
+    _activeLow = activeLow;
+}
+
+ReadResult<WaterLevelState> WaterLevelSensor::readState(uint32_t nowMs) {
+    ReadResult<WaterLevelState> r;
+    r.readAtMs = nowMs;
+
+    if (!_bus) {
+        r.health = SensorHealth::FAIL;
+        r.value = WaterLevelState::UNKNOWN;
+        return r;
+    }
+
+    auto raw = _bus->digitalRead(_channel, _pin);
+    if (!raw.ok()) {
+        r.health = SensorHealth::FAIL;
+        r.value = WaterLevelState::UNKNOWN;
+        return r;
+    }
+
+    // PLAN.md: activeLow → TRIGGERED when LOW, OK when HIGH
+    // Ale w domenie: TRIGGERED = problem (overflow / reservoir empty)
+    bool physicalHigh = raw.value;
+    if (_activeLow) {
+        r.value = physicalHigh ? WaterLevelState::OK : WaterLevelState::TRIGGERED;
+    } else {
+        r.value = physicalHigh ? WaterLevelState::TRIGGERED : WaterLevelState::OK;
+    }
+
+    return r;
+}
+
+// ===== EnvSensor (SHT30) ====================================================
+
+bool EnvSensor::init(uint8_t addr) {
+    _addr = addr;
+    Wire.beginTransmission(_addr);
+    return Wire.endTransmission() == 0;
+}
+
+ReadResult<EnvReading> EnvSensor::readEnv(uint32_t nowMs) {
+    ReadResult<EnvReading> r;
+    r.readAtMs = nowMs;
+
+    // SHT30: single-shot high repeatability: cmd 0x2400
+    Wire.beginTransmission(_addr);
+    Wire.write(0x24);
+    Wire.write(0x00);
+    if (Wire.endTransmission() != 0) {
+        r.health = SensorHealth::FAIL;
+        return r;
+    }
+
+    delay(20);  // SHT30 measurement time ~15ms
+
+    Wire.requestFrom(_addr, (uint8_t)6);
+    if (Wire.available() < 6) {
+        r.health = SensorHealth::FAIL;
+        return r;
+    }
+
+    uint8_t data[6];
+    for (int i = 0; i < 6; i++) data[i] = Wire.read();
+
+    // Temp: bytes 0,1 (skip CRC byte 2)
+    uint16_t rawTemp = (data[0] << 8) | data[1];
+    r.value.tempC = -45.0f + 175.0f * (float)rawTemp / 65535.0f;
+
+    // Humidity: bytes 3,4 (skip CRC byte 5)
+    uint16_t rawHum = (data[3] << 8) | data[4];
+    r.value.humidityPct = 100.0f * (float)rawHum / 65535.0f;
+
+    return r;
+}
+
+// ===== LightSensor (BH1750) =================================================
+
+bool LightSensor::init(uint8_t addr) {
+    _addr = addr;
+    // Power On
+    Wire.beginTransmission(_addr);
+    Wire.write(0x01);
+    if (Wire.endTransmission() != 0) return false;
+
+    // Continuous High Resolution Mode
+    Wire.beginTransmission(_addr);
+    Wire.write(0x10);
+    return Wire.endTransmission() == 0;
+}
+
+ReadResult<float> LightSensor::readLux(uint32_t nowMs) {
+    ReadResult<float> r;
+    r.readAtMs = nowMs;
+
+    Wire.requestFrom(_addr, (uint8_t)2);
+    if (Wire.available() < 2) {
+        r.health = SensorHealth::FAIL;
+        r.value = 0.0f;
+        return r;
+    }
+
+    uint8_t hi = Wire.read();
+    uint8_t lo = Wire.read();
+    uint16_t raw = (hi << 8) | lo;
+    r.value = (float)raw / 1.2f;  // BH1750 formula
+
+    return r;
+}
+
+// ===== BarometerSensor (QMP6988) ============================================
+// Datasheet: QMP6988 register map & compensation formulas
+// Regs: 0xD1 = chip ID (should be 0x5C), 0xA0-0xB8 = OTP calibration, 
+//       0xF1 = IIR filter, 0xF4 = ctrl_meas (osrs_t, osrs_p, power mode)
+//       0xF7-0xF9 = pressure raw (24-bit), 0xFA-0xFC = temperature raw (24-bit)
+
+// QMP6988 register defines
+static constexpr uint8_t QMP_REG_CHIP_ID    = 0xD1;
+static constexpr uint8_t QMP_REG_OTP_START  = 0xA0;
+static constexpr uint8_t QMP_REG_CTRL_MEAS  = 0xF4;
+static constexpr uint8_t QMP_REG_IIR        = 0xF1;
+static constexpr uint8_t QMP_REG_DATA       = 0xF7;  // 6 bytes: P[23:0] T[23:0]
+static constexpr uint8_t QMP_CHIP_ID_VAL    = 0x5C;
+
+bool BarometerSensor::_writeReg(uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(_addr);
+    Wire.write(reg);
+    Wire.write(val);
+    return Wire.endTransmission() == 0;
+}
+
+bool BarometerSensor::_readRegs(uint8_t reg, uint8_t* buf, uint8_t len) {
+    Wire.beginTransmission(_addr);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    Wire.requestFrom(_addr, len);
+    if (Wire.available() < len) return false;
+    for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
+    return true;
+}
+
+bool BarometerSensor::_readOtp() {
+    // Read 25 bytes of OTP calibration from 0xA0..0xB8
+    uint8_t otp[25];
+    if (!_readRegs(QMP_REG_OTP_START, otp, 25)) return false;
+
+    // Parse calibration integers (big-endian signed/unsigned from datasheet)
+    // b00: otp[0..1] (16-bit signed) combined with otp[24] bits 3:0 → 20-bit
+    int32_t b00_raw  = (int16_t)((otp[0] << 8) | otp[1]);
+    int32_t bt1_raw  = (int16_t)((otp[2] << 8) | otp[3]);
+    int32_t bt2_raw  = (int16_t)((otp[4] << 8) | otp[5]);
+    int32_t bp1_raw  = (int16_t)((otp[6] << 8) | otp[7]);
+    int32_t b11_raw  = (int16_t)((otp[8] << 8) | otp[9]);
+    int32_t bp2_raw  = (int16_t)((otp[10] << 8) | otp[11]);
+    int32_t b12_raw  = (int16_t)((otp[12] << 8) | otp[13]);
+    int32_t b21_raw  = (int16_t)((otp[14] << 8) | otp[15]);
+    int32_t bp3_raw  = (int16_t)((otp[16] << 8) | otp[17]);
+    int32_t a0_raw   = (int16_t)((otp[18] << 8) | otp[19]);
+    int32_t a1_raw   = (int16_t)((otp[20] << 8) | otp[21]);
+    int32_t a2_raw   = (int16_t)((otp[22] << 8) | otp[23]);
+
+    // Apply scaling factors from QMP6988 datasheet (Table in compensation section)
+    _a0  = a0_raw  / 16.0f;
+    _a1  = -6.30e-03f + 4.30e-04f * a1_raw / 32767.0f;
+    _a2  = -1.90e-11f + 1.20e-10f * a2_raw / 32767.0f;
+
+    // b00 extended with high nibble of otp[24]
+    int32_t b00_ext = (b00_raw << 4) | ((otp[24] >> 4) & 0x0F);
+    _b00 = b00_ext / 16.0f;   // effectively b00_raw + fractional from otp[24]
+
+    _bt1 = 1.00e-01f + 9.10e-02f * bt1_raw / 32767.0f;
+    _bt2 = 1.20e-08f + 1.20e-06f * bt2_raw / 32767.0f;
+    _bp1 = 3.30e-02f + 1.90e-02f * bp1_raw / 32767.0f;
+    _b11 = 2.10e-07f + 1.40e-07f * b11_raw / 32767.0f;
+    _bp2 = -6.30e-10f + 3.50e-10f * bp2_raw / 32767.0f;
+    _b12 = 2.90e-13f + 7.60e-13f * b12_raw / 32767.0f;
+    _b21 = 2.10e-15f + 1.20e-14f * b21_raw / 32767.0f;
+    _bp3 = 1.30e-16f + 7.90e-17f * bp3_raw / 32767.0f;
+
+    return true;
+}
+
+bool BarometerSensor::init(uint8_t addr) {
+    _addr = addr;
+    _ready = false;
+
+    // Verify chip ID
+    uint8_t id = 0;
+    if (!_readRegs(QMP_REG_CHIP_ID, &id, 1) || id != QMP_CHIP_ID_VAL) {
+        Serial.printf("[BARO] QMP6988 ID mismatch: got 0x%02X expected 0x%02X\n", id, QMP_CHIP_ID_VAL);
+        // Try alternate address 0x56
+        if (_addr == 0x70) {
+            _addr = 0x56;
+            if (!_readRegs(QMP_REG_CHIP_ID, &id, 1) || id != QMP_CHIP_ID_VAL) {
+                Serial.printf("[BARO] QMP6988 not found @0x70 or @0x56\n");
+                _addr = addr;  // restore
+                return false;
+            }
+            Serial.printf("[BARO] QMP6988 found @0x56 (not 0x70)\n");
+        } else {
+            return false;
+        }
+    }
+
+    // Read OTP calibration coefficients
+    if (!_readOtp()) {
+        Serial.println("[BARO] OTP read failed");
+        return false;
+    }
+
+    // IIR filter coefficient = 2 (register value 0x01)
+    _writeReg(QMP_REG_IIR, 0x01);
+
+    // ctrl_meas: osrs_t=010 (×2), osrs_p=100 (×16), mode=11 (normal)
+    // = 0b010_100_11 = 0x53
+    _writeReg(QMP_REG_CTRL_MEAS, 0x53);
+
+    _ready = true;
+    Serial.printf("[BARO] QMP6988 OK @0x%02X, OTP loaded\n", _addr);
+    return true;
+}
+
+ReadResult<float> BarometerSensor::readPressureHpa(uint32_t nowMs) {
+    ReadResult<float> r;
+    r.readAtMs = nowMs;
+    r.value = 0.0f;
+
+    if (!_ready) {
+        r.health = SensorHealth::FAIL;
+        return r;
+    }
+
+    // Read 6 bytes: pressure (3) + temperature (3)
+    uint8_t data[6];
+    if (!_readRegs(QMP_REG_DATA, data, 6)) {
+        r.health = SensorHealth::FAIL;
+        return r;
+    }
+
+    // 24-bit unsigned raw values
+    int32_t rawP = ((int32_t)data[0] << 16) | ((int32_t)data[1] << 8) | data[2];
+    int32_t rawT = ((int32_t)data[3] << 16) | ((int32_t)data[4] << 8) | data[5];
+
+    // Convert to signed: datasheet says subtract 2^23
+    float Dt = (float)rawT - 8388608.0f;   // 2^23
+    float Dp = (float)rawP - 8388608.0f;
+
+    // Temperature compensation
+    float Tr = _a0 + _a1 * Dt + _a2 * Dt * Dt;
+
+    // Pressure compensation (using compensated temperature Tr)
+    float Pa = _b00 + _bt1 * Tr + _bp1 * Dp
+             + _b11 * Tr * Dp + _bt2 * Tr * Tr
+             + _bp2 * Dp * Dp + _b12 * Dp * Tr * Tr
+             + _b21 * Dp * Dp * Tr + _bp3 * Dp * Dp * Dp;
+
+    // Pa is in Pa, convert to hPa
+    r.value = Pa / 100.0f;
+
+    // Sanity check: valid atmospheric pressure range 300-1100 hPa
+    if (r.value < 300.0f || r.value > 1100.0f) {
+        Serial.printf("[BARO] out of range: %.1f hPa (raw P=%d T=%d)\n",
+                       r.value, rawP, rawT);
+        r.health = SensorHealth::OUT_OF_RANGE;
+    }
+
+    return r;
+}
+
+// ===== PumpActuator =========================================================
+
+void PumpActuator::init(PbHubBus* bus, uint8_t channel, uint8_t pin) {
+    _bus = bus;
+    _channel = channel;
+    _pin = pin;
+    _isOn = false;
+    // Upewnij się że pompa jest OFF na starcie
+    if (_bus) _bus->digitalWrite(_channel, _pin, false);
+}
+
+bool PumpActuator::on(uint32_t nowMs, uint32_t plannedDurationMs) {
+    if (_isOn) return true;
+    if (!_bus) { Serial.println("[PUMP] _bus null!"); return false; }
+    if (!_bus->digitalWrite(_channel, _pin, true)) {
+        Serial.printf("[PUMP] CH%d pin%d ON failed!\n", _channel, _pin);
+        return false;
+    }
+    _isOn = true;
+    _onSinceMs = nowMs;
+    _plannedMs = plannedDurationMs;
+    Serial.printf("[PUMP] CH%d.pin%d ON planned=%dms\n", _channel, _pin, plannedDurationMs);
+    return true;
+}
+
+bool PumpActuator::off(uint32_t nowMs, const char* reason) {
+    if (!_isOn && !reason) return true;  // już OFF
+    if (_bus) _bus->digitalWrite(_channel, _pin, false);
+    uint32_t dur = _isOn ? (nowMs - _onSinceMs) : 0;
+    _isOn = false;
+    Serial.printf("[PUMP] CH%d.pin%d OFF reason=%s duration=%dms\n",
+                  _channel, _pin, reason ? reason : "none", dur);
+    return true;
+}
+
+bool PumpActuator::isOn() const { return _isOn; }
+
+uint32_t PumpActuator::onDuration(uint32_t nowMs) const {
+    if (!_isOn) return 0;
+    return nowMs - _onSinceMs;
+}
+
+// ===== DualButton ===========================================================
+
+void DualButton::init(PbHubBus* bus, uint8_t channel, uint8_t bluePin, uint8_t redPin) {
+    _bus = bus;
+    _channel = channel;
+    _bluePin = bluePin;
+    _redPin  = redPin;
+}
+
+DualButtonState DualButton::read(uint32_t nowMs) {
+    DualButtonState s;
+    s.bluePressed = false;
+    s.redPressed  = false;
+    if (!_bus) return s;
+
+    auto blue = _bus->digitalRead(_channel, _bluePin);
+    auto red  = _bus->digitalRead(_channel, _redPin);
+    // Active LOW — wciśnięty = LOW = false w digitalRead
+    s.bluePressed = blue.ok() && !blue.value;
+    s.redPressed  = red.ok()  && !red.value;
+
+    // Diagnostyka co 2s (nie spamuj co 10ms)
+    static uint32_t lastDbg = 0;
+    if (nowMs - lastDbg > 2000 && (s.bluePressed || s.redPressed || !blue.ok() || !red.ok())) {
+        lastDbg = nowMs;
+        Serial.printf("[DBTN] CH%d blue: ok=%d val=%d pressed=%d | red: ok=%d val=%d pressed=%d\n",
+                      _channel,
+                      blue.ok(), blue.value, s.bluePressed,
+                      red.ok(), red.value, s.redPressed);
+    }
+    return s;
+}
+
+// ===== HardwareManager ======================================================
+
+bool HardwareManager::init(const HardwareConfig& hw, const Config& cfg) {
+    Serial.println("[HW] Initializing...");
+
+    // I2C — SDA=G9, SCL=G10
+    Wire.begin(hw.i2cSdaPin, hw.i2cSclPin, hw.i2cFreq);
+    Serial.printf("[HW] I2C: SDA=G%d, SCL=G%d, %dHz\n",
+                  hw.i2cSdaPin, hw.i2cSclPin, hw.i2cFreq);
+
+    // PbHUB
+    if (!_pbhub.init(hw.addrPbHub, hw.pbhubDelayMs)) {
+        Serial.println("[HW] WARNING: PbHUB not responding!");
+    } else {
+        Serial.printf("[HW] PbHUB OK @0x%02X fw=%d\n", hw.addrPbHub, _pbhub.fwVersion());
+    }
+
+    // Warmup — odrzuć pierwsze odczyty
+    for (uint8_t i = 0; i < hw.pbhubWarmupCycles; i++) {
+        for (uint8_t ch = 0; ch < 6; ch++) _pbhub.analogRead(ch);
+        delay(10);
+    }
+
+    // Per-pot sensory i pompy
+    for (uint8_t i = 0; i < cfg.numPots; i++) {
+        if (!cfg.pots[i].enabled) continue;
+        const auto& ch = hw.potChannels[i];
+
+        _soilSensors[i].init(&_pbhub, ch.soilAdcChannel);
+        _overflowSensors[i].init(&_pbhub, ch.potMaxLevelChannel, 0, cfg.pots[i].potMaxActiveLow);
+        _pumps[i].init(&_pbhub, ch.pumpOutputChannel, ch.pumpOutputPin);
+
+        Serial.printf("[HW] Pot%d: ADC=CH%d.pin0(AOUT) pump=CH%d.pin%d(PUMP_EN) overflow=CH%d\n",
+                      i, ch.soilAdcChannel,
+                      ch.pumpOutputChannel, ch.pumpOutputPin,
+                      ch.potMaxLevelChannel);
+    }
+
+    // Startup ADC diagnostic — read ADC (cmd 0x06, pin0 only) on each pot channel
+    for (uint8_t i = 0; i < cfg.numPots; i++) {
+        if (!cfg.pots[i].enabled) continue;
+        const auto& ch = hw.potChannels[i];
+        auto adc = _pbhub.analogRead(ch.soilAdcChannel);
+        Serial.printf("[HW] DIAG Pot%d CH%d ADC(0x06)=%d%s\n",
+                      i, ch.soilAdcChannel,
+                      adc.value, adc.ok() ? "" : " FAIL");
+        if (adc.ok() && adc.value > 100) {
+            Serial.printf("[HW] DIAG Pot%d: moisture ADC looks valid (%d)\n",
+                          i, adc.value);
+        } else if (adc.ok()) {
+            Serial.printf("[HW] DIAG Pot%d: ADC=%d (low/dry or sensor disconnected)\n",
+                          i, adc.value);
+        } else {
+            Serial.printf("[HW] DIAG Pot%d: ADC read FAILED — PbHUB I2C error\n", i);
+        }
+    }
+
+    // Reservoir sensor
+    _reservoirSensor.init(&_pbhub, hw.reservoirMinChannel, 0, false);
+    Serial.printf("[HW] Reservoir: CH%d\n", hw.reservoirMinChannel);
+
+    // Dual Button
+    _dualBtn.init(&_pbhub, hw.dualButtonChannel, hw.dualBtnBluePin, hw.dualBtnRedPin);
+    Serial.printf("[HW] DualButton: CH%d (blue=pin%d, red=pin%d)\n",
+                  hw.dualButtonChannel, hw.dualBtnBluePin, hw.dualBtnRedPin);
+
+    // ENV III (SHT30 + QMP6988)
+    if (_envSensor.init(hw.addrEnv)) {
+        Serial.printf("[HW] SHT30 OK @0x%02X\n", hw.addrEnv);
+    } else {
+        Serial.printf("[HW] WARNING: SHT30 not responding @0x%02X\n", hw.addrEnv);
+    }
+
+    if (_baroSensor.init(hw.addrBaro)) {
+        Serial.printf("[HW] QMP6988 OK @0x%02X\n", hw.addrBaro);
+    } else {
+        Serial.printf("[HW] WARNING: QMP6988 not responding @0x%02X\n", hw.addrBaro);
+    }
+
+    // BH1750
+    if (_lightSensor.init(hw.addrLight)) {
+        Serial.printf("[HW] BH1750 OK @0x%02X\n", hw.addrLight);
+    } else {
+        Serial.printf("[HW] WARNING: BH1750 not responding @0x%02X\n", hw.addrLight);
+    }
+
+    Serial.println("[HW] Init complete");
+    return true;
+}
+
+void HardwareManager::initPot(uint8_t potIdx, const HardwareConfig& hw, const Config& cfg) {
+    if (potIdx >= kMaxPots) return;
+    if (!cfg.pots[potIdx].enabled) return;
+    const auto& ch = hw.potChannels[potIdx];
+    _soilSensors[potIdx].init(&_pbhub, ch.soilAdcChannel);
+    _overflowSensors[potIdx].init(&_pbhub, ch.potMaxLevelChannel, 0, cfg.pots[potIdx].potMaxActiveLow);
+    _pumps[potIdx].init(&_pbhub, ch.pumpOutputChannel, ch.pumpOutputPin);
+    Serial.printf("[HW] initPot(%d): ADC=CH%d.pin0 pump=CH%d.pin%d overflow=CH%d\n",
+                  potIdx, ch.soilAdcChannel,
+                  ch.pumpOutputChannel, ch.pumpOutputPin,
+                  ch.potMaxLevelChannel);
+}
+
+void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSnapshot& snap) {
+    snap.timestampMs = nowMs;
+
+    // Reservoir — wspólny
+    auto resState = _reservoirSensor.readState(nowMs);
+
+    // Throttled I2C failure logging (max every 10s)
+    static uint32_t s_lastFailLogMs = 0;
+    static uint16_t s_failCountSoil[kMaxPots] = {};
+    static uint16_t s_zeroCountSoil[kMaxPots] = {};
+    static uint16_t s_lastValidSoilRaw[kMaxPots] = {};
+    static bool s_hasValidSoilRaw[kMaxPots] = {};
+    static uint16_t s_failCountOverflow[kMaxPots] = {};
+    static uint16_t s_failCountEnv = 0;
+    static uint16_t s_failCountLux = 0;
+    static uint16_t s_failCountBaro = 0;
+    static uint16_t s_failCountRes = 0;
+    static uint32_t s_lastSoilWarnMs[kMaxPots] = {};
+
+    if (!resState.ok()) s_failCountRes++;
+
+    // Per-pot
+    for (uint8_t i = 0; i < cfg.numPots; i++) {
+        if (!cfg.pots[i].enabled) continue;
+        const auto& potCfg = cfg.pots[i];
+
+        // Overflow sensor
+        auto potMaxState = _overflowSensors[i].readState(nowMs);
+        snap.pots[i].waterGuards.potMax = potMaxState.ok()
+            ? potMaxState.value : WaterLevelState::UNKNOWN;
+        if (!potMaxState.ok()) s_failCountOverflow[i]++;
+        snap.pots[i].waterGuards.reservoirMin = resState.ok()
+            ? resState.value : WaterLevelState::UNKNOWN;
+
+        // Moisture ADC
+        auto rawResult = _soilSensors[i].readRaw(nowMs);
+        if (rawResult.ok() && rawResult.value > 0) {
+            snap.pots[i].moistureRaw = rawResult.value;
+            s_lastValidSoilRaw[i] = rawResult.value;
+            s_hasValidSoilRaw[i] = true;
+        } else if (!rawResult.ok()) {
+            // Preserve last valid value to avoid false 100% from raw=0 fallback
+            s_failCountSoil[i]++;
+            if ((nowMs - s_lastSoilWarnMs[i]) >= 10000) {
+                s_lastSoilWarnMs[i] = nowMs;
+                Serial.printf("[POT%d] MOISTURE_READ_FAIL using last raw=%d\n",
+                              i, snap.pots[i].moistureRaw);
+            }
+        } else {
+            // raw==0 with successful I2C read is usually disconnected/wrong channel.
+            // Keep last good sample if available, otherwise assume dry baseline.
+            s_zeroCountSoil[i]++;
+            if (s_hasValidSoilRaw[i]) {
+                snap.pots[i].moistureRaw = s_lastValidSoilRaw[i];
+            } else {
+                snap.pots[i].moistureRaw = potCfg.soilCalib.rawDry;
+            }
+            if ((nowMs - s_lastSoilWarnMs[i]) >= 10000) {
+                s_lastSoilWarnMs[i] = nowMs;
+                Serial.printf("[POT%d] MOISTURE_RAW_ZERO (wire/channel?) fallback_raw=%d\n",
+                              i, snap.pots[i].moistureRaw);
+            }
+        }
+
+        // Safety net: never allow zero raw into normalization path
+        // (raw=0 produced false 100% moisture with dry/wet defaults).
+        if (snap.pots[i].moistureRaw == 0) {
+            snap.pots[i].moistureRaw = s_hasValidSoilRaw[i]
+                ? s_lastValidSoilRaw[i]
+                : potCfg.soilCalib.rawDry;
+        }
+
+        // Crosstalk compensation (PLAN.md → "Wzorzec odczytu z kompensacją")
+        bool uplift = (snap.pots[i].waterGuards.potMax == WaterLevelState::OK)
+                   || (snap.pots[i].waterGuards.reservoirMin == WaterLevelState::TRIGGERED);
+        snap.pots[i].crosstalkUplift = uplift;
+
+        float comp = (float)snap.pots[i].moistureRaw;
+        if (uplift) {
+            comp /= potCfg.sagFactor;
+        }
+        snap.pots[i].moistureComp = comp;
+
+        // Normalizacja → procent (EMA stosowane w analysis module)
+        float pct = 0.0f;
+        if (potCfg.soilCalib.rawDry != potCfg.soilCalib.rawWet) {
+            pct = 100.0f * (float)(potCfg.soilCalib.rawDry - comp)
+                / (float)(potCfg.soilCalib.rawDry - potCfg.soilCalib.rawWet);
+            if (pct < 0.0f) pct = 0.0f;
+            if (pct > 100.0f) pct = 100.0f;
+        }
+        snap.pots[i].moisturePct = pct;
+
+        // Mapping diagnostic for Watering Unit on PbHUB channel:
+        // M5Stack Watering Unit U101: pin0=PUMP_EN, pin1=AOUT
+        // If raw stays at fallback for long, print a clear hint.
+        static uint16_t s_rawFallbackCount[kMaxPots] = {};
+        if (!rawResult.ok() || rawResult.value == 0) {
+            s_rawFallbackCount[i]++;
+        } else {
+            s_rawFallbackCount[i] = 0;
+        }
+        if (s_rawFallbackCount[i] == 50) {  // ~5s at 100ms tick
+            Serial.printf("[POT%d] MOISTURE_STUCK_FALLBACK: no valid ADC — check Grove cable on PbHUB CH%d\n",
+                          i, _soilSensors[i].channel());
+        }
+    }
+
+    // ENV
+    auto env = _envSensor.readEnv(nowMs);
+    if (env.ok()) {
+        snap.env.tempC = env.value.tempC;
+        snap.env.humidityPct = env.value.humidityPct;
+    } else {
+        s_failCountEnv++;
+    }
+
+    auto lux = _lightSensor.readLux(nowMs);
+    if (lux.ok()) snap.env.lux = lux.value;
+    else s_failCountLux++;
+
+    auto baro = _baroSensor.readPressureHpa(nowMs);
+    if (baro.ok()) snap.env.pressureHpa = baro.value;
+    else s_failCountBaro++;
+
+    // --- Periodic I2C fail summary (every 10s) ---
+    if (nowMs - s_lastFailLogMs >= 10000) {
+        bool anyFail = s_failCountRes > 0 || s_failCountEnv > 0
+                    || s_failCountLux > 0 || s_failCountBaro > 0;
+        for (uint8_t fi = 0; fi < kMaxPots && !anyFail; ++fi) {
+            if (s_failCountSoil[fi] > 0 || s_failCountOverflow[fi] > 0)
+                anyFail = true;
+        }
+        if (anyFail) {
+            Serial.printf("[HW] I2C fails (last 10s): env=%d lux=%d baro=%d res=%d",
+                          s_failCountEnv, s_failCountLux, s_failCountBaro, s_failCountRes);
+            for (uint8_t fi = 0; fi < cfg.numPots; ++fi) {
+                Serial.printf(" soil%d=%d(zero=%d) ovf%d=%d",
+                              fi, s_failCountSoil[fi], s_zeroCountSoil[fi],
+                              fi, s_failCountOverflow[fi]);
+            }
+            Serial.println();
+        }
+        s_failCountRes = s_failCountEnv = s_failCountLux = s_failCountBaro = 0;
+        for (uint8_t fi = 0; fi < kMaxPots; ++fi) {
+            s_failCountSoil[fi] = s_failCountOverflow[fi] = 0;
+            s_zeroCountSoil[fi] = 0;
+        }
+        s_lastFailLogMs = nowMs;
+    }
+}

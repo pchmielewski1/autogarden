@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>autogarden — Setup</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f1923;--card:#1a2733;--border:#2a3a4a;
+  --green:#4caf50;--green-dk:#388e3c;--green-lt:#81c784;
+  --text:#e0e0e0;--text2:#90a4ae;--text3:#546e7a;
+  --red:#ef5350;--yellow:#ffc107;--blue:#42a5f5;
+  --radius:12px;--shadow:0 4px 24px rgba(0,0,0,.4)
+}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:var(--bg);color:var(--text);
+  min-height:100vh;display:flex;flex-direction:column;align-items:center;
+  padding:16px;line-height:1.5
+}
+.logo{
+  margin:24px 0 8px;font-size:2rem;font-weight:700;letter-spacing:-.5px;
+  background:linear-gradient(135deg,var(--green-lt),var(--green));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent
+}
+.subtitle{color:var(--text2);font-size:.85rem;margin-bottom:24px}
+.card{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:var(--radius);padding:24px;width:100%;max-width:420px;
+  box-shadow:var(--shadow);margin-bottom:16px
+}
+.card h2{font-size:1.1rem;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.card h2 .icon{font-size:1.3rem}
+label{display:block;font-size:.8rem;color:var(--text2);margin-bottom:4px;font-weight:500;text-transform:uppercase;letter-spacing:.5px}
+input,select{
+  width:100%;padding:12px 14px;border-radius:8px;border:1px solid var(--border);
+  background:#0d1520;color:var(--text);font-size:1rem;
+  outline:none;transition:border-color .2s
+}
+input:focus,select:focus{border-color:var(--green)}
+input::placeholder{color:var(--text3)}
+.field{margin-bottom:16px}
+.field:last-child{margin-bottom:0}
+.ssid-row{display:flex;gap:8px}
+.ssid-row input{flex:1}
+.ssid-row select{flex:1;display:none}
+.toggle-input{
+  background:none;border:1px solid var(--border);color:var(--text2);
+  border-radius:8px;padding:12px 10px;cursor:pointer;font-size:.8rem;
+  white-space:nowrap;transition:all .2s
+}
+.toggle-input:hover{border-color:var(--green);color:var(--text)}
+.btn-scan{
+  background:none;border:1px solid var(--green);color:var(--green);
+  border-radius:8px;padding:12px 16px;cursor:pointer;font-size:.85rem;
+  font-weight:600;transition:all .2s;white-space:nowrap
+}
+.btn-scan:hover{background:var(--green);color:#fff}
+.btn-scan:disabled{opacity:.5;cursor:wait}
+.signal{font-size:.75rem;color:var(--text3);margin-left:auto}
+.lock{font-size:.7rem;margin-left:4px}
+.sep{border:none;border-top:1px solid var(--border);margin:20px 0}
+.btn-save{
+  display:block;width:100%;padding:14px;border:none;border-radius:8px;
+  background:linear-gradient(135deg,var(--green),var(--green-dk));
+  color:#fff;font-size:1.05rem;font-weight:700;cursor:pointer;
+  transition:transform .1s,box-shadow .2s;
+  box-shadow:0 4px 16px rgba(76,175,80,.3)
+}
+.btn-save:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(76,175,80,.4)}
+.btn-save:active{transform:translateY(0)}
+.btn-save:disabled{opacity:.5;cursor:wait}
+.status{
+  text-align:center;padding:12px;border-radius:8px;font-size:.9rem;
+  margin-top:12px;display:none
+}
+.status.err{display:block;background:rgba(239,83,80,.15);color:var(--red);border:1px solid rgba(239,83,80,.3)}
+.status.ok{display:block;background:rgba(76,175,80,.15);color:var(--green-lt);border:1px solid rgba(76,175,80,.3)}
+.status.info{display:block;background:rgba(66,165,245,.15);color:var(--blue);border:1px solid rgba(66,165,245,.3)}
+.opt-badge{
+  font-size:.6rem;background:var(--border);color:var(--text2);
+  padding:2px 6px;border-radius:4px;vertical-align:middle;margin-left:6px
+}
+.footer{color:var(--text3);font-size:.7rem;margin-top:16px;text-align:center}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--green);border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:360px){
+  .card{padding:16px}
+  .logo{font-size:1.6rem}
+}
+</style>
+</head>
+<body>
+
+<div class="logo">🌱 autogarden</div>
+<div class="subtitle">Device Setup — WiFi &amp; Telegram</div>
+
+<!-- WiFi Card -->
+<form id="form" class="card" autocomplete="off">
+  <h2><span class="icon">📶</span> WiFi Configuration</h2>
+
+  <div class="field">
+    <label for="ssid">Network Name (SSID)</label>
+    <div class="ssid-row">
+      <input type="text" id="ssid" name="ssid" placeholder="Enter or select network..." maxlength="32" required>
+      <select id="ssid-list" onchange="pickSsid(this)"></select>
+      <button type="button" class="btn-scan" id="btn-scan" onclick="doScan()">Scan</button>
+    </div>
+  </div>
+
+  <div class="field">
+    <label for="pass">Password</label>
+    <input type="password" id="pass" name="pass" placeholder="WiFi password (leave empty if open)" maxlength="64">
+  </div>
+
+  <hr class="sep">
+
+  <h2><span class="icon">🤖</span> Telegram <span class="opt-badge">OPTIONAL</span></h2>
+
+  <div class="field">
+    <label for="bot_token">Bot Token</label>
+    <input type="text" id="bot_token" name="bot_token" placeholder="123456789:ABCdefGHI..." maxlength="60">
+  </div>
+
+  <div class="field">
+    <label for="chat_id">Your Chat ID</label>
+    <input type="text" id="chat_id" name="chat_id" placeholder="e.g. 123456789" maxlength="15">
+  </div>
+
+  <hr class="sep">
+
+  <button type="submit" class="btn-save" id="btn-save">💾 Save &amp; Connect</button>
+  <div id="status" class="status"></div>
+</form>
+
+<div class="footer">
+  autogarden &bull; M5Stack StickS3 &bull; ESP32-S3<br>
+  IP: 192.168.4.1 &bull; <span id="heap"></span>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const ssidInput=$('#ssid'), ssidList=$('#ssid-list'), btnScan=$('#btn-scan');
+const statusEl=$('#status'), form=$('#form'), btnSave=$('#btn-save');
+
+function showStatus(msg,cls){
+  statusEl.className='status '+cls;
+  statusEl.innerHTML=msg;
+}
+
+function pickSsid(sel){
+  if(sel.value){ssidInput.value=sel.value}
+}
+
+async function doScan(){
+  btnScan.disabled=true;
+  btnScan.innerHTML='<span class="spinner"></span>Scanning';
+  try{
+    const r=await fetch('/scan');
+    const nets=await r.json();
+    if(!nets.length){showStatus('No networks found.','info');return}
+    ssidList.innerHTML='<option value="">— Select —</option>';
+    nets.sort((a,b)=>b.rssi-a.rssi);
+    nets.forEach(n=>{
+      const lock=n.enc?'🔒':'';
+      const bars=n.rssi>-50?'▂▄▆█':n.rssi>-70?'▂▄▆░':n.rssi>-80?'▂▄░░':'▂░░░';
+      const o=document.createElement('option');
+      o.value=n.ssid;
+      o.textContent=`${n.ssid} ${lock} ${bars}`;
+      ssidList.appendChild(o);
+    });
+    ssidList.style.display='block';
+    ssidInput.style.display='none';
+    showStatus(nets.length+' networks found.','info');
+  }catch(e){
+    showStatus('Scan failed: '+e.message,'err');
+  }finally{
+    btnScan.disabled=false;
+    btnScan.textContent='Scan';
+  }
+}
+
+// Allow switching back to manual input
+ssidList.addEventListener('dblclick',()=>{
+  ssidList.style.display='none';
+  ssidInput.style.display='block';
+  ssidInput.focus();
+});
+
+form.addEventListener('submit',async(e)=>{
+  e.preventDefault();
+  const ssid=ssidList.style.display!=='none'?ssidList.value:ssidInput.value;
+  if(!ssid){showStatus('SSID is required.','err');return}
+
+  btnSave.disabled=true;
+  btnSave.innerHTML='<span class="spinner"></span>Saving...';
+  showStatus('Saving configuration...','info');
+
+  try{
+    const body=new URLSearchParams({
+      ssid:ssid,
+      pass:$('#pass').value,
+      bot_token:$('#bot_token').value,
+      chat_id:$('#chat_id').value
+    });
+    const r=await fetch('/save',{method:'POST',body});
+    if(r.ok){
+      showStatus('✅ Saved! Device is restarting and connecting to <b>'+ssid+'</b>...<br>You can close this page.','ok');
+      btnSave.textContent='Saved ✓';
+    }else{
+      const t=await r.text();
+      showStatus('Error: '+t,'err');
+      btnSave.disabled=false;
+      btnSave.textContent='💾 Save & Connect';
+    }
+  }catch(e){
+    showStatus('Connection lost — device may be restarting.','info');
+    btnSave.textContent='Saved ✓';
+  }
+});
+
+// Show free heap (diagnostic)
+fetch('/heap').then(r=>r.text()).then(t=>{$('#heap').textContent='Free: '+t}).catch(()=>{});
+</script>
+</body>
+</html>

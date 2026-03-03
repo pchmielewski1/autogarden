@@ -1,0 +1,18 @@
+# PlatformIO build artifacts
+.pio
+
+# VS Code (keep extensions.json for recommended extensions)
+.vscode/*
+!.vscode/extensions.json
+
+# Internal docs (design notes, firmware references, hardware journals)
+docs/
+
+# Agent/AI session notes
+agent.md
+
+# OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
