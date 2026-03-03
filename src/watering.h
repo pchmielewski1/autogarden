@@ -65,6 +65,7 @@ struct WaterBudget {
     uint32_t reservoirLowSinceMs    = 0;
     float    reservoirLowThresholdMl = 2000.0f;  // z Config
     float    daysRemaining          = 999.0f;
+    uint32_t lastRefillMs            = 0;       // millis() of last refill (0 = boot)
 };
 
 // ---------------------------------------------------------------------------

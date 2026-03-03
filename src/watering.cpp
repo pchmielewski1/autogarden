@@ -13,11 +13,7 @@
 #include <Arduino.h>   // Serial, millis
 #include <cstring>
 
-// Minimalny forward-declare trendu (analysis.h jeszcze nie gotowe)
-// TODO(analysis): gdy analysis.h będzie gotowy, zamień na #include "analysis.h"
-struct TrendState;
-extern bool trendBaselineLearned(uint8_t potIdx);
-extern float trendCurrentRate(uint8_t potIdx);
+#include "analysis.h"
 
 // ===========================================================================
 // Helpers — lokalne
@@ -637,7 +633,6 @@ void updateWaterBudget(uint32_t nowMs,
                        WaterBudget& budget,
                        const Config& cfg)
 {
-    (void)nowMs;
 
     // Rezerwuar uses shared sensor (index irrelevant — stored in pots[0] waterGuards
     // or directly in SensorSnapshot)
@@ -667,7 +662,20 @@ void updateWaterBudget(uint32_t nowMs,
     }
     budget.reservoirCurrentMl = estimated;
 
-    // TODO(history): daysRemaining = reservoirCurrentMl / avgDailyConsumption
+    // daysRemaining — average daily consumption since last refill
+    // Uses persisted totalPumpedMl / elapsed days (survives reboots).
+    // Needs at least 12h of data and >1ml pumped to be meaningful.
+    if (budget.lastRefillMs > 0 && nowMs > budget.lastRefillMs) {
+        float daysSinceRefill = (nowMs - budget.lastRefillMs) / 86400000.0f;
+        if (daysSinceRefill >= 0.5f && budget.totalPumpedMl > 1.0f) {
+            float avgDailyMl = budget.totalPumpedMl / daysSinceRefill;
+            budget.daysRemaining = budget.reservoirCurrentMl / avgDailyMl;
+        } else {
+            budget.daysRemaining = 999.0f;   // not enough data yet
+        }
+    } else {
+        budget.daysRemaining = 999.0f;
+    }
 }
 
 void handleRefill(WaterBudget& budget, const Config& cfg) {
@@ -681,6 +689,7 @@ void handleRefill(WaterBudget& budget, const Config& cfg) {
     budget.reservoirLow = false;
     budget.reservoirLowSinceMs = 0;
     budget.daysRemaining = 999.0f;
+    budget.lastRefillMs = millis();
     Serial.printf("RESERVOIR_REFILL capacity=%.0fml\n", budget.reservoirCapacityMl);
 }
 

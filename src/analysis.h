@@ -128,6 +128,20 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
                       float humPct, float pressHpa,
                       DuskDetector& det, const Config& cfg);
 
+// ---------------------------------------------------------------------------
+// DuskState — persisted to NVS across reboots
+// ---------------------------------------------------------------------------
+struct DuskState {
+    uint8_t  phase          = 0;   // DuskPhase as uint8
+    uint32_t dayLengthMs    = 0;   // estimated day length from SolarClock
+    uint32_t nightLengthMs  = 0;   // estimated night length
+    uint8_t  _pad[3]        = {};  // alignment
+};
+
+bool duskStateSave(const DuskDetector& det);    // save current phase + estimates to NVS
+bool duskStateLoad(DuskDetector& det);           // restore phase + estimates from NVS
+void duskBootstrap(DuskDetector& det, float lux); // instant phase from first lux reading
+
 // Helpery
 DuskScores scoreDusk(float lux, const EnvDerivatives& d);
 DuskScores scoreDawn(float lux, const EnvDerivatives& d);

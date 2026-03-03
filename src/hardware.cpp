@@ -389,6 +389,19 @@ ReadResult<float> BarometerSensor::readPressureHpa(uint32_t nowMs) {
     int32_t rawP = ((int32_t)data[0] << 16) | ((int32_t)data[1] << 8) | data[2];
     int32_t rawT = ((int32_t)data[3] << 16) | ((int32_t)data[4] << 8) | data[5];
 
+    // Raw P=0 + T=0 means the sensor lost its register config (power glitch)
+    // and is in sleep/standby mode.  Mark not-ready so reinit() can fix it.
+    if (rawP == 0 && rawT == 0) {
+        _ready = false;
+        r.health = SensorHealth::FAIL;
+        static uint32_t s_lastZeroLog = 0;
+        if (nowMs - s_lastZeroLog >= 10000) {
+            Serial.println("[BARO] raw P=0 T=0 — sensor in sleep mode, needs re-init");
+            s_lastZeroLog = nowMs;
+        }
+        return r;
+    }
+
     // Convert to signed: datasheet says subtract 2^23
     float Dt = (float)rawT - 8388608.0f;   // 2^23
     float Dp = (float)rawP - 8388608.0f;
@@ -407,8 +420,16 @@ ReadResult<float> BarometerSensor::readPressureHpa(uint32_t nowMs) {
 
     // Sanity check: valid atmospheric pressure range 300-1100 hPa
     if (r.value < 300.0f || r.value > 1100.0f) {
-        Serial.printf("[BARO] out of range: %.1f hPa (raw P=%d T=%d)\n",
-                       r.value, rawP, rawT);
+        // Rate-limit: log max once per 10s to avoid serial spam
+        static uint32_t s_lastOutOfRangeLog = 0;
+        static uint16_t s_outOfRangeCount = 0;
+        s_outOfRangeCount++;
+        if (nowMs - s_lastOutOfRangeLog >= 10000) {
+            Serial.printf("[BARO] out of range: %.1f hPa (raw P=%d T=%d) x%d in 10s\n",
+                           r.value, rawP, rawT, s_outOfRangeCount);
+            s_lastOutOfRangeLog = nowMs;
+            s_outOfRangeCount = 0;
+        }
         r.health = SensorHealth::OUT_OF_RANGE;
     }
 
@@ -492,8 +513,80 @@ DualButtonState DualButton::read(uint32_t nowMs) {
 
 // ===== HardwareManager ======================================================
 
+// ===== I2C Bus Recovery =====================================================
+// After a power glitch on Grove peripherals, a slave may hold SDA low
+// (mid-transaction state). Clock SCL manually until SDA releases, then
+// issue STOP, then re-init Wire.
+void HardwareManager::i2cBusRecovery() {
+    if (!_hwCfg) return;
+    Serial.println("[HW] I2C bus recovery — clocking SCL to unstick SDA");
+
+    Wire.end();
+
+    pinMode(_hwCfg->i2cSdaPin, INPUT_PULLUP);
+    pinMode(_hwCfg->i2cSclPin, OUTPUT);
+
+    // Clock up to 16 pulses on SCL to free a stuck slave
+    for (int i = 0; i < 16; i++) {
+        digitalWrite(_hwCfg->i2cSclPin, LOW);
+        delayMicroseconds(5);
+        digitalWrite(_hwCfg->i2cSclPin, HIGH);
+        delayMicroseconds(5);
+        if (digitalRead(_hwCfg->i2cSdaPin)) {
+            Serial.printf("[HW] SDA released after %d clocks\n", i + 1);
+            break;
+        }
+    }
+
+    // Generate STOP condition: SDA low → SCL high → SDA high
+    pinMode(_hwCfg->i2cSdaPin, OUTPUT);
+    digitalWrite(_hwCfg->i2cSdaPin, LOW);
+    delayMicroseconds(5);
+    digitalWrite(_hwCfg->i2cSclPin, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(_hwCfg->i2cSdaPin, HIGH);
+    delayMicroseconds(5);
+
+    Wire.begin(_hwCfg->i2cSdaPin, _hwCfg->i2cSclPin, _hwCfg->i2cFreq);
+    Serial.println("[HW] I2C bus recovery complete, Wire re-initialized");
+}
+
+void HardwareManager::reinitI2cSensors() {
+    if (!_hwCfg) return;
+    Serial.println("[HW] Re-initializing I2C sensors after recovery");
+
+    // PbHUB
+    if (_pbhub.init(_hwCfg->addrPbHub, _hwCfg->pbhubDelayMs)) {
+        Serial.printf("[HW] PbHUB re-init OK @0x%02X\n", _hwCfg->addrPbHub);
+    } else {
+        Serial.printf("[HW] PbHUB re-init FAILED @0x%02X\n", _hwCfg->addrPbHub);
+    }
+
+    // ENV (SHT30)
+    if (_envSensor.init(_hwCfg->addrEnv)) {
+        Serial.printf("[HW] SHT30 re-init OK @0x%02X\n", _hwCfg->addrEnv);
+    } else {
+        Serial.printf("[HW] SHT30 re-init FAILED @0x%02X\n", _hwCfg->addrEnv);
+    }
+
+    // Barometer (QMP6988) — needs OTP + register config
+    if (_baroSensor.init(_hwCfg->addrBaro)) {
+        Serial.printf("[HW] QMP6988 re-init OK @0x%02X\n", _hwCfg->addrBaro);
+    } else {
+        Serial.printf("[HW] QMP6988 re-init FAILED @0x%02X\n", _hwCfg->addrBaro);
+    }
+
+    // Light (BH1750) — needs power-on + mode register
+    if (_lightSensor.init(_hwCfg->addrLight)) {
+        Serial.printf("[HW] BH1750 re-init OK @0x%02X\n", _hwCfg->addrLight);
+    } else {
+        Serial.printf("[HW] BH1750 re-init FAILED @0x%02X\n", _hwCfg->addrLight);
+    }
+}
+
 bool HardwareManager::init(const HardwareConfig& hw, const Config& cfg) {
     Serial.println("[HW] Initializing...");
+    _hwCfg = &hw;   // store for recovery
 
     // I2C — SDA=G9, SCL=G10
     Wire.begin(hw.i2cSdaPin, hw.i2cSclPin, hw.i2cFreq);
@@ -717,6 +810,39 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     auto baro = _baroSensor.readPressureHpa(nowMs);
     if (baro.ok()) snap.env.pressureHpa = baro.value;
     else s_failCountBaro++;
+
+    // --- Auto I2C recovery on sustained failures ---
+    // Track consecutive failures for direct-I2C sensors (env, baro, lux).
+    // After 30 consecutive failures (~3s at 100ms tick) attempt bus recovery
+    // + sensor re-init. Cooldown 30s between attempts.
+    static uint16_t s_consecI2cFails = 0;
+    static uint32_t s_lastRecoveryMs = 0;
+    bool anyDirectI2cFail = !env.ok() || !baro.ok() || !lux.ok();
+    bool allDirectI2cFail = !env.ok() && !baro.ok() && !lux.ok();
+
+    if (anyDirectI2cFail) {
+        s_consecI2cFails++;
+    } else {
+        s_consecI2cFails = 0;
+    }
+
+    if (s_consecI2cFails >= 30 && (nowMs - s_lastRecoveryMs >= 30000)) {
+        Serial.printf("[HW] %d consecutive I2C sensor failures — triggering recovery\n",
+                      s_consecI2cFails);
+        i2cBusRecovery();
+        reinitI2cSensors();
+        s_lastRecoveryMs = nowMs;
+        s_consecI2cFails = 0;
+    }
+    // Also reinit individual sensors that are failing while others work
+    // (e.g. only baro stuck after power glitch, env+lux OK)
+    else if (s_consecI2cFails >= 20 && !allDirectI2cFail
+             && (nowMs - s_lastRecoveryMs >= 30000)) {
+        Serial.println("[HW] Partial I2C failure — re-initializing sensors (no bus recovery)");
+        reinitI2cSensors();
+        s_lastRecoveryMs = nowMs;
+        s_consecI2cFails = 0;
+    }
 
     // --- Periodic I2C fail summary (every 10s) ---
     if (nowMs - s_lastFailLogMs >= 10000) {

@@ -9,6 +9,7 @@
 #include "analysis.h"
 #include "events.h"
 #include <Arduino.h>
+#include <Preferences.h>
 #include <algorithm>
 #include <cmath>
 
@@ -367,10 +368,12 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
             } else {
                 Serial.println("DAWN_CONFIRMED (first since boot)");
             }
+            duskStateSave(det);
         } else if (elapsed > DuskDetector::kTransitionMaxDurationMs) {
             det.phase = DuskPhase::DAY;
             det.lastDawnMs = nowMs;
             Serial.printf("DAWN_TIMEOUT — assuming day after %dmin\n", elapsed / 60000);
+            duskStateSave(det);
         }
         break;
     }
@@ -417,17 +420,91 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
             } else {
                 Serial.println("DUSK_CONFIRMED (first since boot)");
             }
+            duskStateSave(det);
             // >>> PODLEWANIE OKNO <<<
             // TODO(events): eventQueue.push(Event::tick(EventType::DUSK_DETECTED))
         } else if (elapsed > DuskDetector::kTransitionMaxDurationMs) {
             det.phase = DuskPhase::NIGHT;
             det.lastDuskMs = nowMs;
             Serial.printf("DUSK_TIMEOUT — assuming night after %dmin\n", elapsed / 60000);
+            duskStateSave(det);
         }
         break;
     }
 
     } // switch
+}
+
+// ===========================================================================
+// DuskState — NVS persistence
+// ===========================================================================
+bool duskStateSave(const DuskDetector& det) {
+    Preferences prefs;
+    if (!prefs.begin(kNvsDusk, false)) {
+        Serial.println("[DUSK] NVS save: can't open namespace");
+        return false;
+    }
+    DuskState st;
+    st.phase         = static_cast<uint8_t>(det.phase);
+    st.dayLengthMs   = det.dayLengthMs;
+    st.nightLengthMs = det.nightLengthMs;
+    size_t written = prefs.putBytes("dusk", &st, sizeof(DuskState));
+    prefs.end();
+    Serial.printf("[DUSK] NVS saved: phase=%d day=%dm night=%dm\n",
+                  st.phase, st.dayLengthMs / 60000, st.nightLengthMs / 60000);
+    return written == sizeof(DuskState);
+}
+
+bool duskStateLoad(DuskDetector& det) {
+    Preferences prefs;
+    if (!prefs.begin(kNvsDusk, true)) return false;
+    if (!prefs.isKey("dusk")) { prefs.end(); return false; }
+    DuskState st;
+    size_t len = prefs.getBytes("dusk", &st, sizeof(DuskState));
+    prefs.end();
+    if (len != sizeof(DuskState)) return false;
+    if (st.phase > static_cast<uint8_t>(DuskPhase::DUSK_TRANSITION)) return false;
+
+    // Restore phase — but only stable phases (DAY/NIGHT).
+    // Transitions are volatile, revert to the stable side.
+    DuskPhase restored;
+    switch (static_cast<DuskPhase>(st.phase)) {
+        case DuskPhase::DAY:
+        case DuskPhase::DAWN_TRANSITION:  // was becoming day
+            restored = DuskPhase::DAY;
+            break;
+        case DuskPhase::NIGHT:
+        case DuskPhase::DUSK_TRANSITION:  // was becoming night
+        default:
+            restored = DuskPhase::NIGHT;
+            break;
+    }
+    det.phase = restored;
+    det.dayLengthMs   = st.dayLengthMs;
+    det.nightLengthMs = st.nightLengthMs;
+    Serial.printf("[DUSK] NVS restored: phase=%s day=%dm night=%dm\n",
+                  (restored == DuskPhase::DAY) ? "DAY" : "NIGHT",
+                  st.dayLengthMs / 60000, st.nightLengthMs / 60000);
+    return true;
+}
+
+void duskBootstrap(DuskDetector& det, float lux) {
+    // Quick heuristic from first sensor read — override only if confident.
+    // If NVS already restored a phase, still override if sensor strongly disagrees.
+    //   lux > 200 → definitely daytime (indoor artificial light rarely that high)
+    //   lux < 5   → definitely night
+    //   5..200    → ambiguous, trust NVS phase
+    DuskPhase before = det.phase;
+    if (lux > 200.0f && det.phase == DuskPhase::NIGHT) {
+        det.phase = DuskPhase::DAY;
+        Serial.printf("[DUSK] bootstrap: lux=%.0f → DAY (was NIGHT)\n", lux);
+    } else if (lux < 5.0f && det.phase == DuskPhase::DAY) {
+        det.phase = DuskPhase::NIGHT;
+        Serial.printf("[DUSK] bootstrap: lux=%.0f → NIGHT (was DAY)\n", lux);
+    } else {
+        Serial.printf("[DUSK] bootstrap: lux=%.0f → keeping %s from NVS\n", lux,
+                      (det.phase == DuskPhase::DAY) ? "DAY" : "NIGHT");
+    }
 }
 
 // ===========================================================================

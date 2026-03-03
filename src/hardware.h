@@ -237,6 +237,10 @@ public:
     bool init(const HardwareConfig& hwCfg, const Config& cfg);
     void initPot(uint8_t potIdx, const HardwareConfig& hw, const Config& cfg);
 
+    // I2C bus recovery & sensor re-init (call after power glitch / persistent failures)
+    void i2cBusRecovery();
+    void reinitI2cSensors();
+
     // Dostęp do driverów
     PbHubBus&          pbhub()             { return _pbhub; }
     SoilMoistureSensor& soilSensor(uint8_t potIdx) { return _soilSensors[potIdx]; }
@@ -252,6 +256,7 @@ public:
     void readAllSensors(uint32_t nowMs, const Config& cfg, SensorSnapshot& snap);
 
 private:
+    const HardwareConfig* _hwCfg = nullptr;  // stored at init for recovery
     PbHubBus           _pbhub;
     SoilMoistureSensor _soilSensors[kMaxPots];
     WaterLevelSensor   _overflowSensors[kMaxPots];

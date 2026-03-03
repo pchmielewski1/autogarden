@@ -126,6 +126,79 @@ static void requestConfigSave(const Config& cfg) {
 }
 
 // ============================================================================
+// RuntimeState — snapshot builder + save helper
+// ============================================================================
+static void buildRuntimeState(RuntimeState& rs) {
+    rs.schema = kRuntimeSchema;
+    uint32_t now = millis();
+
+    // Budget
+    rs.reservoirCurrentMl = g_budget.reservoirCurrentMl;
+    rs.totalPumpedMl      = g_budget.totalPumpedMl;
+    for (uint8_t i = 0; i < kMaxPots; ++i)
+        rs.totalPumpedMlPerPot[i] = g_budget.totalPumpedMlPerPot[i];
+    rs.reservoirLow       = g_budget.reservoirLow;
+
+    // Refill timestamp — convert millis to seconds-ago
+    if (g_budget.lastRefillMs > 0) {
+        rs.secsSinceRefill = (now - g_budget.lastRefillMs) / 1000;
+    } else {
+        rs.secsSinceRefill = 0;
+    }
+
+    // Trend baselines
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        rs.normalDryingRate[i]    = g_trendStates[i].normalDryingRate;
+        rs.baselineCalibrated[i]  = g_trendStates[i].baselineCalibrated;
+        rs.trendHeadIdx[i]        = g_trendStates[i].headIdx;
+        rs.trendCount[i]          = g_trendStates[i].count;
+        for (uint8_t h = 0; h < TrendState::kHours; ++h)
+            rs.hourlyDeltas[i][h] = g_trendStates[i].hourlyDeltas[h];
+    }
+
+    // Cooldowns — convert millis timestamp to seconds-ago
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        if (g_actuator.lastCycleDoneMs[i] > 0) {
+            rs.secsSinceLastCycleDone[i] = (now - g_actuator.lastCycleDoneMs[i]) / 1000;
+        } else {
+            rs.secsSinceLastCycleDone[i] = 0;
+        }
+    }
+
+    // Solar clock
+    rs.solarCycleCount = g_solarClock.cycleCount;
+    rs.solarCalibrated = g_solarClock.calibrated;
+}
+
+static bool s_runtimeDirty = false;   // set true when state changes
+
+static void saveRuntimeIfDirty(uint32_t nowMs, uint32_t& lastSaveMs) {
+    if (!s_runtimeDirty) return;
+    if (nowMs - lastSaveMs < 60000) return;  // max once per 60s
+
+    RuntimeState rs;
+    buildRuntimeState(rs);
+    if (runtimeStateSave(rs)) {
+        Serial.printf("[RUNTIME] saved: reservoir=%.0fml pumped=%.1fml\n",
+                      rs.reservoirCurrentMl, rs.totalPumpedMl);
+    }
+    s_runtimeDirty = false;
+    lastSaveMs = nowMs;
+}
+
+// Force immediate save (e.g. after pump event)
+static void saveRuntimeNow(uint32_t& lastSaveMs) {
+    RuntimeState rs;
+    buildRuntimeState(rs);
+    if (runtimeStateSave(rs)) {
+        Serial.printf("[RUNTIME] saved (event): reservoir=%.0fml pumped=%.1fml\n",
+                      rs.reservoirCurrentMl, rs.totalPumpedMl);
+    }
+    s_runtimeDirty = false;
+    lastSaveMs = millis();
+}
+
+// ============================================================================
 // ControlTask — odczyty sensorów, FSM podlewania, safety, analiza
 // PLAN.md → "ControlTask"
 // ============================================================================
@@ -141,8 +214,82 @@ static void controlTaskFn(void* /*param*/) {
 
     // Inicjalizacja budżetu rezerwuaru z configu
     g_budget.reservoirCapacityMl     = g_config.reservoirCapacityMl;
-    g_budget.reservoirCurrentMl      = g_config.reservoirCapacityMl;  // zakładamy pełny
     g_budget.reservoirLowThresholdMl = g_config.reservoirLowThresholdMl;
+
+    // ── Restore RuntimeState from NVS (budget, trends, cooldowns, solar) ──
+    RuntimeState rs;
+    if (runtimeStateLoad(rs)) {
+        // Budget
+        g_budget.reservoirCurrentMl      = rs.reservoirCurrentMl;
+        g_budget.totalPumpedMl           = rs.totalPumpedMl;
+        for (uint8_t i = 0; i < kMaxPots; ++i)
+            g_budget.totalPumpedMlPerPot[i] = rs.totalPumpedMlPerPot[i];
+        g_budget.reservoirLow            = rs.reservoirLow;
+
+        // Refill timestamp — convert seconds-ago to millis
+        if (rs.secsSinceRefill > 0) {
+            uint32_t bootMs = millis();
+            uint32_t elapsedMs = rs.secsSinceRefill * 1000UL;
+            g_budget.lastRefillMs = (elapsedMs < bootMs) ? (bootMs - elapsedMs) : 1;
+            Serial.printf("[CTRL] Refill was %ds ago\n", rs.secsSinceRefill);
+        } else {
+            g_budget.lastRefillMs = millis();  // first boot — treat as fresh refill
+        }
+
+        // Sanity: if capacity changed in config, clamp
+        if (g_budget.reservoirCurrentMl > g_config.reservoirCapacityMl)
+            g_budget.reservoirCurrentMl = g_config.reservoirCapacityMl;
+
+        Serial.printf("[CTRL] Budget restored: current=%.0fml pumped=%.1fml low=%s\n",
+                      g_budget.reservoirCurrentMl, g_budget.totalPumpedMl,
+                      g_budget.reservoirLow ? "YES" : "no");
+
+        // Trend baselines (per-pot)
+        for (uint8_t i = 0; i < kMaxPots; ++i) {
+            g_trendStates[i].normalDryingRate    = rs.normalDryingRate[i];
+            g_trendStates[i].baselineCalibrated  = rs.baselineCalibrated[i];
+            g_trendStates[i].headIdx             = rs.trendHeadIdx[i];
+            g_trendStates[i].count               = rs.trendCount[i];
+            for (uint8_t h = 0; h < TrendState::kHours; ++h)
+                g_trendStates[i].hourlyDeltas[h] = rs.hourlyDeltas[i][h];
+            if (rs.baselineCalibrated[i]) {
+                Serial.printf("[CTRL] Trend[%d] restored: baseline=%.2f%%/h samples=%d\n",
+                              i, rs.normalDryingRate[i], rs.trendCount[i]);
+            }
+        }
+
+        // Cooldowns — convert seconds-since-last-cycle to millis timestamp
+        uint32_t bootMs = millis();
+        for (uint8_t i = 0; i < kMaxPots; ++i) {
+            if (rs.secsSinceLastCycleDone[i] > 0) {
+                // Reconstruct as if the cycle ended (now - elapsed) ago
+                uint32_t elapsedMs = rs.secsSinceLastCycleDone[i] * 1000UL;
+                if (elapsedMs < bootMs) {
+                    g_actuator.lastCycleDoneMs[i] = bootMs - elapsedMs;
+                } else {
+                    g_actuator.lastCycleDoneMs[i] = 1;  // long ago, but not zero (zero = never)
+                }
+                Serial.printf("[CTRL] Cooldown[%d] restored: %ds ago\n",
+                              i, rs.secsSinceLastCycleDone[i]);
+            }
+        }
+
+        // Solar clock
+        g_solarClock.cycleCount = rs.solarCycleCount;
+        g_solarClock.calibrated = rs.solarCalibrated;
+        g_solarClock.dayLengthMs = g_duskDetector.dayLengthMs;
+        g_solarClock.nightLengthMs = g_duskDetector.nightLengthMs;
+    } else {
+        // No saved state — assume full reservoir (first boot or post-reset)
+        g_budget.reservoirCurrentMl = g_config.reservoirCapacityMl;
+        g_budget.lastRefillMs = millis();  // treat first boot as fresh refill
+        Serial.println("[CTRL] No saved runtime state — budget=full, trends=empty");
+    }
+
+    // Restore dusk detector phase from NVS (persisted across reboots)
+    if (!duskStateLoad(g_duskDetector)) {
+        Serial.println("[CTRL] No saved dusk state — starting as NIGHT");
+    }
 
     // Tick counters
     uint32_t lastTick10ms  = millis();
@@ -150,8 +297,11 @@ static void controlTaskFn(void* /*param*/) {
     uint32_t lastTick1s    = millis();
     uint32_t lastLogDump   = millis() - 25000;   // first status dump after ~5s
     uint32_t lastEspAliveLog = millis() - 8000;
+    uint32_t lastRuntimeSave = millis();
+    float    prevTotalPumped = g_budget.totalPumpedMl;  // track pump events
 
     SensorSnapshot snap{};
+    bool duskBootstrapped = false;  // one-shot lux-based phase check
 
     for (;;) {
         uint32_t now = millis();
@@ -170,6 +320,12 @@ static void controlTaskFn(void* /*param*/) {
 
             // 100ms: pełny odczyt sensorów
             g_hardware.readAllSensors(now, g_config, snap);
+
+            // One-shot: bootstrap dusk phase from first valid lux reading
+            if (!duskBootstrapped && snap.env.lux > 0.0f) {
+                duskBootstrap(g_duskDetector, snap.env.lux);
+                duskBootstrapped = true;
+            }
 
             // EMA filtracja moisture per-pot
             for (uint8_t i = 0; i < g_config.numPots; ++i) {
@@ -212,6 +368,20 @@ static void controlTaskFn(void* /*param*/) {
 
             // Budżet rezerwuaru
             updateWaterBudget(now, snap, g_budget, g_config);
+
+            // ── Runtime state save triggers ──
+            // Immediate save when water was pumped (budget changed materially)
+            if (g_budget.totalPumpedMl != prevTotalPumped) {
+                prevTotalPumped = g_budget.totalPumpedMl;
+                s_runtimeDirty = true;
+                // Save immediately after pump event (critical data)
+                saveRuntimeNow(lastRuntimeSave);
+            }
+        }
+
+        // Periodic runtime state save (every 60s if anything changed)
+        if (now - lastTick1s < 100) {  // only check at ~1Hz to avoid churn
+            saveRuntimeIfDirty(now, lastRuntimeSave);
         }
 
         if (now - lastTick1s >= 1000) {
@@ -220,8 +390,15 @@ static void controlTaskFn(void* /*param*/) {
             // Trend analysis per-pot
             for (uint8_t i = 0; i < g_config.numPots; ++i) {
                 if (!g_config.pots[i].enabled) continue;
+                bool wasCal = g_trendStates[i].baselineCalibrated;
+                uint8_t prevCount = g_trendStates[i].count;
                 trendTick(now, snap.pots[i].moistureEma,
                           g_trendStates[i], g_config);
+                // Mark dirty if trend data changed (new hourly delta or baseline learned)
+                if (g_trendStates[i].count != prevCount ||
+                    g_trendStates[i].baselineCalibrated != wasCal) {
+                    s_runtimeDirty = true;
+                }
             }
 
             // Dusk detector
@@ -435,7 +612,9 @@ static void controlTaskFn(void* /*param*/) {
 
                 case EventType::REQUEST_REFILL:
                     handleRefill(g_budget, g_config);
-                    Serial.println("[CTRL] reservoir refilled");
+                    s_runtimeDirty = true;
+                    saveRuntimeNow(lastRuntimeSave);
+                    Serial.println("[CTRL] reservoir refilled + runtime saved");
                     break;
 
                 case EventType::REQUEST_VACATION_TOGGLE:

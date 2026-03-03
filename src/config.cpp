@@ -248,7 +248,63 @@ void configFactoryReset() {
         prefs.clear();
         prefs.end();
     }
+    {
+        Preferences prefs;
+        prefs.begin(kNvsDusk, false);
+        prefs.clear();
+        prefs.end();
+    }
+    {
+        Preferences prefs;
+        prefs.begin(kNvsRuntime, false);
+        prefs.clear();
+        prefs.end();
+    }
     Serial.println("[CONFIG] All NVS cleared. Restarting...");
+}
+
+// ---------------------------------------------------------------------------
+// RuntimeState — NVS persist
+// ---------------------------------------------------------------------------
+bool runtimeStateSave(const RuntimeState& rs) {
+    Preferences prefs;
+    if (!prefs.begin(kNvsRuntime, false)) {
+        Serial.println("[RUNTIME] NVS save: can't open namespace");
+        return false;
+    }
+    prefs.putUShort("schema", kRuntimeSchema);
+    size_t written = prefs.putBytes("state", &rs, sizeof(RuntimeState));
+    prefs.end();
+    return written == sizeof(RuntimeState);
+}
+
+bool runtimeStateLoad(RuntimeState& rs) {
+    Preferences prefs;
+    rs = RuntimeState{};
+    if (!prefs.begin(kNvsRuntime, true)) return false;
+    if (!prefs.isKey("schema") || !prefs.isKey("state")) { prefs.end(); return false; }
+
+    uint16_t schema = prefs.getUShort("schema", 0);
+    if (schema != kRuntimeSchema) {
+        Serial.printf("[RUNTIME] schema mismatch (nvs=%d, expected=%d) — discarding\n",
+                      schema, kRuntimeSchema);
+        prefs.end();
+        return false;
+    }
+
+    size_t len = prefs.getBytes("state", &rs, sizeof(RuntimeState));
+    prefs.end();
+
+    if (len != sizeof(RuntimeState)) {
+        Serial.printf("[RUNTIME] NVS size mismatch (%d vs %d)\n", (int)len, (int)sizeof(RuntimeState));
+        rs = RuntimeState{};
+        return false;
+    }
+
+    Serial.printf("[RUNTIME] Loaded: reservoir=%.0fml pumped=%.1fml low=%s\n",
+                  rs.reservoirCurrentMl, rs.totalPumpedMl,
+                  rs.reservoirLow ? "YES" : "no");
+    return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -355,7 +355,7 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     C.setTextSize(1);
     iconDrop(4, 52);                 // 💧 zawsze niebieska
     C.setTextColor(rColor);
-    snprintf(buf, sizeof(buf), "%.1fL", bud.reservoirCurrentMl / 1000.0f);
+    snprintf(buf, sizeof(buf), "%.0fml", bud.reservoirCurrentMl);
     C.drawString(buf, TXI, 55);
 
     C.setTextColor(COL_DIM);
@@ -595,7 +595,7 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
     C.setTextSize(1);
     iconDrop(4, 98);                 // 💧
     C.setTextColor(rColor);
-    snprintf(buf, sizeof(buf), "%.1fL", bud.reservoirCurrentMl / 1000.0f);
+    snprintf(buf, sizeof(buf), "%.0fml", bud.reservoirCurrentMl);
     C.drawString(buf, TXI, 101);
     C.setTextColor(COL_DIM);
     snprintf(buf, sizeof(buf), "~%dd", (int)bud.daysRemaining);

@@ -19,9 +19,13 @@ static constexpr uint8_t  kNumProfiles  = 6;  // Pomidor..Custom
 static constexpr uint16_t kConfigSchema = 2;  // wersja schematu NVS
 
 // NVS namespace names
-static constexpr const char* kNvsConfig = "ag_config";
-static constexpr const char* kNvsNet    = "ag_net";
-static constexpr const char* kNvsHist   = "ag_hist";
+static constexpr const char* kNvsConfig  = "ag_config";
+static constexpr const char* kNvsNet     = "ag_net";
+static constexpr const char* kNvsHist    = "ag_hist";
+static constexpr const char* kNvsDusk    = "ag_dusk";
+static constexpr const char* kNvsRuntime = "ag_runtime";
+
+static constexpr uint16_t kRuntimeSchema = 2;  // bump on struct change
 
 // ---------------------------------------------------------------------------
 // Profil rośliny (PlantProfile) — PLAN.md → "Profile roślin"
@@ -218,6 +222,40 @@ extern const HardwareConfig g_hwConfig;
 // Walidacja — zwraca true jeśli OK, false + loguje powody
 bool     configValidate(const Config& cfg);
 
+// ---------------------------------------------------------------------------
+// RuntimeState — volatile data persisted to NVS for survival across reboots
+// Everything the system LEARNS at runtime: budget, trends, cooldowns.
+// Only cleared by factory reset or schema bump.
+// ---------------------------------------------------------------------------
+struct RuntimeState {
+    uint16_t schema = kRuntimeSchema;
+
+    // ── Water Budget ──
+    float    reservoirCurrentMl      = 0.0f;
+    float    totalPumpedMl           = 0.0f;
+    float    totalPumpedMlPerPot[kMaxPots] = {};
+    bool     reservoirLow            = false;
+
+    // ── Trend Baselines (per-pot) ──
+    float    normalDryingRate[kMaxPots]    = {};   // learned %/h
+    bool     baselineCalibrated[kMaxPots]  = {};
+    float    hourlyDeltas[kMaxPots][24]    = {};   // full ring buffers
+    uint8_t  trendHeadIdx[kMaxPots]        = {};
+    uint8_t  trendCount[kMaxPots]          = {};
+
+    // ── Cooldown — seconds since last cycle completed (0 = unknown) ──
+    uint32_t secsSinceLastCycleDone[kMaxPots] = {};
+
+    // ── Refill timestamp (seconds since last refill at save time) ──
+    uint32_t secsSinceRefill          = 0;
+
+    // ── Solar clock supplement ──
+    uint8_t  solarCycleCount         = 0;
+    bool     solarCalibrated         = false;
+
+    uint8_t  _pad[2] = {};
+};
+
 // NVS persist
 bool     configLoad(Config& cfg);
 bool     configSave(const Config& cfg);
@@ -227,8 +265,12 @@ void     configLoadDefaults(Config& cfg);
 bool     netConfigLoad(NetConfig& net);
 bool     netConfigSave(const NetConfig& net);
 
-// Factory reset — czyści oba namespace'y
+// Factory reset — czyści wszystkie namespace'y NVS
 void     configFactoryReset();
+
+// RuntimeState NVS persist
+bool     runtimeStateSave(const RuntimeState& rs);
+bool     runtimeStateLoad(RuntimeState& rs);
 
 // Helper: pobierz aktywny profil dla doniczki
 const PlantProfile& getActiveProfile(const Config& cfg, uint8_t potIdx);
