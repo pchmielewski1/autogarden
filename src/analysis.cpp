@@ -12,6 +12,9 @@
 #include <Preferences.h>
 #include <algorithm>
 #include <cmath>
+#include "log_serial.h"
+
+#define Serial AGSerial
 
 // ===========================================================================
 // Globalne instancje
@@ -32,7 +35,7 @@ float EmaFilter::update(float sample, uint32_t nowMs) {
     uint32_t gap = nowMs - lastUpdateMs;
     if (gap > kMaxGapMs) {
         // Sensor był offline >60s → reinicjalizuj
-        Serial.printf("EMA_REINIT gap=%dms\n", gap);
+        Serial.printf("[ANL] event=ema_reinit gap_ms=%u\n", gap);
         value = sample;
     } else {
         value = alpha * sample + (1.0f - alpha) * value;
@@ -108,16 +111,16 @@ void trendTick(uint32_t nowMs, float moisturePct, TrendState& ts, const Config& 
     if (ts.baselineCalibrated) {
         float threshold = ts.normalDryingRate * cfg.anomalyDryingRateMultiplier;
         if (deltaPerHour < threshold) {
-            Serial.printf("TREND_ANOMALY rate=%.1f%%/h normal=%.1f%%/h\n",
+            Serial.printf("[ANL] event=trend_anomaly rate_pct_h=%.1f baseline_pct_h=%.1f\n",
                           deltaPerHour, ts.normalDryingRate);
         }
     } else {
         if (deltaPerHour < -cfg.anomalyDryingRateThreshold) {
-            Serial.printf("TREND_ANOMALY rate=%.1f%%/h (no baseline yet)\n", deltaPerHour);
+            Serial.printf("[ANL] event=trend_anomaly rate_pct_h=%.1f baseline=unlearned\n", deltaPerHour);
         }
     }
 
-    Serial.printf("TREND delta=%.2f%%/h baseline=%.2f%%/h calibrated=%s\n",
+    Serial.printf("[ANL] event=trend_sample delta_pct_h=%.2f baseline_pct_h=%.2f calibrated=%s\n",
                   deltaPerHour, ts.normalDryingRate,
                   ts.baselineCalibrated ? "yes" : "no");
 }
@@ -340,7 +343,7 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
             }
             det.phase = DuskPhase::DAWN_TRANSITION;
             det.transitionStartMs = nowMs;
-            Serial.printf("DAWN_TRANSITION_START score=%.2f lux=%.0f\n", det.dawnScore, lux);
+            Serial.printf("[DUSK] event=dawn_transition_start score=%.2f lux=%.0f\n", det.dawnScore, lux);
         }
         break;
     }
@@ -357,22 +360,22 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
 
         if (det.dawnScore < cancelTh) {
             det.phase = DuskPhase::NIGHT;
-            Serial.printf("DAWN_CANCEL score=%.2f after %dmin\n",
+            Serial.printf("[DUSK] event=dawn_cancel score=%.2f elapsed_min=%u\n",
                           det.dawnScore, elapsed / 60000);
         } else if (det.dawnScore >= confirmTh && elapsed >= cfg.transitionConfirmMs) {
             det.phase = DuskPhase::DAY;
             det.lastDawnMs = nowMs;
             if (det.lastDuskMs > 0) {
                 det.nightLengthMs = nowMs - det.lastDuskMs;
-                Serial.printf("DAWN_CONFIRMED night_was=%dmin\n", det.nightLengthMs / 60000);
+                Serial.printf("[DUSK] event=dawn_confirmed night_len_min=%u\n", det.nightLengthMs / 60000);
             } else {
-                Serial.println("DAWN_CONFIRMED (first since boot)");
+                Serial.println("[DUSK] event=dawn_confirmed first_since_boot=yes");
             }
             duskStateSave(det);
         } else if (elapsed > DuskDetector::kTransitionMaxDurationMs) {
             det.phase = DuskPhase::DAY;
             det.lastDawnMs = nowMs;
-            Serial.printf("DAWN_TIMEOUT — assuming day after %dmin\n", elapsed / 60000);
+            Serial.printf("[DUSK] event=dawn_timeout elapsed_min=%u action=assume_day\n", elapsed / 60000);
             duskStateSave(det);
         }
         break;
@@ -393,7 +396,7 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
             }
             det.phase = DuskPhase::DUSK_TRANSITION;
             det.transitionStartMs = nowMs;
-            Serial.printf("DUSK_TRANSITION_START score=%.2f lux=%.0f dLux=%.1f/min\n",
+            Serial.printf("[DUSK] event=dusk_transition_start score=%.2f lux=%.0f dlux_per_min=%.1f\n",
                           det.duskScore, lux, deriv.dLux_dt);
         }
         break;
@@ -407,7 +410,7 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
 
         if (det.duskScore < cfg.duskScoreCancelThreshold) {
             det.phase = DuskPhase::DAY;
-            Serial.printf("DUSK_CANCEL score=%.2f after %dmin lux=%.0f\n",
+            Serial.printf("[DUSK] event=dusk_cancel score=%.2f elapsed_min=%u lux=%.0f\n",
                           det.duskScore, elapsed / 60000, lux);
         } else if (det.duskScore >= cfg.duskScoreConfirmThreshold
                    && elapsed >= cfg.transitionConfirmMs)
@@ -416,9 +419,9 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
             det.lastDuskMs = nowMs;
             if (det.lastDawnMs > 0) {
                 det.dayLengthMs = nowMs - det.lastDawnMs;
-                Serial.printf("DUSK_CONFIRMED day_was=%dmin\n", det.dayLengthMs / 60000);
+                Serial.printf("[DUSK] event=dusk_confirmed day_len_min=%u\n", det.dayLengthMs / 60000);
             } else {
-                Serial.println("DUSK_CONFIRMED (first since boot)");
+                Serial.println("[DUSK] event=dusk_confirmed first_since_boot=yes");
             }
             duskStateSave(det);
             // >>> PODLEWANIE OKNO <<<
@@ -426,7 +429,7 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
         } else if (elapsed > DuskDetector::kTransitionMaxDurationMs) {
             det.phase = DuskPhase::NIGHT;
             det.lastDuskMs = nowMs;
-            Serial.printf("DUSK_TIMEOUT — assuming night after %dmin\n", elapsed / 60000);
+            Serial.printf("[DUSK] event=dusk_timeout elapsed_min=%u action=assume_night\n", elapsed / 60000);
             duskStateSave(det);
         }
         break;
@@ -441,7 +444,7 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
 bool duskStateSave(const DuskDetector& det) {
     Preferences prefs;
     if (!prefs.begin(kNvsDusk, false)) {
-        Serial.println("[DUSK] NVS save: can't open namespace");
+        Serial.println("[DUSK] event=nvs_save_failed reason=open_namespace");
         return false;
     }
     DuskState st;
@@ -450,7 +453,7 @@ bool duskStateSave(const DuskDetector& det) {
     st.nightLengthMs = det.nightLengthMs;
     size_t written = prefs.putBytes("dusk", &st, sizeof(DuskState));
     prefs.end();
-    Serial.printf("[DUSK] NVS saved: phase=%d day=%dm night=%dm\n",
+    Serial.printf("[DUSK] event=nvs_saved phase=%d day_min=%u night_min=%u\n",
                   st.phase, st.dayLengthMs / 60000, st.nightLengthMs / 60000);
     return written == sizeof(DuskState);
 }
@@ -482,7 +485,7 @@ bool duskStateLoad(DuskDetector& det) {
     det.phase = restored;
     det.dayLengthMs   = st.dayLengthMs;
     det.nightLengthMs = st.nightLengthMs;
-    Serial.printf("[DUSK] NVS restored: phase=%s day=%dm night=%dm\n",
+    Serial.printf("[DUSK] event=nvs_restored phase=%s day_min=%u night_min=%u\n",
                   (restored == DuskPhase::DAY) ? "DAY" : "NIGHT",
                   st.dayLengthMs / 60000, st.nightLengthMs / 60000);
     return true;
@@ -497,12 +500,12 @@ void duskBootstrap(DuskDetector& det, float lux) {
     DuskPhase before = det.phase;
     if (lux > 200.0f && det.phase == DuskPhase::NIGHT) {
         det.phase = DuskPhase::DAY;
-        Serial.printf("[DUSK] bootstrap: lux=%.0f → DAY (was NIGHT)\n", lux);
+        Serial.printf("[DUSK] event=bootstrap lux=%.0f from=NIGHT to=DAY\n", lux);
     } else if (lux < 5.0f && det.phase == DuskPhase::DAY) {
         det.phase = DuskPhase::NIGHT;
-        Serial.printf("[DUSK] bootstrap: lux=%.0f → NIGHT (was DAY)\n", lux);
+        Serial.printf("[DUSK] event=bootstrap lux=%.0f from=DAY to=NIGHT\n", lux);
     } else {
-        Serial.printf("[DUSK] bootstrap: lux=%.0f → keeping %s from NVS\n", lux,
+        Serial.printf("[DUSK] event=bootstrap lux=%.0f action=keep_nvs phase=%s\n", lux,
                       (det.phase == DuskPhase::DAY) ? "DAY" : "NIGHT");
     }
 }
@@ -524,7 +527,7 @@ void updateSolarClock(const DuskDetector& det, SolarClock& clk) {
             if (det.lastDawnMs > 0 && det.lastDuskMs > 0) {
                 clk.cycleCount++;
             }
-            Serial.printf("SOLAR_CLOCK day=%dh%dm night=%dh%dm cycle=%d\n",
+            Serial.printf("[SOLAR] event=clock_update day_h=%u day_m=%u night_h=%u night_m=%u cycle=%u\n",
                           clk.dayLengthMs / 3600000, (clk.dayLengthMs / 60000) % 60,
                           clk.nightLengthMs / 3600000, (clk.nightLengthMs / 60000) % 60,
                           clk.cycleCount);

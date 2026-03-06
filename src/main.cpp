@@ -28,6 +28,9 @@
 #include "analysis.h"
 #include "ui.h"
 #include "network.h"
+#include "log_serial.h"
+
+#define Serial AGSerial
 
 // ============================================================================
 // Globalne instancje (zadeklarowane extern w headerach, zdefiniowane tutaj)
@@ -38,8 +41,6 @@ EventQueue      g_eventQueue;
 // Config
 Config          g_config;
 NetConfig       g_netConfig;
-
-static const char* kLogTag = "AUTOGARDEN";
 
 // Hardware
 HardwareManager g_hardware;
@@ -140,6 +141,69 @@ static void setSelectedPotFromUi(uint8_t selectedPot) {
     }
 }
 
+static uint32_t hashMix(uint32_t hash, uint32_t v) {
+    hash ^= v;
+    hash *= 16777619u;
+    return hash;
+}
+
+static uint32_t quantizeX10(float v) {
+    return static_cast<uint32_t>(static_cast<int32_t>(v * 10.0f));
+}
+
+static uint32_t bucket(float v, float step) {
+    if (step <= 0.0f) return 0;
+    return static_cast<uint32_t>(static_cast<int32_t>(v / step));
+}
+
+static uint32_t statusDigest(const SensorSnapshot& snap) {
+    uint32_t h = 2166136261u;
+    h = hashMix(h, bucket(snap.env.tempC, 1.0f));
+    h = hashMix(h, bucket(snap.env.humidityPct, 3.0f));
+    h = hashMix(h, bucket(snap.env.lux, 500.0f));
+    h = hashMix(h, bucket(snap.env.pressureHpa, 1.0f));
+    h = hashMix(h, bucket(g_budget.reservoirCurrentMl, 25.0f));
+    h = hashMix(h, bucket(g_budget.totalPumpedMl, 5.0f));
+
+    for (uint8_t i = 0; i < g_config.numPots; ++i) {
+        if (!g_config.pots[i].enabled) continue;
+        const auto& ps = snap.pots[i];
+        h = hashMix(h, i);
+        h = hashMix(h, bucket(ps.moisturePct, 3.0f));
+        h = hashMix(h, bucket(ps.moistureEma, 3.0f));
+    }
+    return h;
+}
+
+static uint32_t statusCriticalDigest(const SensorSnapshot& snap) {
+    uint32_t h = 2166136261u;
+    h = hashMix(h, static_cast<uint32_t>(g_config.mode));
+    h = hashMix(h, g_config.numPots);
+    h = hashMix(h, g_config.vacationMode ? 1u : 0u);
+    h = hashMix(h, g_budget.reservoirLow ? 1u : 0u);
+    h = hashMix(h, static_cast<uint32_t>(g_duskDetector.phase));
+
+    for (uint8_t i = 0; i < g_config.numPots; ++i) {
+        if (!g_config.pots[i].enabled) continue;
+        const auto& ps = snap.pots[i];
+        const auto& cyc = g_cycles[i];
+        h = hashMix(h, i);
+        h = hashMix(h, static_cast<uint32_t>(cyc.phase));
+        h = hashMix(h, cyc.pulseCount);
+        h = hashMix(h, ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? 1u : 0u);
+        h = hashMix(h, ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? 1u : 0u);
+    }
+    return h;
+}
+
+static uint32_t ctrlAliveDigest(Mode mode, bool wifiConnected, uint32_t freeHeap) {
+    uint32_t h = 2166136261u;
+    h = hashMix(h, static_cast<uint32_t>(mode));
+    h = hashMix(h, wifiConnected ? 1u : 0u);
+    h = hashMix(h, freeHeap / 8192u);
+    return h;
+}
+
 // ============================================================================
 // ConfigTask — debounced NVS save (niski priorytet)
 // PLAN.md → "Zapis asynchroniczny (nie blokować ControlTask)"
@@ -162,7 +226,7 @@ static void configTaskFn(void* /*param*/) {
 
         if (hasPending && (millis() - lastReqMs) >= kDebounceMs) {
             bool ok = configSave(pending);
-            Serial.printf("[CFG] save %s\n", ok ? "OK" : "FAIL");
+            Serial.printf("[CFG] event=save result=%s\n", ok ? "ok" : "fail");
             hasPending = false;
         }
     }
@@ -272,7 +336,7 @@ static bool forcePumpOffWithRetry(uint8_t potIdx, uint32_t nowMs,
 // ============================================================================
 
 static void controlTaskFn(void* /*param*/) {
-    Serial.println("[CTRL] started");
+    Serial.println("[CTRL] event=task_started");
 
     // Inicjalizacja EMA per-pot
     for (uint8_t i = 0; i < kMaxPots; ++i) {
@@ -351,21 +415,28 @@ static void controlTaskFn(void* /*param*/) {
         // No saved state — assume full reservoir (first boot or post-reset)
         g_budget.reservoirCurrentMl = g_config.reservoirCapacityMl;
         g_budget.lastRefillMs = millis();  // treat first boot as fresh refill
-        Serial.println("[CTRL] No saved runtime state — budget=full, trends=empty");
+        Serial.println("[CTRL] event=runtime_restore result=missing action=defaults");
     }
 
     // Restore dusk detector phase from NVS (persisted across reboots)
     if (!duskStateLoad(g_duskDetector)) {
-        Serial.println("[CTRL] No saved dusk state — starting as NIGHT");
+        Serial.println("[CTRL] event=dusk_restore result=missing phase=NIGHT");
     }
 
     // Tick counters
     uint32_t lastTick10ms  = millis();
     uint32_t lastTick100ms = millis();
     uint32_t lastTick1s    = millis();
-    uint32_t lastLogDump   = millis() - 25000;   // first status dump after ~5s
-    uint32_t lastEspAliveLog = millis() - 8000;
+    uint32_t lastStatusEvalMs = 0;
+    uint32_t lastCtrlAliveEvalMs = millis() - 8000;
+    uint32_t lastCtrlAliveEmitMs = 0;
     uint32_t lastRuntimeSave = millis();
+    uint32_t lastStatusDigest = 0;
+    uint32_t lastCriticalStatusDigest = 0;
+    uint32_t lastCtrlAliveDigest = 0;
+    uint32_t lastFullStatusMs = 0;
+    bool statusDigestInit = false;
+    bool ctrlAliveDigestInit = false;
     float    prevTotalPumped = g_budget.totalPumpedMl;  // track pump events
 
     SensorSnapshot snap{};
@@ -511,143 +582,160 @@ static void controlTaskFn(void* /*param*/) {
             publishSharedStateFromControl();
         }
 
-        // ==================== 30s PERIODIC STATUS DUMP ====================
-        if (now - lastLogDump >= 30000) {
-            lastLogDump = now;
+        // ==================== STATUS DUMP (change-driven + keepalive) ====================
+        if (now - lastStatusEvalMs >= 1000) {
+            lastStatusEvalMs = now;
             uint32_t upSec = now / 1000;
+            uint32_t digest = statusDigest(snap);
+            uint32_t criticalDigest = statusCriticalDigest(snap);
+            bool firstEmit = !statusDigestInit;
+            bool criticalChanged = firstEmit || (criticalDigest != lastCriticalStatusDigest);
+            bool telemetryChanged = firstEmit || (digest != lastStatusDigest);
+            bool keepaliveDue = (lastFullStatusMs == 0) || ((now - lastFullStatusMs) >= 900000);
+            bool telemetryWindowOpen = (lastFullStatusMs == 0) || ((now - lastFullStatusMs) >= 120000);
 
-            Serial.println("----- STATUS -----");
-            Serial.printf("[SYS] uptime=%dm%ds heap=%d freeMin=%d\n",
-                          upSec / 60, upSec % 60,
-                          (int)ESP.getFreeHeap(), (int)ESP.getMinFreeHeap());
-            Serial.printf("[SYS] mode=%s numPots=%d vacation=%s\n",
-                          g_config.mode == Mode::AUTO ? "AUTO" : "MANUAL",
-                          g_config.numPots,
-                          g_config.vacationMode ? "ON" : "OFF");
+            if (criticalChanged || keepaliveDue || (telemetryChanged && telemetryWindowOpen)) {
+                lastStatusDigest = digest;
+                lastCriticalStatusDigest = criticalDigest;
+                statusDigestInit = true;
+                lastFullStatusMs = now;
 
-            // Env sensors
-            Serial.printf("[ENV] temp=%.1fC hum=%.1f%% lux=%.0f press=%.1fhPa\n",
-                          snap.env.tempC, snap.env.humidityPct,
-                          snap.env.lux, snap.env.pressureHpa);
+                Serial.println("[STATUS] event=begin");
+                Serial.printf("[SYS] uptime=%dm%ds heap=%d freeMin=%d\n",
+                              upSec / 60, upSec % 60,
+                              (int)ESP.getFreeHeap(), (int)ESP.getMinFreeHeap());
+                Serial.printf("[SYS] mode=%s numPots=%d vacation=%s\n",
+                              g_config.mode == Mode::AUTO ? "AUTO" : "MANUAL",
+                              g_config.numPots,
+                              g_config.vacationMode ? "ON" : "OFF");
 
-            // Per-pot
-            for (uint8_t i = 0; i < g_config.numPots; ++i) {
-                if (!g_config.pots[i].enabled) continue;
-                const auto& ps = snap.pots[i];
-                const auto& cyc = g_cycles[i];
-                const char* phaseStr = "?";
-                switch (cyc.phase) {
-                    case WateringPhase::IDLE:          phaseStr = "IDLE"; break;
-                    case WateringPhase::EVALUATING:    phaseStr = "EVAL"; break;
-                    case WateringPhase::PULSE:         phaseStr = "PULSE"; break;
-                    case WateringPhase::SOAK:          phaseStr = "SOAK"; break;
-                    case WateringPhase::MEASURING:     phaseStr = "MEAS"; break;
-                    case WateringPhase::OVERFLOW_WAIT: phaseStr = "OFLOW"; break;
-                    case WateringPhase::DONE:          phaseStr = "DONE"; break;
-                    case WateringPhase::BLOCKED:       phaseStr = "BLOCK"; break;
-                }
-                Serial.printf("[POT%d] raw=%d comp=%.0f pct=%.1f%% ema=%.1f%% phase=%s\n",
-                              i, ps.moistureRaw, ps.moistureComp,
-                              ps.moisturePct, ps.moistureEma, phaseStr);
+                Serial.printf("[ENV] temp=%.1fC hum=%.1f%% lux=%.0f press=%.1fhPa\n",
+                              snap.env.tempC, snap.env.humidityPct,
+                              snap.env.lux, snap.env.pressureHpa);
 
-                // When IDLE in AUTO mode — show WHY not watering
-                if (cyc.phase == WateringPhase::IDLE && g_config.mode == Mode::AUTO) {
-                    const PlantProfile& pr = getActiveProfile(g_config, i);
-                    float effTarget = pr.targetMoisturePct;
-                    if (g_config.vacationMode) {
-                        effTarget -= g_config.vacationTargetReductionPct;
-                        if (effTarget < 5.0f) effTarget = 5.0f;
+                for (uint8_t i = 0; i < g_config.numPots; ++i) {
+                    if (!g_config.pots[i].enabled) continue;
+                    const auto& ps = snap.pots[i];
+                    const auto& cyc = g_cycles[i];
+                    const char* phaseStr = "?";
+                    switch (cyc.phase) {
+                        case WateringPhase::IDLE:          phaseStr = "IDLE"; break;
+                        case WateringPhase::EVALUATING:    phaseStr = "EVAL"; break;
+                        case WateringPhase::PULSE:         phaseStr = "PULSE"; break;
+                        case WateringPhase::SOAK:          phaseStr = "SOAK"; break;
+                        case WateringPhase::MEASURING:     phaseStr = "MEAS"; break;
+                        case WateringPhase::OVERFLOW_WAIT: phaseStr = "OFLOW"; break;
+                        case WateringPhase::DONE:          phaseStr = "DONE"; break;
+                        case WateringPhase::BLOCKED:       phaseStr = "BLOCK"; break;
                     }
-                    float trigPct = effTarget - pr.hysteresisPct;
+                    Serial.printf("[POT%d] raw=%d comp=%.0f pct=%.1f%% ema=%.1f%% phase=%s\n",
+                                  i, ps.moistureRaw, ps.moistureComp,
+                                  ps.moisturePct, ps.moistureEma, phaseStr);
 
-                    // Cooldown?
-                    uint32_t effCd = g_config.cooldownMs;
-                    if (g_config.vacationMode)
-                        effCd = static_cast<uint32_t>(effCd * g_config.vacationCooldownMultiplier);
-                    bool cooling = (g_actuator.lastCycleDoneMs[i] != 0) &&
-                                   (now - g_actuator.lastCycleDoneMs[i] < effCd);
+                    if (cyc.phase == WateringPhase::IDLE && g_config.mode == Mode::AUTO) {
+                        const PlantProfile& pr = getActiveProfile(g_config, i);
+                        float effTarget = pr.targetMoisturePct;
+                        if (g_config.vacationMode) {
+                            effTarget -= g_config.vacationTargetReductionPct;
+                            if (effTarget < 5.0f) effTarget = 5.0f;
+                        }
+                        float trigPct = effTarget - pr.hysteresisPct;
 
-                    const char* idleReason = "moisture_ok";
-                    if (cooling)
-                        idleReason = "COOLDOWN";
-                    else if (snap.env.tempC > g_config.heatBlockTempC)
-                        idleReason = "HEAT_BLOCK";
-                    else if (snap.env.lux > g_config.directSunLuxThreshold)
-                        idleReason = "DIRECT_SUN";
-                    else if (ps.moisturePct >= trigPct)
-                        idleReason = "moisture_ok";
-                    else
-                        idleReason = "SHOULD_START";   // something wrong if we see this
+                        uint32_t effCd = g_config.cooldownMs;
+                        if (g_config.vacationMode)
+                            effCd = static_cast<uint32_t>(effCd * g_config.vacationCooldownMultiplier);
+                        bool cooling = (g_actuator.lastCycleDoneMs[i] != 0) &&
+                                       (now - g_actuator.lastCycleDoneMs[i] < effCd);
 
-                    Serial.printf("[POT%d] idle: target=%.0f%% trigger=%.0f%% profile=%s puls=%dml reason=%s\n",
-                                  i, effTarget, trigPct, pr.name,
-                                  g_config.pots[i].pulseWaterMl, idleReason);
-                    if (cooling) {
-                        uint32_t cdLeft = effCd - (now - g_actuator.lastCycleDoneMs[i]);
-                        Serial.printf("[POT%d] cooldown_remaining=%ds\n", i, cdLeft / 1000);
+                        const char* idleReason = "moisture_ok";
+                        if (cooling)
+                            idleReason = "COOLDOWN";
+                        else if (snap.env.tempC > g_config.heatBlockTempC)
+                            idleReason = "HEAT_BLOCK";
+                        else if (snap.env.lux > g_config.directSunLuxThreshold)
+                            idleReason = "DIRECT_SUN";
+                        else if (ps.moisturePct >= trigPct)
+                            idleReason = "moisture_ok";
+                        else
+                            idleReason = "SHOULD_START";
+
+                        Serial.printf("[POT%d] idle: target=%.0f%% trigger=%.0f%% profile=%s puls=%dml reason=%s\n",
+                                      i, effTarget, trigPct, pr.name,
+                                      g_config.pots[i].pulseWaterMl, idleReason);
+                        if (cooling) {
+                            uint32_t cdLeft = effCd - (now - g_actuator.lastCycleDoneMs[i]);
+                            Serial.printf("[POT%d] cooldown_remaining=%ds\n", i, cdLeft / 1000);
+                        }
+                    }
+
+                    Serial.printf("[POT%d] overflow=%s reservoir=%s crosstalk=%s\n",
+                                  i,
+                                  ps.waterGuards.potMax == WaterLevelState::OK ? "OK" :
+                                  ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
+                                  ps.waterGuards.reservoirMin == WaterLevelState::OK ? "OK" :
+                                  ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
+                                  ps.crosstalkUplift ? "yes" : "no");
+                    if (cyc.phase != WateringPhase::IDLE && cyc.phase != WateringPhase::DONE) {
+                        Serial.printf("[POT%d] pulse=%d/%d pumped=%.1fml phaseSince=%ds\n",
+                                      i, cyc.pulseCount, cyc.maxPulses,
+                                      cyc.totalPumpedMl,
+                                      (int)((now - cyc.phaseStartMs) / 1000));
+                    }
+
+                    const auto& tr = g_trendStates[i];
+                    if (tr.count > 0) {
+                        Serial.printf("[POT%d] trend rate=%.2f%%/h baseline=%.2f cal=%s samples=%d\n",
+                                      i, trendCurrentRate(i), tr.normalDryingRate,
+                                      tr.baselineCalibrated ? "yes" : "no", tr.count);
                     }
                 }
 
-                Serial.printf("[POT%d] overflow=%s reservoir=%s crosstalk=%s\n",
-                              i,
-                              ps.waterGuards.potMax == WaterLevelState::OK ? "OK" :
-                              ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
-                              ps.waterGuards.reservoirMin == WaterLevelState::OK ? "OK" :
-                              ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
-                              ps.crosstalkUplift ? "yes" : "no");
-                if (cyc.phase != WateringPhase::IDLE && cyc.phase != WateringPhase::DONE) {
-                    Serial.printf("[POT%d] pulse=%d/%d pumped=%.1fml phaseSince=%ds\n",
-                                  i, cyc.pulseCount, cyc.maxPulses,
-                                  cyc.totalPumpedMl,
-                                  (int)((now - cyc.phaseStartMs) / 1000));
+                Serial.printf("[BUDGET] current=%.0fml total_pumped=%.1fml capacity=%.0fml low=%s\n",
+                              g_budget.reservoirCurrentMl, g_budget.totalPumpedMl,
+                              g_budget.reservoirCapacityMl,
+                              g_budget.reservoirLow ? "YES" : "no");
+
+                const char* duskStr = "?";
+                switch (g_duskDetector.phase) {
+                    case DuskPhase::NIGHT:           duskStr = "NIGHT"; break;
+                    case DuskPhase::DAWN_TRANSITION: duskStr = "DAWN_TR"; break;
+                    case DuskPhase::DAY:             duskStr = "DAY"; break;
+                    case DuskPhase::DUSK_TRANSITION: duskStr = "DUSK_TR"; break;
                 }
-                // Trend
-                const auto& tr = g_trendStates[i];
-                if (tr.count > 0) {
-                    Serial.printf("[POT%d] trend rate=%.2f%%/h baseline=%.2f cal=%s samples=%d\n",
-                                  i, trendCurrentRate(i), tr.normalDryingRate,
-                                  tr.baselineCalibrated ? "yes" : "no", tr.count);
+                Serial.printf("[DUSK] phase=%s dawnScore=%.2f duskScore=%.2f samples=%d\n",
+                              duskStr, g_duskDetector.dawnScore, g_duskDetector.duskScore,
+                              g_duskDetector.count);
+                if (g_solarClock.calibrated) {
+                    Serial.printf("[SOLAR] day=%dh%dm night=%dh%dm cycles=%d\n",
+                                  g_solarClock.dayLengthMs / 3600000,
+                                  (g_solarClock.dayLengthMs / 60000) % 60,
+                                  g_solarClock.nightLengthMs / 3600000,
+                                  (g_solarClock.nightLengthMs / 60000) % 60,
+                                  g_solarClock.cycleCount);
                 }
-            }
 
-            // Budget
-            Serial.printf("[BUDGET] current=%.0fml total_pumped=%.1fml capacity=%.0fml low=%s\n",
-                          g_budget.reservoirCurrentMl, g_budget.totalPumpedMl,
-                          g_budget.reservoirCapacityMl,
-                          g_budget.reservoirLow ? "YES" : "no");
-
-            // Dusk detector
-            const char* duskStr = "?";
-            switch (g_duskDetector.phase) {
-                case DuskPhase::NIGHT:           duskStr = "NIGHT"; break;
-                case DuskPhase::DAWN_TRANSITION: duskStr = "DAWN_TR"; break;
-                case DuskPhase::DAY:             duskStr = "DAY"; break;
-                case DuskPhase::DUSK_TRANSITION: duskStr = "DUSK_TR"; break;
+                Serial.println("[STATUS] event=end");
+                Serial.flush();
             }
-            Serial.printf("[DUSK] phase=%s dawnScore=%.2f duskScore=%.2f samples=%d\n",
-                          duskStr, g_duskDetector.dawnScore, g_duskDetector.duskScore,
-                          g_duskDetector.count);
-            if (g_solarClock.calibrated) {
-                Serial.printf("[SOLAR] day=%dh%dm night=%dh%dm cycles=%d\n",
-                              g_solarClock.dayLengthMs / 3600000,
-                              (g_solarClock.dayLengthMs / 60000) % 60,
-                              g_solarClock.nightLengthMs / 3600000,
-                              (g_solarClock.nightLengthMs / 60000) % 60,
-                              g_solarClock.cycleCount);
-            }
-
-            Serial.println("------------------");
-            Serial.flush();  // ensure STATUS dump is sent
         }
 
-        // Independent heartbeat via ESP logger (same path as WiFiGeneric logs)
-        if (now - lastEspAliveLog >= 10000) {
-            lastEspAliveLog = now;
+        // Independent heartbeat (change-driven + sparse keepalive)
+        if (now - lastCtrlAliveEvalMs >= 10000) {
+            lastCtrlAliveEvalMs = now;
             SharedState shared = readSharedState();
-            ESP_LOGI(kLogTag, "ctrl alive, mode=%s, wifi=%s, heap=%u",
-                     g_config.mode == Mode::AUTO ? "AUTO" : "MANUAL",
-                     shared.wifiConnected ? "up" : "down",
-                     (unsigned)ESP.getFreeHeap());
+            uint32_t freeHeap = ESP.getFreeHeap();
+            uint32_t digest = ctrlAliveDigest(g_config.mode, shared.wifiConnected, freeHeap);
+            bool changed = (!ctrlAliveDigestInit) || (digest != lastCtrlAliveDigest);
+            bool keepaliveDue = (lastCtrlAliveEmitMs == 0) || ((now - lastCtrlAliveEmitMs) >= 300000);
+            if (changed || keepaliveDue) {
+                ctrlAliveDigestInit = true;
+                lastCtrlAliveDigest = digest;
+                lastCtrlAliveEmitMs = now;
+                Serial.printf("[CTRL] event=alive mode=%s wifi=%s heap=%u\n",
+                              g_config.mode == Mode::AUTO ? "AUTO" : "MANUAL",
+                              shared.wifiConnected ? "up" : "down",
+                              (unsigned)freeHeap);
+            }
         }
 
         // --- Obsługa eventów (non-blocking) ---
@@ -738,7 +826,7 @@ static void controlTaskFn(void* /*param*/) {
                     handleRefill(g_budget, g_config);
                     s_runtimeDirty = true;
                     saveRuntimeNow(lastRuntimeSave);
-                    Serial.println("[CTRL] reservoir refilled + runtime saved");
+                    Serial.println("[CTRL] event=reservoir_refill runtime_saved=yes");
                     publishSharedStateFromControl();
                     break;
 
@@ -757,7 +845,7 @@ static void controlTaskFn(void* /*param*/) {
                     break;
 
                 case EventType::SYSTEM_FACTORY_RESET:
-                    Serial.println("[CTRL] FACTORY RESET");
+                    Serial.println("[CTRL] event=factory_reset");
                     configFactoryReset();
                     delay(500);
                     ESP.restart();
@@ -824,7 +912,7 @@ static void checkFactoryReset(uint32_t nowMs) {
             while (millis() < deadline) {
                 M5.update();
                 if (M5.BtnA.wasClicked()) {
-                    Serial.println("[UI] Factory reset confirmed");
+                    Serial.println("[UI] event=factory_reset_confirmed");
                     g_eventQueue.push(Event{EventType::SYSTEM_FACTORY_RESET});
                     // Wyświetl komunikat i czekaj na restart z ControlTask
                     M5.Display.fillScreen(0x0000);
@@ -1027,7 +1115,7 @@ static void uiTaskFn(void* /*param*/) {
 // ============================================================================
 
 static void netTaskFn(void* /*param*/) {
-    Serial.println("[NET] started");
+    Serial.println("[NET] event=task_started");
     netTaskInit(g_netConfig, g_netState);
 
     for (;;) {
@@ -1052,7 +1140,7 @@ static void netTaskFn(void* /*param*/) {
                 formatDailyReport(rptData, buf, sizeof(buf));
                 telegramSend(buf, g_netConfig);
                 g_netState.heartbeatSentToday = true;
-                Serial.println("[NET] heartbeat sent");
+                Serial.println("[NET] event=heartbeat_sent");
             }
 
             telegramPollCommands(now, g_netConfig);
@@ -1094,10 +1182,14 @@ void setup() {
     while (!Serial && millis() < serialDeadline) {
         delay(10);
     }
-    Serial.setDebugOutput(true);
-    ESP_LOGI(kLogTag, "boot start, serial_ready=%d", (int)Serial);
+    Serial.setDebugOutput(false);
+    esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set("wifi", ESP_LOG_NONE);
+    esp_log_level_set("wifi_init", ESP_LOG_NONE);
+    esp_log_level_set("phy_init", ESP_LOG_NONE);
+    Serial.printf("[BOOT] start serial_ready=%d\n", (int)Serial);
 
-    Serial.println("=== autogarden ===");
+    Serial.println("[BOOT] event=banner name=autogarden");
     Serial.println("[BOOT] M5 initialized, EXT 5V ON");
     Serial.flush();  // force output before any blocking operation
 
@@ -1116,11 +1208,11 @@ void setup() {
 
     // --- Załaduj konfigurację domenową ---
     if (!configLoad(g_config)) {
-        Serial.println("[BOOT] config load FAIL — using defaults");
+        Serial.println("[BOOT] event=config_load result=fail action=defaults");
         configLoadDefaults(g_config);
     }
     if (!configValidate(g_config)) {
-        Serial.println("[BOOT] config invalid — falling back to defaults");
+        Serial.println("[BOOT] event=config_validate result=fail action=defaults");
         configLoadDefaults(g_config);
     }
     Serial.printf("[BOOT] config OK: mode=%s numPots=%d\n",
@@ -1129,7 +1221,7 @@ void setup() {
 
     // --- Załaduj konfigurację sieci ---
     if (!netConfigLoad(g_netConfig)) {
-        Serial.println("[BOOT] netCfg load FAIL — provisioning needed");
+        Serial.println("[BOOT] event=netcfg_load result=fail provisioning=needed");
     }
 
     // --- WiFi (OPCJONALNE — nie blokuje boota) ---
@@ -1146,9 +1238,9 @@ void setup() {
 
     // --- Inicjalizacja hardware ---
     if (!g_hardware.init(g_hwConfig, g_config)) {
-        Serial.println("[BOOT] hardware init FAIL — continuing with degraded mode");
+        Serial.println("[BOOT] event=hardware_init result=fail mode=degraded");
     } else {
-        Serial.println("[BOOT] hardware OK");
+        Serial.println("[BOOT] event=hardware_init result=ok");
     }
 
     // --- Inicjalizacja eventów i synchronizacji ---
@@ -1161,7 +1253,7 @@ void setup() {
     publishSharedStateFromControl();
     publishSharedNetStatus(false);
 
-    Serial.println("[BOOT] creating FreeRTOS tasks...");
+    Serial.println("[BOOT] event=tasks_create_start");
 
     // --- Tworzenie tasków (bez pinowania do rdzeni) ---
     xTaskCreate(controlTaskFn, "control", kControlStackSize, nullptr,
@@ -1176,7 +1268,7 @@ void setup() {
     xTaskCreate(configTaskFn, "config", kConfigStackSize, nullptr,
                 kConfigPriority, nullptr);
 
-    Serial.println("[BOOT] all tasks created — scheduler running");
+    Serial.println("[BOOT] event=tasks_create_done scheduler=running");
     Serial.flush();
 
     // Wymuś event SYSTEM_BOOT

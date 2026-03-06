@@ -15,6 +15,9 @@
 #include <algorithm>
 
 #include "analysis.h"
+#include "log_serial.h"
+
+#define Serial AGSerial
 
 extern SensorHistory g_history;
 
@@ -321,12 +324,12 @@ void wateringTick(uint32_t nowMs,
             if (budget.reservoirLow) {
                 cycle.pulseDurationMs /= 3;
                 cycle.maxPulses = (cycle.maxPulses > 2) ? 2 : cycle.maxPulses;
-                Serial.printf("WATERING_CRISIS_MODE reservoir_remaining=%.0fml\n",
+                Serial.printf("[WATER] event=crisis_mode reservoir_remaining_ml=%.0f\n",
                               budget.reservoirCurrentMl);
 
                 if (budget.reservoirCurrentMl <= 0.0f) {
                     cycle.phase = WateringPhase::BLOCKED;
-                    Serial.println("RESERVOIR_EMPTY — watering stopped");
+                    Serial.println("[WATER] event=reservoir_empty action=stop");
                     break;
                 }
             }
@@ -538,8 +541,8 @@ void manualPumpTick(uint32_t nowMs,
     if (manual.locked && nowMs < manual.lockUntilMs) {
         if ((nowMs - s_lastManualLockLogMs) >= 2000) {
             s_lastManualLockLogMs = nowMs;
-            Serial.printf("MANUAL_LOCK active remaining=%ds\n",
-                          (int)((manual.lockUntilMs - nowMs) / 1000));
+            Serial.printf("[MANUAL] event=lock_active remaining_s=%u\n",
+                          static_cast<unsigned>((manual.lockUntilMs - nowMs) / 1000));
         }
         return;
     }
@@ -554,7 +557,7 @@ void manualPumpTick(uint32_t nowMs,
         if (manual.blueHeldMs == 0) {
             manual.blueHeldMs = nowMs;
             manual.blueOwnsPump = false;
-            Serial.printf("[POT%d] MANUAL: blue pressed, starting pump\n", selectedPot);
+            Serial.printf("[POT%d] event=manual_blue_pressed action=start_pump\n", selectedPot);
 
             // Anti-spam: rejestracja w historii
             if (manual.pressCount < ManualState::kMaxHistory) {
@@ -611,8 +614,8 @@ void manualPumpTick(uint32_t nowMs,
             float pumpedMl = (heldDuration / 1000.0f) * cfg.pots[selectedPot].pumpMlPerSec;
             hw.pump(selectedPot).off(nowMs, "MANUAL_RELEASE");
             addPumped(budget, pumpedMl, selectedPot);
-            Serial.printf("MANUAL_PUMP_OFF held=%dms pumped_ml=%.1f\n",
-                          heldDuration, pumpedMl);
+            Serial.printf("[MANUAL] event=pump_off held_ms=%u pumped_ml=%.1f\n",
+                          static_cast<unsigned>(heldDuration), pumpedMl);
         }
         manual.blueHeldMs = 0;
         manual.blueOwnsPump = false;
@@ -637,7 +640,7 @@ void manualPumpTick(uint32_t nowMs,
             hw.pump(selectedPot).off(nowMs, "BUTTON_SPAM");
         }
         manual.blueOwnsPump = false;
-        Serial.printf("MANUAL_BLOCK reason=button_spam count=%d\n", manual.pressCount);
+        Serial.printf("[MANUAL] event=block reason=button_spam count=%u\n", manual.pressCount);
     }
 }
 
@@ -665,7 +668,7 @@ void updateWaterBudget(uint32_t nowMs,
             budget.reservoirLow = true;
             budget.reservoirLowSinceMs = nowMs;
             budget.reservoirCurrentMl = budget.reservoirLowThresholdMl;
-            Serial.printf("RESERVOIR_LOW remaining_est=%.0fml\n", budget.reservoirCurrentMl);
+            Serial.printf("[WATER] event=reservoir_low remaining_est_ml=%.0f\n", budget.reservoirCurrentMl);
         }
     }
 
@@ -707,7 +710,7 @@ void handleRefill(WaterBudget& budget, const Config& cfg) {
     budget.reservoirLowSinceMs = 0;
     budget.daysRemaining = 999.0f;
     budget.lastRefillMs = millis();
-    Serial.printf("RESERVOIR_REFILL capacity=%.0fml\n", budget.reservoirCapacityMl);
+    Serial.printf("[WATER] event=reservoir_refill capacity_ml=%.0f\n", budget.reservoirCapacityMl);
 }
 
 void addPumped(WaterBudget& budget, float ml, uint8_t potIdx) {
@@ -746,7 +749,7 @@ void applyVacationOverrides(const Config& cfg, const PlantProfile& base,
 
     // Soak time i cooldown handled inline w wateringTick
 
-    Serial.printf("[VACATION] target %.1f%% → %.1f%%, maxPulses %d → %d\n",
+    Serial.printf("[VACATION] event=apply_overrides target_from_pct=%.1f target_to_pct=%.1f max_pulses_from=%u max_pulses_to=%u\n",
                   base.targetMoisturePct, effective.targetMoisturePct,
                   base.maxPulsesPerCycle, effective.maxPulsesPerCycle);
 }
@@ -755,7 +758,7 @@ void handleVacationToggle(bool enable, Config& cfg) {
     bool prev = cfg.vacationMode;
     cfg.vacationMode = enable;
     if (prev != enable) {
-        Serial.printf("VACATION_MODE %s\n", enable ? "ON" : "OFF");
+        Serial.printf("[VACATION] event=toggle state=%s\n", enable ? "ON" : "OFF");
         // TODO(config): configSave(cfg) — powinno iść przez PersistQueue
     }
 }

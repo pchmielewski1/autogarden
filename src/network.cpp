@@ -15,6 +15,9 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
+#include "log_serial.h"
+
+#define Serial AGSerial
 
 // TODO(telegram): #include <UniversalTelegramBot.h>
 // TODO(telegram): #include <WiFiClientSecure.h>
@@ -36,6 +39,15 @@ static const char SUCCESS_HTML[] PROGMEM = R"(
 static WebServer* g_webServer  = nullptr;
 static DNSServer* g_dnsServer  = nullptr;
 static NetConfig* g_apNetCfg   = nullptr;   // pointer do NetConfig w AP mode
+
+static uint32_t hashIpAddress(const IPAddress& ip) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < 4; ++i) {
+        hash ^= static_cast<uint32_t>(ip[i]);
+        hash *= 16777619u;
+    }
+    return hash;
+}
 
 // ---------------------------------------------------------------------------
 // Input sanitization helpers
@@ -184,7 +196,7 @@ static void handleSave() {
     g_apNetCfg->provisioned = true;
 
     netConfigSave(*g_apNetCfg);
-    Serial.printf("[PROV] Config saved (SSID='%s', chatId='%s'), restarting...\n",
+    Serial.printf("[PROV] event=config_saved ssid=%s chat_id=%s action=restart\n",
                   g_apNetCfg->wifiSsid, g_apNetCfg->telegramChatId);
 
     g_webServer->send_P(200, "text/html", SUCCESS_HTML);
@@ -201,7 +213,7 @@ static DNSServer  s_apDns;
 static WebServer  s_apWeb(80);
 
 void startApNonBlocking(NetConfig& netCfg, NetworkState& ns) {
-    Serial.println("[AP] Starting non-blocking AP mode...");
+    Serial.println("[AP] event=start mode=non_blocking");
 
     WiFi.mode(WIFI_AP);
     WiFi.softAP("autogarden", "");   // open, no password
@@ -226,7 +238,7 @@ void startApNonBlocking(NetConfig& netCfg, NetworkState& ns) {
     s_apWeb.on("/skip", []() {
         if (g_webServer) {
             g_webServer->send(200, "text/plain", "OK — going offline");
-            Serial.println("[AP] skip WiFi — staying offline");
+            Serial.println("[AP] event=skip_wifi state=offline");
         }
     });
     // Captive portal detection paths (Android, iOS, Windows, etc.)
@@ -250,8 +262,8 @@ void startApNonBlocking(NetConfig& netCfg, NetworkState& ns) {
     ns.apNoClientSinceMs = millis();
     ns.provState         = ProvisioningState::AP_MODE;
 
-    Serial.printf("[AP] AP 'autogarden' active, IP=192.168.4.1 (auto-off in %ds)\n",
-                  (int)(NetworkState::kApAutoOffMs / 1000));
+    Serial.printf("[AP] event=active ssid=autogarden ip=192.168.4.1 auto_off_s=%u\n",
+                  static_cast<unsigned>(NetworkState::kApAutoOffMs / 1000));
 }
 
 void apTick(NetworkState& ns) {
@@ -267,7 +279,7 @@ void apTick(NetworkState& ns) {
 
     // Auto-off: 5 min bez klienta
     if ((millis() - ns.apNoClientSinceMs) >= NetworkState::kApAutoOffMs) {
-        Serial.println("[AP] auto-off: no client for 5 min");
+        Serial.println("[AP] event=auto_off reason=no_client_5min");
         stopAp(ns);
     }
 }
@@ -285,7 +297,7 @@ void stopAp(NetworkState& ns) {
     g_apNetCfg  = nullptr;
 
     ns.apActive = false;
-    Serial.println("[AP] AP mode stopped — offline");
+    Serial.println("[AP] event=stop state=offline");
 }
 
 // ---------------------------------------------------------------------------
@@ -298,40 +310,62 @@ void netTaskInit(const NetConfig& netCfg, NetworkState& ns) {
                           strlen(netCfg.telegramChatId) > 0);
 
     if (ns.telegramEnabled) {
-        Serial.println("NET Telegram enabled");
+        Serial.println("[NET] event=telegram_enabled state=yes");
     }
 
     // Jeśli WiFi nie provisioned → auto-start AP w tle
     if (!netCfg.provisioned || strlen(netCfg.wifiSsid) == 0) {
-        Serial.println("[NET] WiFi not provisioned — starting AP 'autogarden' in background");
+        Serial.println("[NET] event=wifi_not_provisioned action=start_ap_background");
         // const_cast bo startApNonBlocking potrzebuje writeable NetConfig*
         // dla handleSave — ale g_apNetCfg jest ustawiany globalnie
         extern NetConfig g_netConfig;
         startApNonBlocking(g_netConfig, ns);
     }
 
-    Serial.println("NET task initialized");
+    Serial.println("[NET] event=task_initialized");
 }
 
 // ---------------------------------------------------------------------------
 // netTaskTick — reconnect + AP tick + poll + notifications
 // ---------------------------------------------------------------------------
 void netTaskTick(uint32_t nowMs, NetworkState& ns, const NetConfig& netCfg) {
-    // --- Periodic network status log (every 30s) ---
-    static uint32_t s_lastNetLogMs = 0;
-    if (nowMs - s_lastNetLogMs >= 30000) {
-        s_lastNetLogMs = nowMs;
-        if (ns.apActive) {
-            Serial.printf("[NET] AP active, clients=%d\n",
-                          WiFi.softAPgetStationNum());
-        } else if (ns.wifiConnected) {
-            Serial.printf("[NET] WiFi OK rssi=%d ip=%s\n",
-                          WiFi.RSSI(), WiFi.localIP().toString().c_str());
-        } else if (netCfg.provisioned) {
-            Serial.printf("[NET] WiFi disconnected, reconnect #%d backoff=%ds\n",
-                          ns.reconnectAttempts, (int)(ns.reconnectBackoffMs / 1000));
-        } else {
-            Serial.println("[NET] offline (not provisioned)");
+    // --- Network status log (change-driven + keepalive) ---
+    static uint32_t s_lastNetEvalMs = 0;
+    static uint32_t s_lastNetDigest = 0;
+    static uint32_t s_lastNetEmitMs = 0;
+    static bool s_netDigestInit = false;
+    if (nowMs - s_lastNetEvalMs >= 5000) {
+        s_lastNetEvalMs = nowMs;
+        uint32_t digest = 2166136261u;
+        digest = (digest ^ (ns.apActive ? 1u : 0u)) * 16777619u;
+        digest = (digest ^ (ns.wifiConnected ? 1u : 0u)) * 16777619u;
+        digest = (digest ^ (netCfg.provisioned ? 1u : 0u)) * 16777619u;
+        digest = (digest ^ static_cast<uint32_t>(ns.reconnectAttempts)) * 16777619u;
+        digest = (digest ^ static_cast<uint32_t>(ns.reconnectBackoffMs / 1000)) * 16777619u;
+        digest = (digest ^ static_cast<uint32_t>(WiFi.softAPgetStationNum())) * 16777619u;
+        if (ns.wifiConnected) {
+            digest = (digest ^ hashIpAddress(WiFi.localIP())) * 16777619u;
+        }
+
+        bool changed = (!s_netDigestInit) || (digest != s_lastNetDigest);
+        bool keepaliveDue = (s_lastNetEmitMs == 0) || ((nowMs - s_lastNetEmitMs) >= 600000);
+
+        if (changed || keepaliveDue) {
+            s_netDigestInit = true;
+            s_lastNetDigest = digest;
+            s_lastNetEmitMs = nowMs;
+            if (ns.apActive) {
+                Serial.printf("[NET] event=status ap_active=yes clients=%u\n",
+                              WiFi.softAPgetStationNum());
+            } else if (ns.wifiConnected) {
+                Serial.printf("[NET] event=status wifi=up rssi=%d ip=%s\n",
+                              WiFi.RSSI(), WiFi.localIP().toString().c_str());
+            } else if (netCfg.provisioned) {
+                Serial.printf("[NET] event=status wifi=down reconnect_attempt=%u backoff_s=%u\n",
+                              ns.reconnectAttempts, (int)(ns.reconnectBackoffMs / 1000));
+            } else {
+                Serial.println("[NET] event=status wifi=offline reason=not_provisioned");
+            }
         }
     }
 
@@ -352,7 +386,7 @@ void netTaskTick(uint32_t nowMs, NetworkState& ns, const NetConfig& netCfg) {
         ns.wifiConnected = false;
 
         if ((nowMs - ns.lastReconnectAttemptMs) >= ns.reconnectBackoffMs) {
-            Serial.println("NET WiFi reconnecting...");
+            Serial.println("[NET] event=wifi_reconnect_start");
             WiFi.disconnect();
             WiFi.begin(netCfg.wifiSsid, netCfg.wifiPass);
 
@@ -373,7 +407,7 @@ void netTaskTick(uint32_t nowMs, NetworkState& ns, const NetConfig& netCfg) {
         ns.wifiConnected = true;
         ns.reconnectBackoffMs = 5000;
         ns.reconnectAttempts = 0;
-        Serial.printf("NET WiFi reconnected ip=%s\n",
+        Serial.printf("[NET] event=wifi_reconnected ip=%s\n",
                       WiFi.localIP().toString().c_str());
         // TODO(events): push WIFI_CONNECTED event
     }
@@ -403,7 +437,7 @@ bool telegramSend(const char* msg, const NetConfig& netCfg,
     (void)netCfg;
     (void)maxRetries;
     (void)backoffMs;
-    Serial.printf("TG_SEND (stub): %s\n", msg);
+    Serial.printf("[TG] event=send_stub message=%s\n", msg);
     return false;
 }
 
@@ -500,7 +534,7 @@ bool isDailyHeartbeatTime(uint32_t nowMs, const SolarClock& clk,
 void networkFactoryReset() {
     NetConfig empty{};
     netConfigSave(empty);
-    Serial.println("NET factory reset done");
+    Serial.println("[NET] event=factory_reset_done");
 }
 
 // ---------------------------------------------------------------------------

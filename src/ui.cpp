@@ -12,6 +12,9 @@
 #include "events.h"
 #include "network.h"
 #include <M5Unified.h>
+#include "log_serial.h"
+
+#define Serial AGSerial
 
 // ---------------------------------------------------------------------------
 // Off-screen sprite buffer (anti-flicker)
@@ -77,6 +80,42 @@ static uint16_t moistureColor(float pct, const PlantProfile& prof) {
     return COL_RED;
 }
 
+enum class TargetState : uint8_t {
+    BELOW_TRIGGER,
+    ON_TARGET,
+    ABOVE_TARGET,
+    ABOVE_MAX,
+};
+
+static float effectiveTargetPct(const PlantProfile& prof, const Config& cfg) {
+    float target = prof.targetMoisturePct;
+    if (cfg.vacationMode) {
+        target -= cfg.vacationTargetReductionPct;
+        if (target < 5.0f) {
+            target = 5.0f;
+        }
+    }
+    return target;
+}
+
+static TargetState targetStateForMoisture(float moisturePct,
+                                          const PlantProfile& prof,
+                                          const Config& cfg) {
+    float target = effectiveTargetPct(prof, cfg);
+    float trigger = target - prof.hysteresisPct;
+
+    if (moisturePct < trigger) {
+        return TargetState::BELOW_TRIGGER;
+    }
+    if (moisturePct <= target + 2.0f) {
+        return TargetState::ON_TARGET;
+    }
+    if (moisturePct <= prof.maxMoisturePct) {
+        return TargetState::ABOVE_TARGET;
+    }
+    return TargetState::ABOVE_MAX;
+}
+
 static const char* phaseStr(WateringPhase ph) {
     switch (ph) {
         case WateringPhase::IDLE:           return "IDLE";
@@ -95,6 +134,42 @@ static void drawSep(int16_t y) {
     C.drawFastHLine(4, y, SCR_W - 8, COL_SEP);
 }
 
+static void formatUptimeCompact(uint32_t nowMs, char* out, size_t outSize) {
+    if (!out || outSize == 0) {
+        return;
+    }
+
+    uint32_t totalSec = nowMs / 1000;
+    uint32_t sec = totalSec % 60;
+    uint32_t totalMin = totalSec / 60;
+    uint32_t min = totalMin % 60;
+    uint32_t totalHours = totalMin / 60;
+    uint32_t hours = totalHours % 24;
+    uint32_t days = totalHours / 24;
+
+    if (days == 0) {
+        snprintf(out, outSize, "UP %02lu:%02lu",
+                 (unsigned long)hours,
+                 (unsigned long)min);
+        return;
+    }
+
+    if (days < 100) {
+        snprintf(out, outSize, "UP %lud%02luh",
+                 (unsigned long)days,
+                 (unsigned long)hours);
+        return;
+    }
+
+    if (days < 1000) {
+        snprintf(out, outSize, "UP %lud", (unsigned long)days);
+        return;
+    }
+
+    uint32_t weeks = days / 7;
+    snprintf(out, outSize, "UP %luw", (unsigned long)weeks);
+}
+
 // ---------------------------------------------------------------------------
 // Pixel-art icons (12×12 px) — rysowane prymitywami na M5Canvas
 // Każda ikona rysuje się w kwadracie 12×12 od (x,y).
@@ -103,11 +178,18 @@ static void drawSep(int16_t y) {
 static constexpr int16_t ICO = 12;  // icon bounding box
 static constexpr int16_t TXI = 20;  // text x after left icon (4 + 12 + 4)
 
-// 🌱 Seedling — zielona łodyga + 2 duże listki
+// 🌱 Seedling — zielona łodyga + 2 czytelne listki
 static void iconSeedling(int16_t x, int16_t y, uint16_t col = COL_GREEN) {
-    C.fillRect(x + 5, y + 5, 2, 7, col);                                 // stem
-    C.fillTriangle(x + 5, y + 5, x + 0, y + 0, x + 5, y + 0, col);      // left leaf
-    C.fillTriangle(x + 6, y + 5, x + 11, y + 0, x + 6, y + 0, col);     // right leaf
+    // stem
+    C.fillRect(x + 5, y + 5, 2, 6, col);
+
+    // left leaf (rounded)
+    C.fillCircle(x + 3, y + 3, 2, col);
+    C.fillTriangle(x + 4, y + 4, x + 6, y + 5, x + 5, y + 2, col);
+
+    // right leaf (rounded)
+    C.fillCircle(x + 8, y + 3, 2, col);
+    C.fillTriangle(x + 7, y + 4, x + 6, y + 5, x + 7, y + 2, col);
 }
 
 // 💧 Water drop — zawsze niebieska (COL_CYAN)
@@ -169,10 +251,47 @@ static void iconClock(int16_t x, int16_t y, uint16_t col = COL_DIM) {
     C.drawFastHLine(x + 5, y + 5, 3, col);                               // minute hand
 }
 
-// ⬆ Target arrow
-static void iconTarget(int16_t x, int16_t y, uint16_t col = COL_DIM) {
-    C.fillTriangle(x + 5, y + 0, x + 0, y + 6, x + 10, y + 6, col);
-    C.fillRect(x + 3, y + 6, 5, 6, col);
+// ⏲ Barometer — mały manometr / tarcza z wskazówką
+static void iconBarometer(int16_t x, int16_t y, uint16_t col = COL_TEXT) {
+    C.drawCircle(x + 5, y + 6, 5, col);                                  // gauge body
+    C.drawPixel(x + 5, y + 6, col);                                      // center
+    C.drawLine(x + 5, y + 6, x + 8, y + 3, col);                         // needle
+    C.drawFastHLine(x + 2, y + 11, 7, col);                              // base
+}
+
+// 🎯 Target indicator — dynamiczny wg odchyłki od targetu
+static void iconTarget(int16_t x, int16_t y, TargetState state) {
+    switch (state) {
+        case TargetState::BELOW_TRIGGER: {
+            uint16_t col = COL_YELLOW;
+            C.fillTriangle(x + 5, y + 0, x + 1, y + 5, x + 9, y + 5, col);
+            C.fillRect(x + 4, y + 5, 3, 6, col);
+            C.drawFastVLine(x + 1, y + 6, 5, col);
+            C.drawFastVLine(x + 9, y + 6, 5, col);
+            break;
+        }
+        case TargetState::ON_TARGET: {
+            uint16_t col = COL_GREEN;
+            C.drawCircle(x + 5, y + 5, 5, col);
+            C.drawCircle(x + 5, y + 5, 2, col);
+            C.fillCircle(x + 5, y + 5, 1, col);
+            break;
+        }
+        case TargetState::ABOVE_TARGET: {
+            uint16_t col = COL_CYAN;
+            C.fillTriangle(x + 5, y + 11, x + 1, y + 6, x + 9, y + 6, col);
+            C.fillRect(x + 4, y + 1, 3, 6, col);
+            break;
+        }
+        case TargetState::ABOVE_MAX:
+        default: {
+            uint16_t col = COL_RED;
+            C.fillTriangle(x + 5, y + 11, x + 1, y + 6, x + 9, y + 6, col);
+            C.fillRect(x + 4, y + 1, 3, 6, col);
+            C.drawFastHLine(x + 1, y + 0, 9, col);
+            break;
+        }
+    }
 }
 
 // 🤖 Telegram — paper-plane
@@ -315,26 +434,28 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     char buf[48];
 
     float moist = (ps.moistureEma > 0) ? ps.moistureEma : ps.moisturePct;
+    float targetPct = effectiveTargetPct(prof, snap.config);
+    TargetState targetState = targetStateForMoisture(moist, prof, snap.config);
     uint16_t mColor = moistureColor(moist, prof);
 
     // ── Section 1: Moisture + profile (y 0-48) ────────────────
     iconSeedling(4, 4, mColor);      // 🌱
-    C.setTextSize(3);
+    C.setTextSize(2);
     C.setTextColor(mColor);
-    snprintf(buf, sizeof(buf), "%.0f%%", moist);
+    snprintf(buf, sizeof(buf), "%.0f %%", moist);
     C.drawString(buf, TXI, 4);
 
     C.setTextSize(1);
-    iconTarget(82, 4);               // ⬆
+    iconTarget(82, 4, targetState);  // 🎯 dynamic
     C.setTextColor(COL_DIM);
-    snprintf(buf, sizeof(buf), "%.0f%%", prof.targetMoisturePct);
+    snprintf(buf, sizeof(buf), "%.0f %%", targetPct);
     C.drawString(buf, 96, 6);
 
     // Profil: ikona + nazwa
-    drawPlantIcon(82, 17, snap.config.pots[potIdx].plantProfileIndex);
+    drawPlantIcon(82, 20, snap.config.pots[potIdx].plantProfileIndex);
     C.setTextColor(COL_CYAN);
     snprintf(buf, sizeof(buf), "%s", prof.name ? prof.name : "?");
-    C.drawString(buf, 96, 20);
+    C.drawString(buf, 96, 23);
 
     // Pot indicator for dual mode
     if (snap.config.numPots > 1) {
@@ -355,7 +476,7 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     C.setTextSize(1);
     iconDrop(4, 52);                 // 💧 zawsze niebieska
     C.setTextColor(rColor);
-    snprintf(buf, sizeof(buf), "%.0fml", bud.reservoirCurrentMl);
+    snprintf(buf, sizeof(buf), "%.0f ml", bud.reservoirCurrentMl);
     C.drawString(buf, TXI, 55);
 
     C.setTextColor(COL_DIM);
@@ -375,23 +496,24 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     // ── Section 3: Environment — temp + humidity (y 84-108) ───
     iconThermo(4, 84);               // 🌡
     C.setTextColor(COL_TEXT);
-    snprintf(buf, sizeof(buf), "%.1fC", env.tempC);
+    snprintf(buf, sizeof(buf), "%.1f C", env.tempC);
     C.drawString(buf, TXI, 87);
 
     iconDrop(66, 84);                // 💧 humidity
     C.setTextColor(COL_CYAN);
-    snprintf(buf, sizeof(buf), "%.0f%%", env.humidityPct);
+    snprintf(buf, sizeof(buf), "%.0f %%", env.humidityPct);
     C.drawString(buf, 80, 87);
 
     // Lux + pressure
     iconSun(4, 98);                  // ☀
     C.setTextColor(COL_YELLOW);
-    snprintf(buf, sizeof(buf), "%.0flx", env.lux);
+    snprintf(buf, sizeof(buf), "%.0f lx", env.lux);
     C.drawString(buf, TXI, 101);
 
-    C.setTextColor(COL_DIM);
-    snprintf(buf, sizeof(buf), "%.0fhPa", env.pressureHpa);
-    C.drawString(buf, 72, 101);
+    iconBarometer(66, 98, COL_TEXT);
+    C.setTextColor(COL_TEXT);
+    snprintf(buf, sizeof(buf), "%.0f hPa", env.pressureHpa);
+    C.drawString(buf, 80, 101);
 
     drawSep(114);
 
@@ -420,7 +542,7 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
 
     case WateringPhase::PULSE: {
         C.setTextColor(COL_BLUE);
-        snprintf(buf, sizeof(buf), "PULSE %d/%d  %.0fml",
+        snprintf(buf, sizeof(buf), "PULSE %d/%d  %.0f ml",
                  cyc.pulseCount + 1, cyc.maxPulses, cyc.totalPumpedMl);
         C.drawString(buf, 4, 136);
         if (cyc.pulseDurationMs > 0) {
@@ -463,7 +585,7 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
 
     case WateringPhase::DONE:
         C.setTextColor(COL_GREEN);
-        snprintf(buf, sizeof(buf), "DONE %.0fml", cyc.totalPumpedMl);
+        snprintf(buf, sizeof(buf), "DONE %.0f ml", cyc.totalPumpedMl);
         C.drawString(buf, 4, 136);
         break;
     }
@@ -482,17 +604,14 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     C.drawString(duskStr, TXI, 168);
 
     iconClock(66, 166);              // ⏰
-    uint32_t upSec = nowMs / 1000;
-    uint32_t upMin = upSec / 60; upSec %= 60;
-    uint32_t upHr  = upMin / 60; upMin %= 60;
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", (int)upHr, (int)upMin, (int)upSec);
+    formatUptimeCompact(nowMs, buf, sizeof(buf));
     C.drawString(buf, 80, 168);
 
     drawSep(182);
 
     // ── Section 7: Sensor raw data (y 184-200) ───────────────
     C.setTextColor(COL_DIM);
-    snprintf(buf, sizeof(buf), "RAW:%d EMA:%.1f%%", ps.moistureRaw, ps.moistureEma);
+    snprintf(buf, sizeof(buf), "RAW:%d EMA:%.1f %%", ps.moistureRaw, ps.moistureEma);
     C.drawString(buf, 4, 184);
     snprintf(buf, sizeof(buf), "Comp:%.0f ct:%s",
              ps.moistureComp, ps.crosstalkUplift ? "Y" : "N");
@@ -525,6 +644,8 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
 
         int16_t baseY = i * 48;  // pot0: 0, pot1: 48
         float moist = (ps.moistureEma > 0) ? ps.moistureEma : ps.moisturePct;
+        float targetPct = effectiveTargetPct(prof, snap.config);
+        TargetState targetState = targetStateForMoisture(moist, prof, snap.config);
         uint16_t mColor = moistureColor(moist, prof);
 
         // Selected pot highlight
@@ -536,13 +657,17 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
         iconSeedling(4, baseY + 2, mColor);  // 🌱
         C.setTextSize(2);
         C.setTextColor(mColor);
-        snprintf(buf, sizeof(buf), "%d:%.0f%%", i + 1, moist);
+        snprintf(buf, sizeof(buf), "%.0f %%", moist);
         C.drawString(buf, TXI, baseY + 2);
 
-        C.setTextSize(1);
-        iconTarget(88, baseY + 2);     // ⬆ target
         C.setTextColor(COL_DIM);
-        snprintf(buf, sizeof(buf), "%.0f%%", prof.targetMoisturePct);
+        snprintf(buf, sizeof(buf), "P%d", i + 1);
+        C.drawString(buf, 2, baseY + 0);
+
+        C.setTextSize(1);
+        iconTarget(88, baseY + 2, targetState);     // 🎯 target dynamic
+        C.setTextColor(COL_DIM);
+        snprintf(buf, sizeof(buf), "%.0f %%", targetPct);
         C.drawString(buf, 102, baseY + 4);
 
         // Wiersz 2: profil ikona + nazwa + faza podlewania
@@ -574,7 +699,7 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
 
         if (cyc.totalPumpedMl > 0 && cyc.phase != WateringPhase::IDLE) {
             C.setTextColor(COL_DIM);
-            snprintf(buf, sizeof(buf), "%.0fml", cyc.totalPumpedMl);
+            snprintf(buf, sizeof(buf), "%.0f ml", cyc.totalPumpedMl);
             int16_t tw = C.textWidth(buf);
             C.drawString(buf, SCR_W - 4 - tw, baseY + 42);
         }
@@ -595,7 +720,7 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
     C.setTextSize(1);
     iconDrop(4, 98);                 // 💧
     C.setTextColor(rColor);
-    snprintf(buf, sizeof(buf), "%.0fml", bud.reservoirCurrentMl);
+    snprintf(buf, sizeof(buf), "%.0f ml", bud.reservoirCurrentMl);
     C.drawString(buf, TXI, 101);
     C.setTextColor(COL_DIM);
     snprintf(buf, sizeof(buf), "~%dd", (int)bud.daysRemaining);
@@ -612,23 +737,24 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
     // Environment: temp + humidity (y 114-126)
     iconThermo(4, 114);              // 🌡
     C.setTextColor(COL_TEXT);
-    snprintf(buf, sizeof(buf), "%.1fC", env.tempC);
+    snprintf(buf, sizeof(buf), "%.1f C", env.tempC);
     C.drawString(buf, TXI, 117);
 
     iconDrop(60, 114);               // 💧 humidity
     C.setTextColor(COL_CYAN);
-    snprintf(buf, sizeof(buf), "%.0f%%", env.humidityPct);
+    snprintf(buf, sizeof(buf), "%.0f %%", env.humidityPct);
     C.drawString(buf, 74, 117);
 
     // Lux + pressure (y 128-140)
     iconSun(4, 128);                 // ☀
     C.setTextColor(COL_YELLOW);
-    snprintf(buf, sizeof(buf), "%.0flx", env.lux);
+    snprintf(buf, sizeof(buf), "%.0f lx", env.lux);
     C.drawString(buf, TXI, 131);
 
-    C.setTextColor(COL_DIM);
-    snprintf(buf, sizeof(buf), "%.0fhPa", env.pressureHpa);
-    C.drawString(buf, 72, 131);
+    iconBarometer(60, 128, COL_TEXT);
+    C.setTextColor(COL_TEXT);
+    snprintf(buf, sizeof(buf), "%.0f hPa", env.pressureHpa);
+    C.drawString(buf, 74, 131);
 
     drawSep(144);
 
@@ -657,10 +783,7 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
     C.drawString(duskStr2, TXI, 164);
 
     iconClock(66, 162);              // ⏰
-    uint32_t upSec = nowMs / 1000;
-    uint32_t upMin = upSec / 60; upSec %= 60;
-    uint32_t upHr  = upMin / 60; upMin %= 60;
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", (int)upHr, (int)upMin, (int)upSec);
+    formatUptimeCompact(nowMs, buf, sizeof(buf));
     C.drawString(buf, 80, 164);
 
     drawSep(178);
@@ -671,7 +794,7 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
         if (!snap.config.pots[i].enabled) continue;
         const PotSensorSnapshot& ps2 = snap.sensors.pots[i];
         int16_t ry = 180 + i * 12;
-        snprintf(buf, sizeof(buf), "%d:RAW:%d E:%.1f%% C:%.0f",
+        snprintf(buf, sizeof(buf), "%d:RAW:%d E:%.1f %% C:%.0f",
                  i + 1, ps2.moistureRaw, ps2.moistureEma, ps2.moistureComp);
         C.drawString(buf, 4, ry);
     }
@@ -730,8 +853,8 @@ void renderSettingsScreen(const UiSnap& snap, const UiState& state) {
     uint8_t profIdx0 = cfg.pots[0].plantProfileIndex;
     uint8_t profIdx1 = cfg.pots[1].plantProfileIndex;
     { auto& m = items[itemCount++]; m.label = "Rezerwuar"; snprintf(m.value, 20, "%.1fL", cfg.reservoirCapacityMl / 1000.0f); m.visible = true; }
-    { auto& m = items[itemCount++]; m.label = "Rez. min";  snprintf(m.value, 20, "%.0fml", cfg.reservoirLowThresholdMl); m.visible = true; }
-    { auto& m = items[itemCount++]; m.label = "Puls";      snprintf(m.value, 20, "%dml", cfg.pots[0].pulseWaterMl); m.visible = true; }
+    { auto& m = items[itemCount++]; m.label = "Rez. min";  snprintf(m.value, 20, "%.0f ml", cfg.reservoirLowThresholdMl); m.visible = true; }
+    { auto& m = items[itemCount++]; m.label = "Puls";      snprintf(m.value, 20, "%d ml", cfg.pots[0].pulseWaterMl); m.visible = true; }
     { auto& m = items[itemCount++]; m.label = "REFILL";    snprintf(m.value, 20, "(press)"); m.visible = true; }
     { auto& m = items[itemCount++]; m.label = "Tryb";      snprintf(m.value, 20, "%s", cfg.mode == Mode::AUTO ? "AUTO" : "MANUAL"); m.visible = true; }
     { auto& m = items[itemCount++]; m.label = "Vacation";  snprintf(m.value, 20, "%s", cfg.vacationMode ? "ON" : "OFF"); m.visible = true; }
@@ -839,7 +962,7 @@ bool uiHandleBtnBLong(UiState& state, Config& cfg, WaterBudget& budget) {
     case 0:
         cfg.numPots = (cfg.numPots == 1) ? 2 : 1;
         cfg.pots[1].enabled = (cfg.numPots == 2);
-        Serial.printf("SETTINGS numPots=%d\n", cfg.numPots);
+        Serial.printf("[UI] event=settings_update key=num_pots value=%u\n", cfg.numPots);
         changed = true;
         break;
     case 1:
@@ -887,19 +1010,19 @@ bool uiHandleBtnBLong(UiState& state, Config& cfg, WaterBudget& budget) {
         changed = true;
         break;
     case 8: {
-        Serial.println("SETTINGS WiFi setup request");
+        Serial.println("[UI] event=settings_wifi_setup_request");
         changed = true;  // handled event-driven in ControlTask
         break;
     }
     case 9:
-        Serial.println("SETTINGS: hold BtnA+B 5s for reset");
+        Serial.println("[UI] event=settings_factory_reset_hint hold=A+B_5s");
         break;
     case 10: {
         // Pulse size — cyklicznie 10-100ml, step 5ml, ustawiane na oba poty
         uint16_t next = cfg.pots[0].pulseWaterMl + kPulseStepMl;
         if (next > kPulseMaxMl) next = kPulseMinMl;
         for (uint8_t p = 0; p < kMaxPots; ++p) cfg.pots[p].pulseWaterMl = next;
-        Serial.printf("SETTINGS pulseWaterMl=%dml\n", next);
+        Serial.printf("[UI] event=settings_update key=pulse_ml value=%u\n", next);
         changed = true;
         break;
     }

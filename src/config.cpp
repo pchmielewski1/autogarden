@@ -8,6 +8,9 @@
 #include "config.h"
 #include <Preferences.h>
 #include <Arduino.h>
+#include "log_serial.h"
+
+#define Serial AGSerial
 
 // ---------------------------------------------------------------------------
 // Profile roślin — stała tablica (PLAN.md → "Profile roślin")

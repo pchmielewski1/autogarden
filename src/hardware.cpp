@@ -17,6 +17,9 @@
 #include "hardware.h"
 #include <Wire.h>
 #include <Arduino.h>
+#include "log_serial.h"
+
+#define Serial AGSerial
 
 // Out-of-class definition for static constexpr (ODR-used)
 constexpr uint8_t PbHubBus::kChBase[6];
@@ -833,8 +836,8 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     }
 
     if (s_consecI2cFails >= 30 && (nowMs - s_lastRecoveryMs >= 30000)) {
-        Serial.printf("[HW] %d consecutive I2C sensor failures — triggering recovery\n",
-                      s_consecI2cFails);
+        Serial.printf("[HW] event=i2c_recovery_trigger consec_fails=%u\n",
+                  s_consecI2cFails);
         i2cBusRecovery();
         reinitI2cSensors();
         s_lastRecoveryMs = nowMs;
@@ -844,7 +847,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     // (e.g. only baro stuck after power glitch, env+lux OK)
     else if (s_consecI2cFails >= 20 && !allDirectI2cFail
              && (nowMs - s_lastRecoveryMs >= 30000)) {
-        Serial.println("[HW] Partial I2C failure — re-initializing sensors (no bus recovery)");
+        Serial.println("[HW] event=i2c_partial_failure action=reinit_sensors");
         reinitI2cSensors();
         s_lastRecoveryMs = nowMs;
         s_consecI2cFails = 0;
@@ -859,14 +862,19 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
                 anyFail = true;
         }
         if (anyFail) {
-            Serial.printf("[HW] I2C fails (last 10s): env=%d lux=%d baro=%d res=%d",
-                          s_failCountEnv, s_failCountLux, s_failCountBaro, s_failCountRes);
+            char summary[256];
+            int pos = snprintf(summary, sizeof(summary),
+                               "[HW] event=i2c_fail_summary window_s=10 env=%u lux=%u baro=%u res=%u",
+                               s_failCountEnv, s_failCountLux, s_failCountBaro, s_failCountRes);
             for (uint8_t fi = 0; fi < cfg.numPots; ++fi) {
-                Serial.printf(" soil%d=%d(zero=%d) ovf%d=%d",
-                              fi, s_failCountSoil[fi], s_zeroCountSoil[fi],
-                              fi, s_failCountOverflow[fi]);
+                if (pos > 0 && pos < static_cast<int>(sizeof(summary))) {
+                    pos += snprintf(summary + pos, sizeof(summary) - pos,
+                                    " soil%u=%u soil%u_zero=%u ovf%u=%u",
+                                    fi, s_failCountSoil[fi], fi, s_zeroCountSoil[fi],
+                                    fi, s_failCountOverflow[fi]);
+                }
             }
-            Serial.println();
+            Serial.printf("%s\n", summary);
         }
         s_failCountRes = s_failCountEnv = s_failCountLux = s_failCountBaro = 0;
         for (uint8_t fi = 0; fi < kMaxPots; ++fi) {
