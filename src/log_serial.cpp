@@ -89,6 +89,32 @@ static uint32_t nextLogSeq() {
     return seq;
 }
 
+static size_t writeAllToSerial(const uint8_t* data, size_t len) {
+    if (!data || len == 0) {
+        return 0;
+    }
+
+    size_t sent = 0;
+    uint32_t stallStartMs = millis();
+
+    while (sent < len) {
+        size_t written = ::Serial.write(data + sent, len - sent);
+        if (written > 0) {
+            sent += written;
+            stallStartMs = millis();
+            continue;
+        }
+
+        if ((millis() - stallStartMs) >= 250) {
+            break;
+        }
+
+        delay(1);
+    }
+
+    return sent;
+}
+
 static size_t writePrefixedLines(const char* text) {
     if (!text) {
         return 0;
@@ -137,15 +163,14 @@ static size_t writePrefixedLines(const char* text) {
                     fullLine[writeLen - 1] = '\n';
                     fullLine[writeLen] = '\0';
                 }
-                ::Serial.write(reinterpret_cast<const uint8_t*>(fullLine), writeLen);
-                outBytes += writeLen;
+                outBytes += writeAllToSerial(reinterpret_cast<const uint8_t*>(fullLine), writeLen);
             }
         } else if (n > 0) {
             char fullLine[64];
             int fullLen = snprintf(fullLine, sizeof(fullLine), "%s\n", prefix);
             if (fullLen > 0) {
-                ::Serial.write(reinterpret_cast<const uint8_t*>(fullLine), static_cast<size_t>(fullLen));
-                outBytes += static_cast<size_t>(fullLen);
+                outBytes += writeAllToSerial(reinterpret_cast<const uint8_t*>(fullLine),
+                                             static_cast<size_t>(fullLen));
             }
         }
 
