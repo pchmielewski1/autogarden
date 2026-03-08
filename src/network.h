@@ -81,10 +81,16 @@ struct TelegramStatusData {
     WaterBudget     budget;
     WateringCycle   cycles[kMaxPots];
     uint32_t        lastCycleDoneMs[kMaxPots] = {};
+    uint32_t        lastFeedbackSeq[kMaxPots] = {};
+    WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
+    float           lastFeedbackValue1[kMaxPots] = {};
+    float           lastFeedbackValue2[kMaxPots] = {};
+    uint8_t         lastFeedbackPulseCount[kMaxPots] = {};
     TrendState      trends[kMaxPots];
     Config          config;
     DuskPhase       duskPhase = DuskPhase::NIGHT;
     bool            wifiConnected = false;
+    bool            apActive = false;
     uint8_t         selectedPot = 0;
     uint32_t        uptimeMs = 0;
 };

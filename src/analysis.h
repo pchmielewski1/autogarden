@@ -187,7 +187,7 @@ struct WateringRecord {
     uint16_t totalPumpedMl_x10;   // ml × 10
     uint16_t moistureBefore_x10;
     uint16_t moistureAfter_x10;
-    uint8_t  reason;              // ScheduleDecision enum
+    uint8_t  reason;              // WateringFeedbackCode enum
     uint8_t  _pad;
 };  // 12 bytes
 

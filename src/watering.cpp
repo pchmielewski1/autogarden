@@ -40,6 +40,30 @@ static bool inCooldown(uint32_t nowMs, uint32_t cooldownMs, const ActuatorState&
     return (nowMs - act.lastCycleDoneMs[potIdx]) < cooldownMs;
 }
 
+static WateringFeedbackCode feedbackCodeFromSafetyReason(const char* reason) {
+    if (!reason) return WateringFeedbackCode::NONE;
+    if (strcmp(reason, "OVERFLOW_RISK") == 0) return WateringFeedbackCode::SAFETY_BLOCK_OVERFLOW_RISK;
+    if (strcmp(reason, "TANK_EMPTY") == 0) return WateringFeedbackCode::SAFETY_BLOCK_TANK_EMPTY;
+    if (strcmp(reason, "OVERFLOW_SENSOR_UNKNOWN") == 0) return WateringFeedbackCode::SAFETY_BLOCK_OVERFLOW_SENSOR_UNKNOWN;
+    if (strcmp(reason, "TANK_SENSOR_UNKNOWN") == 0) return WateringFeedbackCode::SAFETY_BLOCK_TANK_SENSOR_UNKNOWN;
+    if (strcmp(reason, "RESERVOIR_EMPTY") == 0) return WateringFeedbackCode::SAFETY_BLOCK_RESERVOIR_EMPTY;
+    if (strcmp(reason, "PUMP_NOT_CALIBRATED") == 0) return WateringFeedbackCode::SAFETY_BLOCK_PUMP_NOT_CALIBRATED;
+    return WateringFeedbackCode::NONE;
+}
+
+static void publishFeedback(ActuatorState& actuator,
+                            uint8_t potIdx,
+                            WateringFeedbackCode code,
+                            float value1 = 0.0f,
+                            float value2 = 0.0f,
+                            uint8_t pulseCount = 0) {
+    actuator.lastFeedbackSeq[potIdx]++;
+    actuator.lastFeedbackCode[potIdx] = code;
+    actuator.lastFeedbackValue1[potIdx] = value1;
+    actuator.lastFeedbackValue2[potIdx] = value2;
+    actuator.lastFeedbackPulseCount[potIdx] = pulseCount;
+}
+
 // ===========================================================================
 // evaluateSafety — PLAN.md → "Polityki bezpieczeństwa (gates)"
 // ===========================================================================
@@ -239,6 +263,7 @@ void wateringTick(uint32_t nowMs,
             nowMs, potSens, cfg, potCfg, budget, actuator, potIdx);
 
         if (safety.hardBlock) {
+            WateringPhase prevPhase = cycle.phase;
             if (cycle.phase == WateringPhase::PULSE && pump.isOn()) {
                 pump.off(nowMs, safety.reason);
             }
@@ -255,6 +280,12 @@ void wateringTick(uint32_t nowMs,
                         sizeof(s_lastSafetyReason[potIdx]) - 1);
                 s_lastSafetyReason[potIdx][sizeof(s_lastSafetyReason[potIdx]) - 1] = '\0';
                 s_lastSafetyLogMs[potIdx] = nowMs;
+            }
+            if (reasonChanged || prevPhase != WateringPhase::BLOCKED) {
+                WateringFeedbackCode code = feedbackCodeFromSafetyReason(reason);
+                if (code != WateringFeedbackCode::NONE) {
+                    publishFeedback(actuator, potIdx, code);
+                }
             }
             continue;
         }
@@ -281,10 +312,19 @@ void wateringTick(uint32_t nowMs,
                 cycle = newCycle(prof, potCfg, potIdx);
                 cycle.moistureBeforeCycle = potSens.moisturePct;
                 cycle.phaseStartMs = nowMs;
+                actuator.lastFeedbackCode[potIdx] = WateringFeedbackCode::NONE;
+                actuator.lastFeedbackValue1[potIdx] = 0.0f;
+                actuator.lastFeedbackValue2[potIdx] = 0.0f;
+                actuator.lastFeedbackPulseCount[potIdx] = 0;
 
                 Serial.printf("[POT%d] WATERING_CYCLE_START moisture=%.1f%% reason=%s\n",
                               potIdx, potSens.moisturePct,
                               sched.reason ? sched.reason : "?");
+                publishFeedback(actuator, potIdx,
+                                sched.decision == ScheduleDecision::RESCUE_WATER
+                                    ? WateringFeedbackCode::CYCLE_START_RESCUE
+                                    : WateringFeedbackCode::CYCLE_START_SCHEDULE,
+                                potSens.moisturePct);
             }
             break;
         }
@@ -302,12 +342,16 @@ void wateringTick(uint32_t nowMs,
                 cycle.phase = WateringPhase::DONE;
                 Serial.printf("[POT%d] WATERING_SKIP reason=already_wet moisture=%.1f%%\n",
                               potIdx, potSens.moisturePct);
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::SKIP_ALREADY_WET,
+                                potSens.moisturePct, effectiveTarget, cycle.pulseCount);
                 break;
             }
             if (potSens.moisturePct >= effectiveMax) {
                 cycle.phase = WateringPhase::DONE;
                 Serial.printf("[POT%d] WATERING_SKIP reason=above_max moisture=%.1f%%\n",
                               potIdx, potSens.moisturePct);
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::SKIP_ABOVE_MAX,
+                                potSens.moisturePct, effectiveMax, cycle.pulseCount);
                 break;
             }
 
@@ -330,6 +374,7 @@ void wateringTick(uint32_t nowMs,
                 if (budget.reservoirCurrentMl <= 0.0f) {
                     cycle.phase = WateringPhase::BLOCKED;
                     Serial.println("[WATER] event=reservoir_empty action=stop");
+                    publishFeedback(actuator, potIdx, WateringFeedbackCode::SAFETY_BLOCK_RESERVOIR_EMPTY);
                     break;
                 }
             }
@@ -374,6 +419,8 @@ void wateringTick(uint32_t nowMs,
                     cycle.phaseStartMs = nowMs;
                     Serial.printf("[POT%d] OVERFLOW_DETECTED after pulse %d\n",
                                   potIdx, cycle.pulseCount);
+                    publishFeedback(actuator, potIdx, WateringFeedbackCode::OVERFLOW_DETECTED,
+                                    potSens.moisturePct, 0.0f, cycle.pulseCount);
                 } else {
                     cycle.phase = WateringPhase::SOAK;
                     cycle.phaseStartMs = nowMs;
@@ -385,6 +432,8 @@ void wateringTick(uint32_t nowMs,
                 pump.off(nowMs, "HARD_TIMEOUT");
                 cycle.phase = WateringPhase::BLOCKED;
                 Serial.printf("[POT%d] HARD_TIMEOUT pump forced off\n", potIdx);
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::HARD_TIMEOUT,
+                                pump.onDuration(nowMs), cfg.pumpOnMsMax, cycle.pulseCount);
             }
             break;
         }
@@ -416,17 +465,25 @@ void wateringTick(uint32_t nowMs,
                 cycle.phase = WateringPhase::DONE;
                 Serial.printf("[POT%d] WATERING_TARGET_REACHED moisture=%.1f%%\n",
                               potIdx, moistureNow);
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::TARGET_REACHED,
+                                moistureNow, effectiveTarget, cycle.pulseCount);
             } else if (moistureNow >= prof.maxMoisturePct) {
                 cycle.phase = WateringPhase::DONE;
                 Serial.printf("[POT%d] WATERING_STOP reason=max_exceeded moisture=%.1f%%\n",
                               potIdx, moistureNow);
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::STOP_MAX_EXCEEDED,
+                                moistureNow, prof.maxMoisturePct, cycle.pulseCount);
             } else if (cycle.pulseCount >= cycle.maxPulses) {
                 cycle.phase = WateringPhase::DONE;
                 Serial.printf("[POT%d] WATERING_STOP reason=max_pulses moisture=%.1f%% pulses=%d\n",
                               potIdx, moistureNow, cycle.pulseCount);
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::STOP_MAX_PULSES,
+                                moistureNow, cycle.maxPulses, cycle.pulseCount);
             } else if (potSens.waterGuards.potMax == WaterLevelState::TRIGGERED) {
                 cycle.phase = WateringPhase::OVERFLOW_WAIT;
                 cycle.phaseStartMs = nowMs;
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::OVERFLOW_DETECTED,
+                                moistureNow, 0.0f, cycle.pulseCount);
             } else {
                 // Kolejny puls
                 cycle.phase = WateringPhase::PULSE;
@@ -456,12 +513,16 @@ void wateringTick(uint32_t nowMs,
                     cycle.phaseStartMs = nowMs;
                     Serial.printf("[POT%d] OVERFLOW_RESUME reduced_pulse=%dms\n",
                                   potIdx, cycle.pulseDurationMs);
+                    publishFeedback(actuator, potIdx, WateringFeedbackCode::OVERFLOW_RESUME,
+                                    potSens.moisturePct, effectiveTarget, cycle.pulseCount);
                 } else {
                     cycle.phase = WateringPhase::DONE;
                 }
             } else if (elapsed > cfg.overflowMaxWaitMs) {
                 cycle.phase = WateringPhase::DONE;
                 Serial.printf("[POT%d] OVERFLOW_TIMEOUT — ending cycle\n", potIdx);
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::OVERFLOW_TIMEOUT,
+                                elapsed / 1000.0f, cfg.overflowMaxWaitMs / 1000.0f, cycle.pulseCount);
             }
             // else: nadal czekamy
             break;
@@ -484,10 +545,14 @@ void wateringTick(uint32_t nowMs,
                 std::min(65535.0f, cycle.moistureBeforeCycle * 10.0f));
             rec.moistureAfter_x10 = static_cast<uint16_t>(
                 std::min(65535.0f, cycle.moistureAfterLastSoak * 10.0f));
-            rec.reason = 0;
+            rec.reason = static_cast<uint8_t>(actuator.lastFeedbackCode[potIdx]);
             historyAddWatering(g_history, rec);
 
             actuator.lastCycleDoneMs[potIdx] = nowMs;
+            if (actuator.lastFeedbackCode[potIdx] == WateringFeedbackCode::NONE) {
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::CYCLE_DONE_GENERIC,
+                                cycle.moistureAfterLastSoak, 0.0f, cycle.pulseCount);
+            }
             cycle.reset();
             // cycle.phase = IDLE (po reset)
             break;
@@ -501,6 +566,7 @@ void wateringTick(uint32_t nowMs,
             if (!recheck.hardBlock) {
                 cycle.phase = WateringPhase::IDLE;
                 Serial.printf("[POT%d] SAFETY_UNBLOCK\n", potIdx);
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::SAFETY_UNBLOCK);
             }
             break;
         }

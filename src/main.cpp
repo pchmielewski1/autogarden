@@ -20,6 +20,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <esp_log.h>
+#include <cstdarg>
 
 #include "events.h"
 #include "config.h"
@@ -74,6 +75,11 @@ struct SharedState {
     WaterBudget   budget;
     WateringCycle cycles[kMaxPots];
     uint32_t      lastCycleDoneMs[kMaxPots] = {};
+    uint32_t      lastFeedbackSeq[kMaxPots] = {};
+    WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
+    float         lastFeedbackValue1[kMaxPots] = {};
+    float         lastFeedbackValue2[kMaxPots] = {};
+    uint8_t       lastFeedbackPulseCount[kMaxPots] = {};
     TrendState    trends[kMaxPots];
     DuskPhase     duskPhase = DuskPhase::NIGHT;
     bool          wifiConnected = false;
@@ -85,6 +91,12 @@ static SharedState       s_sharedState;
 
 // Config save request — debounced
 static QueueHandle_t     s_saveQueue = nullptr;
+
+struct TelegramFeedbackMessage {
+    char text[160];
+};
+
+static QueueHandle_t     s_tgFeedbackQueue = nullptr;
 
 // ============================================================================
 // Helpers — snapshot (thread-safe r/w)
@@ -113,6 +125,11 @@ static void publishSharedStateFromControl() {
         s_sharedState.budget = g_budget;
         memcpy(s_sharedState.cycles, g_cycles, sizeof(g_cycles));
         memcpy(s_sharedState.lastCycleDoneMs, g_actuator.lastCycleDoneMs, sizeof(g_actuator.lastCycleDoneMs));
+        memcpy(s_sharedState.lastFeedbackSeq, g_actuator.lastFeedbackSeq, sizeof(g_actuator.lastFeedbackSeq));
+        memcpy(s_sharedState.lastFeedbackCode, g_actuator.lastFeedbackCode, sizeof(g_actuator.lastFeedbackCode));
+        memcpy(s_sharedState.lastFeedbackValue1, g_actuator.lastFeedbackValue1, sizeof(g_actuator.lastFeedbackValue1));
+        memcpy(s_sharedState.lastFeedbackValue2, g_actuator.lastFeedbackValue2, sizeof(g_actuator.lastFeedbackValue2));
+        memcpy(s_sharedState.lastFeedbackPulseCount, g_actuator.lastFeedbackPulseCount, sizeof(g_actuator.lastFeedbackPulseCount));
         memcpy(s_sharedState.trends, g_trendStates, sizeof(g_trendStates));
         s_sharedState.duskPhase = g_duskDetector.phase;
         xSemaphoreGive(s_stateMutex);
@@ -140,6 +157,163 @@ static void setSelectedPotFromUi(uint8_t selectedPot) {
     if (xSemaphoreTake(s_stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         s_sharedState.selectedPot = selectedPot;
         xSemaphoreGive(s_stateMutex);
+    }
+}
+
+static void queueTelegramFeedbackFmt(const char* fmt, ...) {
+    if (!s_tgFeedbackQueue || !fmt) {
+        return;
+    }
+
+    TelegramFeedbackMessage msg{};
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg.text, sizeof(msg.text), fmt, args);
+    va_end(args);
+    msg.text[sizeof(msg.text) - 1] = '\0';
+
+    if (msg.text[0] == '\0') {
+        return;
+    }
+
+    if (xQueueSend(s_tgFeedbackQueue, &msg, 0) != pdTRUE) {
+        Serial.println("[TG] event=feedback_drop reason=queue_full");
+    }
+}
+
+static float effectiveTargetForPot(const Config& cfg, uint8_t potIdx) {
+    const PlantProfile& prof = getActiveProfile(cfg, potIdx);
+    float target = prof.targetMoisturePct;
+    if (cfg.vacationMode) {
+        target -= cfg.vacationTargetReductionPct;
+        if (target < 5.0f) {
+            target = 5.0f;
+        }
+    }
+    return target;
+}
+
+static float effectiveMaxForPot(const Config& cfg, uint8_t potIdx) {
+    const PlantProfile& prof = getActiveProfile(cfg, potIdx);
+    return prof.maxMoisturePct;
+}
+
+static const char* remoteWaterRejectMessage(const char* reason) {
+    if (!reason) return "water request was rejected by control.";
+    if (strcmp(reason, "pot_disabled") == 0) return "water request blocked: pot is disabled.";
+    if (strcmp(reason, "mode_manual") == 0) return "water request blocked: mode is MANUAL.";
+    if (strcmp(reason, "cycle_active") == 0) return "water request blocked: watering is already active.";
+    if (strcmp(reason, "cooldown") == 0) return "water request blocked: cooldown is still active.";
+    if (strcmp(reason, "PUMP_NOT_CALIBRATED") == 0) return "water request blocked: pump is not calibrated.";
+    if (strcmp(reason, "OVERFLOW_RISK") == 0) return "water request blocked: overflow sensor is triggered.";
+    if (strcmp(reason, "TANK_EMPTY") == 0 || strcmp(reason, "RESERVOIR_EMPTY") == 0) return "water request blocked: reservoir is empty.";
+    if (strcmp(reason, "OVERFLOW_SENSOR_UNKNOWN") == 0) return "water request blocked: overflow sensor state is unknown.";
+    if (strcmp(reason, "TANK_SENSOR_UNKNOWN") == 0) return "water request blocked: reservoir sensor state is unknown.";
+    return "water request was rejected by control.";
+}
+
+static void publishWateringFeedback(const uint32_t* prevFeedbackSeq) {
+    for (uint8_t i = 0; i < g_config.numPots; ++i) {
+        if (g_actuator.lastFeedbackSeq[i] == prevFeedbackSeq[i]) {
+            continue;
+        }
+
+        switch (g_actuator.lastFeedbackCode[i]) {
+            case WateringFeedbackCode::CYCLE_START_SCHEDULE:
+                queueTelegramFeedbackFmt("Pot %u: automatic cycle started at %.1f%% moisture.",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue1[i]);
+                break;
+            case WateringFeedbackCode::CYCLE_START_RESCUE:
+                queueTelegramFeedbackFmt("Pot %u: rescue cycle started at critical moisture %.1f%%.",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue1[i]);
+                break;
+            case WateringFeedbackCode::SKIP_ALREADY_WET:
+                queueTelegramFeedbackFmt("Pot %u: skipped, wet enough %.1f%% >= %.1f%% target.",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue1[i],
+                                         g_actuator.lastFeedbackValue2[i]);
+                break;
+            case WateringFeedbackCode::SKIP_ABOVE_MAX:
+                queueTelegramFeedbackFmt("Pot %u: skipped, above max %.1f%% >= %.1f%%.",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue1[i],
+                                         g_actuator.lastFeedbackValue2[i]);
+                break;
+            case WateringFeedbackCode::OVERFLOW_DETECTED:
+                queueTelegramFeedbackFmt("Pot %u: overflow detected after pulse %u, waiting before resume.",
+                                         static_cast<unsigned>(i + 1),
+                                         static_cast<unsigned>(g_actuator.lastFeedbackPulseCount[i]));
+                break;
+            case WateringFeedbackCode::OVERFLOW_RESUME:
+                queueTelegramFeedbackFmt("Pot %u: overflow cleared, resuming below target %.1f%%.",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue2[i]);
+                break;
+            case WateringFeedbackCode::TARGET_REACHED:
+                queueTelegramFeedbackFmt("Pot %u: target reached %.1f%% after %u pulse(s).",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue1[i],
+                                         static_cast<unsigned>(g_actuator.lastFeedbackPulseCount[i]));
+                break;
+            case WateringFeedbackCode::STOP_MAX_EXCEEDED:
+                queueTelegramFeedbackFmt("Pot %u: stopped, max moisture reached %.1f%% >= %.1f%%.",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue1[i],
+                                         g_actuator.lastFeedbackValue2[i]);
+                break;
+            case WateringFeedbackCode::STOP_MAX_PULSES:
+                queueTelegramFeedbackFmt("Pot %u: stopped after max pulses %u, moisture %.1f%%.",
+                                         static_cast<unsigned>(i + 1),
+                                         static_cast<unsigned>(g_actuator.lastFeedbackPulseCount[i]),
+                                         g_actuator.lastFeedbackValue1[i]);
+                break;
+            case WateringFeedbackCode::OVERFLOW_TIMEOUT:
+                queueTelegramFeedbackFmt("Pot %u: stopped after overflow wait timeout (%.0fs / %.0fs).",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue1[i],
+                                         g_actuator.lastFeedbackValue2[i]);
+                break;
+            case WateringFeedbackCode::SAFETY_BLOCK_OVERFLOW_RISK:
+                queueTelegramFeedbackFmt("Pot %u: blocked by safety, overflow risk.",
+                                         static_cast<unsigned>(i + 1));
+                break;
+            case WateringFeedbackCode::SAFETY_BLOCK_TANK_EMPTY:
+            case WateringFeedbackCode::SAFETY_BLOCK_RESERVOIR_EMPTY:
+                queueTelegramFeedbackFmt("Pot %u: blocked by safety, reservoir empty.",
+                                         static_cast<unsigned>(i + 1));
+                break;
+            case WateringFeedbackCode::SAFETY_BLOCK_OVERFLOW_SENSOR_UNKNOWN:
+                queueTelegramFeedbackFmt("Pot %u: blocked by safety, overflow sensor state unknown.",
+                                         static_cast<unsigned>(i + 1));
+                break;
+            case WateringFeedbackCode::SAFETY_BLOCK_TANK_SENSOR_UNKNOWN:
+                queueTelegramFeedbackFmt("Pot %u: blocked by safety, reservoir sensor state unknown.",
+                                         static_cast<unsigned>(i + 1));
+                break;
+            case WateringFeedbackCode::SAFETY_BLOCK_PUMP_NOT_CALIBRATED:
+                queueTelegramFeedbackFmt("Pot %u: blocked by safety, pump not calibrated.",
+                                         static_cast<unsigned>(i + 1));
+                break;
+            case WateringFeedbackCode::HARD_TIMEOUT:
+                queueTelegramFeedbackFmt("Pot %u: hard timeout, pump forced OFF after %.0fms.",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue1[i]);
+                break;
+            case WateringFeedbackCode::SAFETY_UNBLOCK:
+                queueTelegramFeedbackFmt("Pot %u: safety block cleared.",
+                                         static_cast<unsigned>(i + 1));
+                break;
+            case WateringFeedbackCode::CYCLE_DONE_GENERIC:
+                queueTelegramFeedbackFmt("Pot %u: cycle finished, moisture now %.1f%%.",
+                                         static_cast<unsigned>(i + 1),
+                                         g_actuator.lastFeedbackValue1[i]);
+                break;
+            case WateringFeedbackCode::NONE:
+            default:
+                break;
+        }
     }
 }
 
@@ -212,13 +386,13 @@ static uint32_t ctrlAliveDigest(Mode mode, bool wifiConnected, uint32_t freeHeap
 // ============================================================================
 
 static void configTaskFn(void* /*param*/) {
-    Config pending;
+    static Config pending{};
+    static Config incoming{};
     bool   hasPending   = false;
     uint32_t lastReqMs  = 0;
     constexpr uint32_t kDebounceMs = 500;
 
     for (;;) {
-        Config incoming;
         // Czekaj na request z max 100ms timeout (poll)
         if (xQueueReceive(s_saveQueue, &incoming, pdMS_TO_TICKS(100)) == pdTRUE) {
             pending    = incoming;
@@ -334,17 +508,24 @@ static bool forcePumpOffWithRetry(uint8_t potIdx, uint32_t nowMs,
 
 static bool startRemoteWateringPulse(uint32_t nowMs,
                                      uint8_t potIdx,
-                                     const SensorSnapshot& snap) {
+                                     const SensorSnapshot& snap,
+                                     const char** rejectReason = nullptr) {
+    if (rejectReason) {
+        *rejectReason = nullptr;
+    }
     if (potIdx >= g_config.numPots || !g_config.pots[potIdx].enabled) {
+        if (rejectReason) *rejectReason = "pot_disabled";
         return false;
     }
     if (g_config.mode != Mode::AUTO) {
         Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=mode_manual\n", potIdx);
+        if (rejectReason) *rejectReason = "mode_manual";
         return false;
     }
     if (g_cycles[potIdx].phase != WateringPhase::IDLE) {
         Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=cycle_active phase=%d\n",
                       potIdx, static_cast<int>(g_cycles[potIdx].phase));
+        if (rejectReason) *rejectReason = "cycle_active";
         return false;
     }
 
@@ -354,6 +535,7 @@ static bool startRemoteWateringPulse(uint32_t nowMs,
     if (safety.hardBlock) {
         Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=%s\n",
                       potIdx, safety.reason ? safety.reason : "safety");
+        if (rejectReason) *rejectReason = safety.reason ? safety.reason : "safety";
         return false;
     }
 
@@ -364,10 +546,12 @@ static bool startRemoteWateringPulse(uint32_t nowMs,
     if (g_actuator.lastCycleDoneMs[potIdx] != 0 &&
         (nowMs - g_actuator.lastCycleDoneMs[potIdx]) < effCooldown) {
         Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=cooldown\n", potIdx);
+        if (rejectReason) *rejectReason = "cooldown";
         return false;
     }
     if (!potCfg.pumpCalibrated || potCfg.pumpMlPerSec <= 0.0f) {
         Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=pump_not_calibrated\n", potIdx);
+        if (rejectReason) *rejectReason = "PUMP_NOT_CALIBRATED";
         return false;
     }
 
@@ -384,6 +568,10 @@ static bool startRemoteWateringPulse(uint32_t nowMs,
     cycle.phaseStartMs = nowMs;
     cycle.moistureBeforeCycle = snap.pots[potIdx].moisturePct;
     g_cycles[potIdx] = cycle;
+    g_actuator.lastFeedbackCode[potIdx] = WateringFeedbackCode::NONE;
+    g_actuator.lastFeedbackValue1[potIdx] = 0.0f;
+    g_actuator.lastFeedbackValue2[potIdx] = 0.0f;
+    g_actuator.lastFeedbackPulseCount[potIdx] = 0;
 
     Serial.printf("[POT%d] event=remote_water_start source=telegram pulse_ml=%u\n",
                   potIdx, potCfg.pulseWaterMl);
@@ -537,10 +725,14 @@ static void controlTaskFn(void* /*param*/) {
             // Publikuj snapshot (thread-safe)
             publishSnapshot(snap);
 
+            uint32_t prevFeedbackSeq[kMaxPots];
+            memcpy(prevFeedbackSeq, g_actuator.lastFeedbackSeq, sizeof(prevFeedbackSeq));
+
             // FSM podlewania (AUTO mode)
             if (g_config.mode == Mode::AUTO) {
                 wateringTick(now, snap, g_config, g_cycles, g_budget,
                              g_actuator, g_hardware);
+                publishWateringFeedback(prevFeedbackSeq);
             } else {
                 // Mode != AUTO → abort any active watering cycles
                 for (uint8_t i = 0; i < g_config.numPots; ++i) {
@@ -551,6 +743,8 @@ static void controlTaskFn(void* /*param*/) {
                         }
                         Serial.printf("[POT%d] CYCLE_ABORT reason=mode_switch phase=%d\n",
                                       i, static_cast<int>(g_cycles[i].phase));
+                        queueTelegramFeedbackFmt("Pot %u: cycle aborted because mode switched to MANUAL.",
+                                                 static_cast<unsigned>(i + 1));
                         g_cycles[i].reset();
                     }
                 }
@@ -806,6 +1000,8 @@ static void controlTaskFn(void* /*param*/) {
                     g_config.mode = static_cast<Mode>(evt.payload.config.valueU16);
                     requestConfigSave(g_config);
                     Serial.printf("[CTRL] mode=%d\n", (int)g_config.mode);
+                    queueTelegramFeedbackFmt("Mode applied: %s.",
+                                             g_config.mode == Mode::AUTO ? "AUTO" : "MANUAL");
                     publishSharedStateFromControl();
                     break;
 
@@ -878,6 +1074,8 @@ static void controlTaskFn(void* /*param*/) {
                     handleVacationToggle(enable, g_config);
                     requestConfigSave(g_config);
                     Serial.printf("[CTRL] vacation=%d\n", g_config.vacationMode);
+                    queueTelegramFeedbackFmt("Vacation mode applied: %s.",
+                                             g_config.vacationMode ? "ON" : "OFF");
                     publishSharedStateFromControl();
                     break;
                 }
@@ -887,14 +1085,22 @@ static void controlTaskFn(void* /*param*/) {
                     s_runtimeDirty = true;
                     saveRuntimeNow(lastRuntimeSave);
                     Serial.println("[CTRL] event=reservoir_refill runtime_saved=yes");
+                    queueTelegramFeedbackFmt("Reservoir refill applied: %.0fml available.",
+                                             g_budget.reservoirCurrentMl);
                     publishSharedStateFromControl();
                     break;
 
                 case EventType::REQUEST_MANUAL_WATER: {
                     uint8_t potIdx = evt.payload.config.key;
-                    bool ok = startRemoteWateringPulse(now, potIdx, snap);
+                    const char* rejectReason = nullptr;
+                    bool ok = startRemoteWateringPulse(now, potIdx, snap, &rejectReason);
                     Serial.printf("[CTRL] event=remote_water pot=%u result=%s\n",
                                   static_cast<unsigned>(potIdx), ok ? "ok" : "blocked");
+                    if (!ok && potIdx < g_config.numPots) {
+                        queueTelegramFeedbackFmt("Pot %u: %s",
+                                                 static_cast<unsigned>(potIdx + 1),
+                                                 remoteWaterRejectMessage(rejectReason));
+                    }
                     publishSharedStateFromControl();
                     break;
                 }
@@ -930,6 +1136,7 @@ static void controlTaskFn(void* /*param*/) {
                         saveRuntimeNow(lastRuntimeSave);
                     }
                     Serial.printf("[CTRL] event=remote_stop any=%s\n", any ? "yes" : "no");
+                    queueTelegramFeedbackFmt("Stop applied: %s.", any ? "watering stopped" : "nothing was active");
                     publishSharedStateFromControl();
                     break;
                 }
@@ -944,7 +1151,10 @@ static void controlTaskFn(void* /*param*/) {
                 case EventType::REQUEST_START_WIFI_SETUP:
                     if (!g_netState.apActive) {
                         startApNonBlocking(g_netConfig, g_netState);
+                        queueTelegramFeedbackFmt("WiFi portal active: open autogarden or 192.168.4.1.");
                         publishSharedNetStatus(g_netState.wifiConnected);
+                    } else {
+                        queueTelegramFeedbackFmt("WiFi portal already active: autogarden / 192.168.4.1.");
                     }
                     break;
 
@@ -1234,6 +1444,15 @@ static void netTaskFn(void* /*param*/) {
         netTaskTick(now, g_netState, g_netConfig);
         publishSharedNetStatus(g_netState.wifiConnected);
 
+        if (g_netState.wifiConnected && g_netState.telegramEnabled && s_tgFeedbackQueue) {
+            TelegramFeedbackMessage note{};
+            while (xQueueReceive(s_tgFeedbackQueue, &note, 0) == pdTRUE) {
+                telegramSend(note.text, g_netConfig, 2, 250);
+                Serial.printf("[TG] event=feedback_sent len=%u\n",
+                              static_cast<unsigned>(strlen(note.text)));
+            }
+        }
+
         // Heartbeat check
         if (g_netState.wifiConnected && g_netState.telegramEnabled) {
             shared = readSharedState();
@@ -1256,10 +1475,16 @@ static void netTaskFn(void* /*param*/) {
             tgData.budget = shared.budget;
             memcpy(tgData.cycles, shared.cycles, sizeof(shared.cycles));
             memcpy(tgData.lastCycleDoneMs, shared.lastCycleDoneMs, sizeof(shared.lastCycleDoneMs));
+            memcpy(tgData.lastFeedbackSeq, shared.lastFeedbackSeq, sizeof(shared.lastFeedbackSeq));
+            memcpy(tgData.lastFeedbackCode, shared.lastFeedbackCode, sizeof(shared.lastFeedbackCode));
+            memcpy(tgData.lastFeedbackValue1, shared.lastFeedbackValue1, sizeof(shared.lastFeedbackValue1));
+            memcpy(tgData.lastFeedbackValue2, shared.lastFeedbackValue2, sizeof(shared.lastFeedbackValue2));
+            memcpy(tgData.lastFeedbackPulseCount, shared.lastFeedbackPulseCount, sizeof(shared.lastFeedbackPulseCount));
             memcpy(tgData.trends, shared.trends, sizeof(shared.trends));
             tgData.config = shared.config;
             tgData.duskPhase = shared.duskPhase;
             tgData.wifiConnected = shared.wifiConnected;
+            tgData.apActive = g_netState.apActive;
             tgData.selectedPot = shared.selectedPot;
             tgData.uptimeMs = now;
             telegramPollCommands(now, g_netConfig, tgData);
@@ -1281,7 +1506,7 @@ static void netTaskFn(void* /*param*/) {
 static constexpr uint32_t kControlStackSize = 12288;
 static constexpr uint32_t kUiStackSize      = 8192;
 static constexpr uint32_t kNetStackSize     = 12288;
-static constexpr uint32_t kConfigStackSize  = 4096;
+static constexpr uint32_t kConfigStackSize  = 8192;
 
 static constexpr UBaseType_t kControlPriority = 5;
 static constexpr UBaseType_t kUiPriority      = 3;
@@ -1378,6 +1603,7 @@ void setup() {
     s_snapMutex = xSemaphoreCreateMutex();
     s_stateMutex = xSemaphoreCreateMutex();
     s_saveQueue = xQueueCreate(8, sizeof(Config));
+    s_tgFeedbackQueue = xQueueCreate(12, sizeof(TelegramFeedbackMessage));
 
     // Initial shared snapshot
     publishSharedStateFromControl();

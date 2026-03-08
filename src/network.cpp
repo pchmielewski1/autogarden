@@ -272,6 +272,85 @@ static const char* duskPhaseStr(DuskPhase phase) {
     return "?";
 }
 
+static void formatLastFeedback(const TelegramStatusData& data,
+                               uint8_t potIdx,
+                               char* buf,
+                               size_t bufSize) {
+    if (!buf || bufSize == 0) {
+        return;
+    }
+    buf[0] = '\0';
+
+    switch (data.lastFeedbackCode[potIdx]) {
+        case WateringFeedbackCode::CYCLE_START_SCHEDULE:
+            snprintf(buf, bufSize, "auto_start %.1f%%", data.lastFeedbackValue1[potIdx]);
+            break;
+        case WateringFeedbackCode::CYCLE_START_RESCUE:
+            snprintf(buf, bufSize, "rescue_start %.1f%%", data.lastFeedbackValue1[potIdx]);
+            break;
+        case WateringFeedbackCode::SKIP_ALREADY_WET:
+            snprintf(buf, bufSize, "skip wet %.1f/%.1f%%",
+                     data.lastFeedbackValue1[potIdx], data.lastFeedbackValue2[potIdx]);
+            break;
+        case WateringFeedbackCode::SKIP_ABOVE_MAX:
+            snprintf(buf, bufSize, "skip max %.1f/%.1f%%",
+                     data.lastFeedbackValue1[potIdx], data.lastFeedbackValue2[potIdx]);
+            break;
+        case WateringFeedbackCode::OVERFLOW_DETECTED:
+            snprintf(buf, bufSize, "overflow pulse=%u",
+                     static_cast<unsigned>(data.lastFeedbackPulseCount[potIdx]));
+            break;
+        case WateringFeedbackCode::OVERFLOW_RESUME:
+            snprintf(buf, bufSize, "overflow_resume target=%.1f%%",
+                     data.lastFeedbackValue2[potIdx]);
+            break;
+        case WateringFeedbackCode::TARGET_REACHED:
+            snprintf(buf, bufSize, "target_reached %.1f%%", data.lastFeedbackValue1[potIdx]);
+            break;
+        case WateringFeedbackCode::STOP_MAX_EXCEEDED:
+            snprintf(buf, bufSize, "stop max %.1f/%.1f%%",
+                     data.lastFeedbackValue1[potIdx], data.lastFeedbackValue2[potIdx]);
+            break;
+        case WateringFeedbackCode::STOP_MAX_PULSES:
+            snprintf(buf, bufSize, "stop max_pulses %u",
+                     static_cast<unsigned>(data.lastFeedbackPulseCount[potIdx]));
+            break;
+        case WateringFeedbackCode::OVERFLOW_TIMEOUT:
+            snprintf(buf, bufSize, "overflow_timeout %.0fs",
+                     data.lastFeedbackValue1[potIdx]);
+            break;
+        case WateringFeedbackCode::SAFETY_BLOCK_OVERFLOW_RISK:
+            safeCopy(buf, bufSize, "blocked overflow_risk");
+            break;
+        case WateringFeedbackCode::SAFETY_BLOCK_TANK_EMPTY:
+        case WateringFeedbackCode::SAFETY_BLOCK_RESERVOIR_EMPTY:
+            safeCopy(buf, bufSize, "blocked reservoir_empty");
+            break;
+        case WateringFeedbackCode::SAFETY_BLOCK_OVERFLOW_SENSOR_UNKNOWN:
+            safeCopy(buf, bufSize, "blocked overflow_unknown");
+            break;
+        case WateringFeedbackCode::SAFETY_BLOCK_TANK_SENSOR_UNKNOWN:
+            safeCopy(buf, bufSize, "blocked reservoir_unknown");
+            break;
+        case WateringFeedbackCode::SAFETY_BLOCK_PUMP_NOT_CALIBRATED:
+            safeCopy(buf, bufSize, "blocked pump_uncalibrated");
+            break;
+        case WateringFeedbackCode::HARD_TIMEOUT:
+            snprintf(buf, bufSize, "hard_timeout %.0fms", data.lastFeedbackValue1[potIdx]);
+            break;
+        case WateringFeedbackCode::SAFETY_UNBLOCK:
+            safeCopy(buf, bufSize, "safety_unblock");
+            break;
+        case WateringFeedbackCode::CYCLE_DONE_GENERIC:
+            snprintf(buf, bufSize, "cycle_done %.1f%%", data.lastFeedbackValue1[potIdx]);
+            break;
+        case WateringFeedbackCode::NONE:
+        default:
+            safeCopy(buf, bufSize, "-" );
+            break;
+    }
+}
+
 static bool telegramWaterBlocked(const TelegramStatusData& status,
                                  uint8_t potIdx,
                                  char* reasonBuf,
@@ -301,6 +380,33 @@ static bool telegramWaterBlocked(const TelegramStatusData& status,
 
     const PotConfig& potCfg = status.config.pots[potIdx];
     const PotSensorSnapshot& pot = status.sensors.pots[potIdx];
+    const PlantProfile& prof = getActiveProfile(status.config, potIdx);
+    float effectiveTarget = prof.targetMoisturePct;
+    float effectiveMax = prof.maxMoisturePct;
+    if (status.config.vacationMode) {
+        effectiveTarget -= status.config.vacationTargetReductionPct;
+        if (effectiveTarget < 5.0f) {
+            effectiveTarget = 5.0f;
+        }
+    }
+
+    if (pot.moisturePct >= effectiveTarget) {
+        if (reasonBuf && reasonBufSize > 0) {
+            snprintf(reasonBuf, reasonBufSize,
+                     "Blocked: already wet %.1f%% >= %.1f%% target.",
+                     pot.moisturePct, effectiveTarget);
+        }
+        return true;
+    }
+    if (pot.moisturePct >= effectiveMax) {
+        if (reasonBuf && reasonBufSize > 0) {
+            snprintf(reasonBuf, reasonBufSize,
+                     "Blocked: above max %.1f%% >= %.1f%%.",
+                     pot.moisturePct, effectiveMax);
+        }
+        return true;
+    }
+
     if (status.config.antiOverflowEnabled) {
         if (pot.waterGuards.potMax == WaterLevelState::TRIGGERED) {
             safeCopy(reasonBuf, reasonBufSize, "Blocked: overflow sensor triggered.");
@@ -372,6 +478,8 @@ static void telegramWaterButtonLabel(const TelegramStatusData& status,
 
     if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
         safeCopy(buf, bufSize, "\xF0\x9F\x92\xA7 Watering...");
+    } else if (strstr(reason, "already wet") != nullptr || strstr(reason, "above max") != nullptr) {
+        safeCopy(buf, bufSize, "\xE2\x9C\x85 Wet enough");
     } else if (cooldownRemainingMs > 0) {
         snprintf(buf, bufSize, "\xE2\x8F\xB3 Water %lus",
                  static_cast<unsigned long>((cooldownRemainingMs + 999) / 1000));
@@ -550,10 +658,11 @@ static bool telegramSendInlineKeyboardToChat(const String& chatId,
 static void formatTelegramMenuSummary(const TelegramStatusData& data, char* buf, size_t bufSize) {
     int pos = 0;
     pos = appendFmt(buf, bufSize, pos, "autogarden menu\n");
-    pos = appendFmt(buf, bufSize, pos, "Mode: %s | Vac: %s | WiFi: %s\n",
+    pos = appendFmt(buf, bufSize, pos, "Mode: %s | Vac: %s | WiFi: %s | AP: %s\n",
                     modeStr(data.config.mode),
                     data.config.vacationMode ? "ON" : "OFF",
-                    data.wifiConnected ? "UP" : "DOWN");
+                    data.wifiConnected ? "UP" : "DOWN",
+                    data.apActive ? "ON" : "OFF");
     pos = appendFmt(buf, bufSize, pos, "Reservoir: %.0fml (~%.1fd)%s\n",
                     data.budget.reservoirCurrentMl,
                     data.budget.daysRemaining,
@@ -717,10 +826,11 @@ static void formatTelegramHistoryReport(const TelegramStatusData& data,
 void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_t bufSize) {
     int pos = 0;
     pos = appendFmt(buf, bufSize, pos, "autogarden status\n");
-    pos = appendFmt(buf, bufSize, pos, "Mode: %s | Vacation: %s | WiFi: %s\n",
+    pos = appendFmt(buf, bufSize, pos, "Mode: %s | Vacation: %s | WiFi: %s | AP: %s\n",
                     modeStr(data.config.mode),
                     data.config.vacationMode ? "ON" : "OFF",
-                    data.wifiConnected ? "UP" : "DOWN");
+                    data.wifiConnected ? "UP" : "DOWN",
+                    data.apActive ? "ON" : "OFF");
     pos = appendFmt(buf, bufSize, pos, "Dusk: %s | Uptime: %lu min\n",
                     duskPhaseStr(data.duskPhase),
                     static_cast<unsigned long>(data.uptimeMs / 60000UL));
@@ -739,7 +849,9 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
         const PlantProfile& prof = getActiveProfile(data.config, i);
         float targetPct = prof.targetMoisturePct;
         char waterState[96] = {};
+        char lastState[64] = {};
         telegramWaterBlocked(data, i, waterState, sizeof(waterState));
+        formatLastFeedback(data, i, lastState, sizeof(lastState));
         if (data.config.vacationMode) {
             targetPct -= data.config.vacationTargetReductionPct;
             if (targetPct < 5.0f) targetPct = 5.0f;
@@ -748,7 +860,8 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
                         "\nPot %u (%s)%s\n"
                         "  moisture=%.1f%% ema=%.1f%% target=%.1f%%\n"
                         "  raw=%u overflow=%s cycle=%d pulses=%u\n"
-                        "  action=%s\n",
+                        "  action=%s\n"
+                        "  last=%s\n",
                         static_cast<unsigned>(i + 1),
                         prof.name ? prof.name : "?",
                         (i == data.selectedPot) ? " [selected]" : "",
@@ -759,7 +872,8 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
                         data.sensors.pots[i].waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "OK",
                         static_cast<int>(data.cycles[i].phase),
                         data.cycles[i].pulseCount,
-                        waterState[0] ? waterState : "Ready: one safe pulse");
+                        waterState[0] ? waterState : "Ready: one safe pulse",
+                        lastState);
     }
 }
 
@@ -778,6 +892,15 @@ static bool pushConfigEvent(EventType type, uint8_t key, uint16_t valueU16, floa
     evt.payload.config.valueU16 = valueU16;
     evt.payload.config.valueF = valueF;
     return pushEvent(evt);
+}
+
+static bool anyWateringActive(const TelegramStatusData& status) {
+    for (uint8_t i = 0; i < status.config.numPots; ++i) {
+        if (status.cycles[i].phase != WateringPhase::IDLE) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool parseUIntArg(const String& token, uint8_t& out) {
@@ -812,6 +935,7 @@ static bool handleTelegramCallback(const telegramMessage& message,
     const String chatId = message.chat_id;
     const String data = message.text;
     const int messageId = message.message_id;
+    TelegramStatusData replyStatus = status;
 
     if (message.query_id.length() > 0) {
         if (!g_tgBot->answerCallbackQuery(message.query_id, "")) {
@@ -848,45 +972,86 @@ static bool handleTelegramCallback(const telegramMessage& message,
 
     if (data == "ag:stop") {
         bool ok = pushEvent(Event{EventType::REQUEST_PUMP_OFF});
-        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
-                 ok ? "Stop queued. Pumps will be forced OFF." : "Stop queue failed.");
-        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        bool anyActive = anyWateringActive(status);
+        if (ok) {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                     anyActive
+                         ? "Stop requested. Active watering is being forced OFF."
+                         : "Stop requested, but nothing is active right now.");
+            for (uint8_t i = 0; i < replyStatus.config.numPots; ++i) {
+                if (replyStatus.cycles[i].phase != WateringPhase::IDLE) {
+                    replyStatus.cycles[i].reset();
+                    replyStatus.lastCycleDoneMs[i] = replyStatus.uptimeMs;
+                }
+            }
+        } else {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Stop queue failed.");
+        }
+        buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
         return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
     }
 
     if (data == "ag:refill") {
         bool ok = pushEvent(Event{EventType::REQUEST_REFILL});
-        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
-                 ok ? "Reservoir refill queued." : "Refill queue failed.");
-        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        if (ok) {
+            float beforeMl = replyStatus.budget.reservoirCurrentMl;
+            replyStatus.budget.reservoirCurrentMl = replyStatus.config.reservoirCapacityMl;
+            replyStatus.budget.reservoirLow = false;
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                     "Reservoir refill requested: %.0fml -> %.0fml.",
+                     beforeMl,
+                     replyStatus.config.reservoirCapacityMl);
+        } else {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Refill queue failed.");
+        }
+        buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
         return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
     }
 
     if (data == "ag:wifi") {
         bool ok = pushEvent(Event{EventType::REQUEST_START_WIFI_SETUP});
-        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
-                 ok ? "WiFi setup queued. AP portal will start if possible." : "WiFi setup queue failed.");
-        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        if (ok) {
+            replyStatus.apActive = true;
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                     status.apActive
+                         ? "WiFi portal is already active. Open autogarden / 192.168.4.1."
+                         : "WiFi setup requested. AP portal should appear at autogarden / 192.168.4.1.");
+        } else {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "WiFi setup queue failed.");
+        }
+        buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
         return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
     }
 
     if (data == "ag:vac:toggle") {
         bool enable = !status.config.vacationMode;
         bool ok = pushConfigEvent(EventType::REQUEST_SET_VACATION, 0, enable ? 1 : 0);
-        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
-                 ok ? (enable ? "Vacation ON queued." : "Vacation OFF queued.")
-                    : "Vacation queue failed.");
-        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        if (ok) {
+            replyStatus.config.vacationMode = enable;
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                     enable
+                         ? "Vacation mode requested: ON. Targets and cooldowns are now relaxed."
+                         : "Vacation mode requested: OFF. Normal targets and cooldowns restored.");
+        } else {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Vacation queue failed.");
+        }
+        buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
         return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
     }
 
     if (data == "ag:mode:toggle") {
         Mode mode = (status.config.mode == Mode::AUTO) ? Mode::MANUAL : Mode::AUTO;
         bool ok = pushConfigEvent(EventType::REQUEST_SET_MODE, 0, static_cast<uint16_t>(mode));
-        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
-                 ok ? (mode == Mode::AUTO ? "Mode AUTO queued." : "Mode MANUAL queued.")
-                    : "Mode queue failed.");
-        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        if (ok) {
+            replyStatus.config.mode = mode;
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                     mode == Mode::AUTO
+                         ? "Mode change requested: AUTO. Remote water is enabled again."
+                         : "Mode change requested: MANUAL. Remote water is now blocked.");
+        } else {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Mode queue failed.");
+        }
+        buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
         return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
     }
 
@@ -902,8 +1067,12 @@ static bool handleTelegramCallback(const telegramMessage& message,
             } else {
                 bool ok = pushConfigEvent(EventType::REQUEST_MANUAL_WATER, potIdx, 1);
                 if (ok) {
+                    replyStatus.cycles[potIdx].phase = WateringPhase::EVALUATING;
+                    replyStatus.cycles[potIdx].potIndex = potIdx;
+                    replyStatus.cycles[potIdx].phaseStartMs = replyStatus.uptimeMs;
                     snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
-                             "Starting one safe pulse: %uml for pot %u.",
+                             "Water requested for pot %u: one safe pulse %uml. Preflight OK; control task is starting evaluation.",
+                             static_cast<unsigned>(potIdx + 1),
                              static_cast<unsigned>(status.config.pots[potIdx].pulseWaterMl),
                              static_cast<unsigned>(potIdx + 1));
                 } else {
@@ -911,7 +1080,7 @@ static bool handleTelegramCallback(const telegramMessage& message,
                 }
             }
         }
-        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
         return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
     }
 

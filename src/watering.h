@@ -32,6 +32,29 @@ enum class WateringPhase : uint8_t {
     BLOCKED,
 };
 
+enum class WateringFeedbackCode : uint8_t {
+    NONE = 0,
+    CYCLE_START_SCHEDULE,
+    CYCLE_START_RESCUE,
+    SKIP_ALREADY_WET,
+    SKIP_ABOVE_MAX,
+    OVERFLOW_DETECTED,
+    OVERFLOW_RESUME,
+    TARGET_REACHED,
+    STOP_MAX_EXCEEDED,
+    STOP_MAX_PULSES,
+    OVERFLOW_TIMEOUT,
+    SAFETY_BLOCK_OVERFLOW_RISK,
+    SAFETY_BLOCK_TANK_EMPTY,
+    SAFETY_BLOCK_OVERFLOW_SENSOR_UNKNOWN,
+    SAFETY_BLOCK_TANK_SENSOR_UNKNOWN,
+    SAFETY_BLOCK_RESERVOIR_EMPTY,
+    SAFETY_BLOCK_PUMP_NOT_CALIBRATED,
+    HARD_TIMEOUT,
+    SAFETY_UNBLOCK,
+    CYCLE_DONE_GENERIC,
+};
+
 // ---------------------------------------------------------------------------
 // WateringCycle — kontekst jednego cyklu per-pot
 // PLAN.md → "Kontekst jednego cyklu podlewania"
@@ -119,6 +142,11 @@ struct ScheduleResult {
 struct ActuatorState {
     uint32_t lastPumpStopAtMs[kMaxPots] = {};
     uint32_t lastCycleDoneMs[kMaxPots]  = {};
+    uint32_t lastFeedbackSeq[kMaxPots]  = {};
+    WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
+    float    lastFeedbackValue1[kMaxPots] = {};
+    float    lastFeedbackValue2[kMaxPots] = {};
+    uint8_t  lastFeedbackPulseCount[kMaxPots] = {};
 };
 
 // ---------------------------------------------------------------------------
