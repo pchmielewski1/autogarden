@@ -190,6 +190,16 @@ bool configSave(const Config& cfg) {
 // ---------------------------------------------------------------------------
 // NVS Load / Save — NetConfig
 // ---------------------------------------------------------------------------
+namespace {
+struct LegacyNetConfigV1 {
+    bool  provisioned       = false;
+    char  wifiSsid[33]      = {};
+    char  wifiPass[65]      = {};
+    char  telegramBotToken[64] = {};
+    char  telegramChatId[16]   = {};
+};
+}
+
 bool netConfigLoad(NetConfig& net) {
     Preferences prefs;
     net = NetConfig{};  // always zero-init first
@@ -215,9 +225,36 @@ bool netConfigLoad(NetConfig& net) {
         return false;
     }
 
-    size_t len = prefs.getBytes("net", &net, sizeof(NetConfig));
+    size_t storedLen = prefs.getBytesLength("net");
+    size_t len = prefs.getBytes("net", &net, storedLen <= sizeof(NetConfig) ? storedLen : sizeof(NetConfig));
     prefs.end();
-    return len == sizeof(NetConfig);
+
+    if (len == sizeof(NetConfig) && net.schemaVersion == kNetConfigSchema) {
+        return true;
+    }
+
+    if (storedLen == sizeof(LegacyNetConfigV1)) {
+        LegacyNetConfigV1 legacy{};
+        prefs.begin(kNvsNet, true);
+        size_t legacyLen = prefs.getBytes("net", &legacy, sizeof(legacy));
+        prefs.end();
+        if (legacyLen == sizeof(legacy)) {
+            net = NetConfig{};
+            net.provisioned = legacy.provisioned;
+            strncpy(net.wifiSsid, legacy.wifiSsid, sizeof(net.wifiSsid) - 1);
+            strncpy(net.wifiPass, legacy.wifiPass, sizeof(net.wifiPass) - 1);
+            strncpy(net.telegramBotToken, legacy.telegramBotToken, sizeof(net.telegramBotToken) - 1);
+            strncpy(net.telegramChatIds, legacy.telegramChatId, sizeof(net.telegramChatIds) - 1);
+            netConfigSave(net);
+            Serial.println("[NET] event=config_migrated from=v1 to=v2");
+            return true;
+        }
+    }
+
+    net = NetConfig{};
+    netConfigSave(net);
+    Serial.println("[NET] event=config_invalid action=defaults_written");
+    return false;
 }
 
 bool netConfigSave(const NetConfig& net) {

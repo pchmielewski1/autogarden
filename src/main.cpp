@@ -20,8 +20,6 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <esp_log.h>
-#include <cstdarg>
-#include <cstdio>
 
 #include "events.h"
 #include "config.h"
@@ -75,6 +73,7 @@ struct SharedState {
     NetConfig     netConfig;
     WaterBudget   budget;
     WateringCycle cycles[kMaxPots];
+    uint32_t      lastCycleDoneMs[kMaxPots] = {};
     TrendState    trends[kMaxPots];
     DuskPhase     duskPhase = DuskPhase::NIGHT;
     bool          wifiConnected = false;
@@ -113,6 +112,7 @@ static void publishSharedStateFromControl() {
         s_sharedState.netConfig = g_netConfig;
         s_sharedState.budget = g_budget;
         memcpy(s_sharedState.cycles, g_cycles, sizeof(g_cycles));
+        memcpy(s_sharedState.lastCycleDoneMs, g_actuator.lastCycleDoneMs, sizeof(g_actuator.lastCycleDoneMs));
         memcpy(s_sharedState.trends, g_trendStates, sizeof(g_trendStates));
         s_sharedState.duskPhase = g_duskDetector.phase;
         xSemaphoreGive(s_stateMutex);
@@ -204,30 +204,6 @@ static uint32_t ctrlAliveDigest(Mode mode, bool wifiConnected, uint32_t freeHeap
     h = hashMix(h, wifiConnected ? 1u : 0u);
     h = hashMix(h, freeHeap / 8192u);
     return h;
-}
-
-static void appendLogf(char* buffer, size_t bufferSize, size_t& pos, const char* fmt, ...) {
-    if (!buffer || bufferSize == 0 || !fmt || pos >= bufferSize - 1) {
-        return;
-    }
-
-    va_list args;
-    va_start(args, fmt);
-    int written = vsnprintf(buffer + pos, bufferSize - pos, fmt, args);
-    va_end(args);
-
-    if (written <= 0) {
-        return;
-    }
-
-    size_t remaining = bufferSize - pos;
-    if (static_cast<size_t>(written) >= remaining) {
-        pos = bufferSize - 1;
-        buffer[pos] = '\0';
-        return;
-    }
-
-    pos += static_cast<size_t>(written);
 }
 
 // ============================================================================
@@ -354,6 +330,64 @@ static bool forcePumpOffWithRetry(uint8_t potIdx, uint32_t nowMs,
     Serial.printf("[POT%d] SAFETY_BLOCK reason=pump_off_failed src=%s\n",
                   potIdx, reason ? reason : "unknown");
     return false;
+}
+
+static bool startRemoteWateringPulse(uint32_t nowMs,
+                                     uint8_t potIdx,
+                                     const SensorSnapshot& snap) {
+    if (potIdx >= g_config.numPots || !g_config.pots[potIdx].enabled) {
+        return false;
+    }
+    if (g_config.mode != Mode::AUTO) {
+        Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=mode_manual\n", potIdx);
+        return false;
+    }
+    if (g_cycles[potIdx].phase != WateringPhase::IDLE) {
+        Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=cycle_active phase=%d\n",
+                      potIdx, static_cast<int>(g_cycles[potIdx].phase));
+        return false;
+    }
+
+    const PotConfig& potCfg = g_config.pots[potIdx];
+    SafetyResult safety = evaluateExtendedSafety(nowMs, snap.pots[potIdx], g_config,
+                                                 potCfg, g_budget, g_actuator, potIdx);
+    if (safety.hardBlock) {
+        Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=%s\n",
+                      potIdx, safety.reason ? safety.reason : "safety");
+        return false;
+    }
+
+    uint32_t effCooldown = g_config.cooldownMs;
+    if (g_config.vacationMode) {
+        effCooldown = static_cast<uint32_t>(effCooldown * g_config.vacationCooldownMultiplier);
+    }
+    if (g_actuator.lastCycleDoneMs[potIdx] != 0 &&
+        (nowMs - g_actuator.lastCycleDoneMs[potIdx]) < effCooldown) {
+        Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=cooldown\n", potIdx);
+        return false;
+    }
+    if (!potCfg.pumpCalibrated || potCfg.pumpMlPerSec <= 0.0f) {
+        Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=pump_not_calibrated\n", potIdx);
+        return false;
+    }
+
+    const PlantProfile& prof = getActiveProfile(g_config, potIdx);
+    WateringCycle cycle{};
+    cycle.potIndex = potIdx;
+    cycle.phase = WateringPhase::EVALUATING;
+    cycle.maxPulses = 1;
+    cycle.pulseDurationMs = static_cast<uint32_t>((potCfg.pulseWaterMl / potCfg.pumpMlPerSec) * 1000.0f);
+    if (cycle.pulseDurationMs > g_config.pumpOnMsMax) {
+        cycle.pulseDurationMs = g_config.pumpOnMsMax;
+    }
+    cycle.soakTimeMs = prof.soakTimeMs;
+    cycle.phaseStartMs = nowMs;
+    cycle.moistureBeforeCycle = snap.pots[potIdx].moisturePct;
+    g_cycles[potIdx] = cycle;
+
+    Serial.printf("[POT%d] event=remote_water_start source=telegram pulse_ml=%u\n",
+                  potIdx, potCfg.pulseWaterMl);
+    return true;
 }
 
 // ============================================================================
@@ -626,27 +660,18 @@ static void controlTaskFn(void* /*param*/) {
                 statusDigestInit = true;
                 lastFullStatusMs = now;
 
-                char statusBuf[2048];
-                size_t statusPos = 0;
-                statusBuf[0] = '\0';
+                Serial.println("[STATUS] event=begin");
+                Serial.printf("[SYS] uptime=%dm%ds heap=%d freeMin=%d\n",
+                              upSec / 60, upSec % 60,
+                              (int)ESP.getFreeHeap(), (int)ESP.getMinFreeHeap());
+                Serial.printf("[SYS] mode=%s numPots=%d vacation=%s\n",
+                              g_config.mode == Mode::AUTO ? "AUTO" : "MANUAL",
+                              g_config.numPots,
+                              g_config.vacationMode ? "ON" : "OFF");
 
-                appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                           "[STATUS] event=begin\n");
-                appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                           "[SYS] event=snapshot uptime_s=%lu heap=%u free_min=%u\n",
-                           static_cast<unsigned long>(upSec),
-                           static_cast<unsigned>(ESP.getFreeHeap()),
-                           static_cast<unsigned>(ESP.getMinFreeHeap()));
-                appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                           "[SYS] event=config mode=%s num_pots=%u vacation=%s\n",
-                           g_config.mode == Mode::AUTO ? "AUTO" : "MANUAL",
-                           static_cast<unsigned>(g_config.numPots),
-                           g_config.vacationMode ? "on" : "off");
-
-                appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                           "[ENV] event=snapshot temp_c=%.1f hum_pct=%.1f lux=%.0f press_hpa=%.1f\n",
-                           snap.env.tempC, snap.env.humidityPct,
-                           snap.env.lux, snap.env.pressureHpa);
+                Serial.printf("[ENV] temp=%.1fC hum=%.1f%% lux=%.0f press=%.1fhPa\n",
+                              snap.env.tempC, snap.env.humidityPct,
+                              snap.env.lux, snap.env.pressureHpa);
 
                 for (uint8_t i = 0; i < g_config.numPots; ++i) {
                     if (!g_config.pots[i].enabled) continue;
@@ -663,10 +688,9 @@ static void controlTaskFn(void* /*param*/) {
                         case WateringPhase::DONE:          phaseStr = "DONE"; break;
                         case WateringPhase::BLOCKED:       phaseStr = "BLOCK"; break;
                     }
-                    appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                               "[POT%u] event=snapshot raw=%d comp=%.0f moisture_pct=%.1f ema_pct=%.1f phase=%s\n",
-                               static_cast<unsigned>(i), ps.moistureRaw, ps.moistureComp,
-                               ps.moisturePct, ps.moistureEma, phaseStr);
+                    Serial.printf("[POT%d] raw=%d comp=%.0f pct=%.1f%% ema=%.1f%% phase=%s\n",
+                                  i, ps.moistureRaw, ps.moistureComp,
+                                  ps.moisturePct, ps.moistureEma, phaseStr);
 
                     if (cyc.phase == WateringPhase::IDLE && g_config.mode == Mode::AUTO) {
                         const PlantProfile& pr = getActiveProfile(g_config, i);
@@ -695,49 +719,41 @@ static void controlTaskFn(void* /*param*/) {
                         else
                             idleReason = "SHOULD_START";
 
-                        appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                                   "[POT%u] event=idle_state target_pct=%.0f trigger_pct=%.0f profile=%s pulse_ml=%u reason=%s\n",
-                                   static_cast<unsigned>(i), effTarget, trigPct, pr.name,
-                                   static_cast<unsigned>(g_config.pots[i].pulseWaterMl), idleReason);
+                        Serial.printf("[POT%d] idle: target=%.0f%% trigger=%.0f%% profile=%s puls=%dml reason=%s\n",
+                                      i, effTarget, trigPct, pr.name,
+                                      g_config.pots[i].pulseWaterMl, idleReason);
                         if (cooling) {
                             uint32_t cdLeft = effCd - (now - g_actuator.lastCycleDoneMs[i]);
-                            appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                                       "[POT%u] event=cooldown remaining_s=%u\n",
-                                       static_cast<unsigned>(i), static_cast<unsigned>(cdLeft / 1000));
+                            Serial.printf("[POT%d] cooldown_remaining=%ds\n", i, cdLeft / 1000);
                         }
                     }
 
-                    appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                               "[POT%u] event=guards overflow=%s reservoir=%s crosstalk=%s\n",
-                               static_cast<unsigned>(i),
-                               ps.waterGuards.potMax == WaterLevelState::OK ? "OK" :
-                               ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
-                               ps.waterGuards.reservoirMin == WaterLevelState::OK ? "OK" :
-                               ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
-                               ps.crosstalkUplift ? "yes" : "no");
+                    Serial.printf("[POT%d] overflow=%s reservoir=%s crosstalk=%s\n",
+                                  i,
+                                  ps.waterGuards.potMax == WaterLevelState::OK ? "OK" :
+                                  ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
+                                  ps.waterGuards.reservoirMin == WaterLevelState::OK ? "OK" :
+                                  ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
+                                  ps.crosstalkUplift ? "yes" : "no");
                     if (cyc.phase != WateringPhase::IDLE && cyc.phase != WateringPhase::DONE) {
-                        appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                                   "[POT%u] event=pulse_state pulse=%u max_pulses=%u pumped_ml=%.1f phase_s=%u\n",
-                                   static_cast<unsigned>(i), static_cast<unsigned>(cyc.pulseCount),
-                                   static_cast<unsigned>(cyc.maxPulses), cyc.totalPumpedMl,
-                                   static_cast<unsigned>((now - cyc.phaseStartMs) / 1000));
+                        Serial.printf("[POT%d] pulse=%d/%d pumped=%.1fml phaseSince=%ds\n",
+                                      i, cyc.pulseCount, cyc.maxPulses,
+                                      cyc.totalPumpedMl,
+                                      (int)((now - cyc.phaseStartMs) / 1000));
                     }
 
                     const auto& tr = g_trendStates[i];
                     if (tr.count > 0) {
-                        appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                                   "[POT%u] event=trend rate_pct_h=%.2f baseline_pct_h=%.2f calibrated=%s samples=%u\n",
-                                   static_cast<unsigned>(i), trendCurrentRate(i), tr.normalDryingRate,
-                                   tr.baselineCalibrated ? "yes" : "no",
-                                   static_cast<unsigned>(tr.count));
+                        Serial.printf("[POT%d] trend rate=%.2f%%/h baseline=%.2f cal=%s samples=%d\n",
+                                      i, trendCurrentRate(i), tr.normalDryingRate,
+                                      tr.baselineCalibrated ? "yes" : "no", tr.count);
                     }
                 }
 
-                appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                           "[BUDGET] event=snapshot current_ml=%.0f total_pumped_ml=%.1f capacity_ml=%.0f low=%s\n",
-                           g_budget.reservoirCurrentMl, g_budget.totalPumpedMl,
-                           g_budget.reservoirCapacityMl,
-                           g_budget.reservoirLow ? "yes" : "no");
+                Serial.printf("[BUDGET] current=%.0fml total_pumped=%.1fml capacity=%.0fml low=%s\n",
+                              g_budget.reservoirCurrentMl, g_budget.totalPumpedMl,
+                              g_budget.reservoirCapacityMl,
+                              g_budget.reservoirLow ? "YES" : "no");
 
                 const char* duskStr = "?";
                 switch (g_duskDetector.phase) {
@@ -746,23 +762,19 @@ static void controlTaskFn(void* /*param*/) {
                     case DuskPhase::DAY:             duskStr = "DAY"; break;
                     case DuskPhase::DUSK_TRANSITION: duskStr = "DUSK_TR"; break;
                 }
-                appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                           "[DUSK] event=snapshot phase=%s dawn_score=%.2f dusk_score=%.2f samples=%u\n",
-                           duskStr, g_duskDetector.dawnScore, g_duskDetector.duskScore,
-                           static_cast<unsigned>(g_duskDetector.count));
+                Serial.printf("[DUSK] phase=%s dawnScore=%.2f duskScore=%.2f samples=%d\n",
+                              duskStr, g_duskDetector.dawnScore, g_duskDetector.duskScore,
+                              g_duskDetector.count);
                 if (g_solarClock.calibrated) {
-                    appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                               "[SOLAR] event=snapshot day_h=%u day_m=%u night_h=%u night_m=%u cycles=%u\n",
-                               static_cast<unsigned>(g_solarClock.dayLengthMs / 3600000),
-                               static_cast<unsigned>((g_solarClock.dayLengthMs / 60000) % 60),
-                               static_cast<unsigned>(g_solarClock.nightLengthMs / 3600000),
-                               static_cast<unsigned>((g_solarClock.nightLengthMs / 60000) % 60),
-                               static_cast<unsigned>(g_solarClock.cycleCount));
+                    Serial.printf("[SOLAR] day=%dh%dm night=%dh%dm cycles=%d\n",
+                                  g_solarClock.dayLengthMs / 3600000,
+                                  (g_solarClock.dayLengthMs / 60000) % 60,
+                                  g_solarClock.nightLengthMs / 3600000,
+                                  (g_solarClock.nightLengthMs / 60000) % 60,
+                                  g_solarClock.cycleCount);
                 }
 
-                appendLogf(statusBuf, sizeof(statusBuf), statusPos,
-                           "[STATUS] event=end\n");
-                Serial.println(statusBuf);
+                Serial.println("[STATUS] event=end");
                 Serial.flush();
             }
         }
@@ -877,6 +889,50 @@ static void controlTaskFn(void* /*param*/) {
                     Serial.println("[CTRL] event=reservoir_refill runtime_saved=yes");
                     publishSharedStateFromControl();
                     break;
+
+                case EventType::REQUEST_MANUAL_WATER: {
+                    uint8_t potIdx = evt.payload.config.key;
+                    bool ok = startRemoteWateringPulse(now, potIdx, snap);
+                    Serial.printf("[CTRL] event=remote_water pot=%u result=%s\n",
+                                  static_cast<unsigned>(potIdx), ok ? "ok" : "blocked");
+                    publishSharedStateFromControl();
+                    break;
+                }
+
+                case EventType::REQUEST_PUMP_OFF: {
+                    bool any = false;
+                    bool budgetChanged = false;
+                    for (uint8_t i = 0; i < g_config.numPots; ++i) {
+                        if (g_hardware.pump(i).isOn()) {
+                            any = true;
+                            uint32_t onMs = g_hardware.pump(i).onDuration(now);
+                            if (g_config.pots[i].pumpMlPerSec > 0.0f && onMs > 0) {
+                                float pumpedMl = (onMs / 1000.0f) * g_config.pots[i].pumpMlPerSec;
+                                addPumped(g_budget, pumpedMl, i);
+                                g_cycles[i].totalPumpedMs += onMs;
+                                g_cycles[i].totalPumpedMl += pumpedMl;
+                                budgetChanged = true;
+                            }
+                            forcePumpOffWithRetry(i, now, "REMOTE_STOP");
+                        }
+                        if (g_cycles[i].phase != WateringPhase::IDLE) {
+                            any = true;
+                            g_cycles[i].reset();
+                            g_actuator.lastCycleDoneMs[i] = now;
+                        }
+                    }
+                    g_manual.blueHeldMs = 0;
+                    g_manual.blueOwnsPump = false;
+                    g_manual.locked = true;
+                    g_manual.lockUntilMs = now + 5000;
+                    if (budgetChanged) {
+                        s_runtimeDirty = true;
+                        saveRuntimeNow(lastRuntimeSave);
+                    }
+                    Serial.printf("[CTRL] event=remote_stop any=%s\n", any ? "yes" : "no");
+                    publishSharedStateFromControl();
+                    break;
+                }
 
                 case EventType::REQUEST_VACATION_TOGGLE:
                     handleVacationToggle(!g_config.vacationMode, g_config);
@@ -1166,6 +1222,12 @@ static void netTaskFn(void* /*param*/) {
     Serial.println("[NET] event=task_started");
     netTaskInit(g_netConfig, g_netState);
 
+    static SharedState shared{};
+    static SensorSnapshot latestSnap{};
+    static DailyReportData rptData{};
+    static TelegramStatusData tgData{};
+    static char heartbeatBuf[512];
+
     for (;;) {
         uint32_t now = millis();
 
@@ -1174,28 +1236,41 @@ static void netTaskFn(void* /*param*/) {
 
         // Heartbeat check
         if (g_netState.wifiConnected && g_netState.telegramEnabled) {
-            SharedState shared = readSharedState();
+            shared = readSharedState();
+            latestSnap = readSnapshot();
             if (isDailyHeartbeatTime(now, g_solarClock, g_duskDetector,
                                      false /* NTP TODO */, g_netState)) {
-                DailyReportData rptData{};
-                rptData.sensors  = readSnapshot();
+                rptData.sensors  = latestSnap;
                 rptData.budget   = shared.budget;
                 memcpy(rptData.trends, shared.trends, sizeof(shared.trends));
                 rptData.config   = shared.config;
                 rptData.uptimeMs = now;
 
-                char buf[512];
-                formatDailyReport(rptData, buf, sizeof(buf));
-                telegramSend(buf, g_netConfig);
+                formatDailyReport(rptData, heartbeatBuf, sizeof(heartbeatBuf));
+                telegramSend(heartbeatBuf, g_netConfig);
                 g_netState.heartbeatSentToday = true;
                 Serial.println("[NET] event=heartbeat_sent");
             }
 
-            telegramPollCommands(now, g_netConfig);
+            tgData.sensors = latestSnap;
+            tgData.budget = shared.budget;
+            memcpy(tgData.cycles, shared.cycles, sizeof(shared.cycles));
+            memcpy(tgData.lastCycleDoneMs, shared.lastCycleDoneMs, sizeof(shared.lastCycleDoneMs));
+            memcpy(tgData.trends, shared.trends, sizeof(shared.trends));
+            tgData.config = shared.config;
+            tgData.duskPhase = shared.duskPhase;
+            tgData.wifiConnected = shared.wifiConnected;
+            tgData.selectedPot = shared.selectedPot;
+            tgData.uptimeMs = now;
+            telegramPollCommands(now, g_netConfig, tgData);
         }
 
-        // AP mode wymaga szybszego ticka (~100ms); normalny tryb co 1s
-        vTaskDelay(pdMS_TO_TICKS(g_netState.apActive ? 100 : 1000));
+        // AP mode i aktywny Telegram korzystają z krótszego ticka,
+        // żeby adaptacyjny polling/callbacki były responsywne bez wpływu na automatykę.
+        const uint32_t netDelayMs = g_netState.apActive
+            ? 100
+            : ((g_netState.wifiConnected && g_netState.telegramEnabled) ? 100 : 1000);
+        vTaskDelay(pdMS_TO_TICKS(netDelayMs));
     }
 }
 
@@ -1205,7 +1280,7 @@ static void netTaskFn(void* /*param*/) {
 
 static constexpr uint32_t kControlStackSize = 12288;
 static constexpr uint32_t kUiStackSize      = 8192;
-static constexpr uint32_t kNetStackSize     = 8192;
+static constexpr uint32_t kNetStackSize     = 12288;
 static constexpr uint32_t kConfigStackSize  = 4096;
 
 static constexpr UBaseType_t kControlPriority = 5;
@@ -1270,6 +1345,13 @@ void setup() {
     // --- Załaduj konfigurację sieci ---
     if (!netConfigLoad(g_netConfig)) {
         Serial.println("[BOOT] event=netcfg_load result=fail provisioning=needed");
+    }
+    applyLocalTelegramConfig(g_netConfig);
+    if (strlen(g_netConfig.telegramBotToken) > 0 && g_netConfig.telegramChatIds[0] != '\0') {
+        Serial.printf("[BOOT] event=telegram_config source=%s bot=%s targets=%u\n",
+                      "nvs_or_local",
+                      telegramConfiguredBotName()[0] ? telegramConfiguredBotName() : "configured",
+                      static_cast<unsigned>(telegramConfiguredTargetCount(g_netConfig)));
     }
 
     // --- WiFi (OPCJONALNE — nie blokuje boota) ---

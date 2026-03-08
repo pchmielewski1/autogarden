@@ -76,8 +76,26 @@ void netTaskTick(uint32_t nowMs, NetworkState& ns, const NetConfig& netCfg);
 // API — Telegram
 // ---------------------------------------------------------------------------
 
+struct TelegramStatusData {
+    SensorSnapshot  sensors;
+    WaterBudget     budget;
+    WateringCycle   cycles[kMaxPots];
+    uint32_t        lastCycleDoneMs[kMaxPots] = {};
+    TrendState      trends[kMaxPots];
+    Config          config;
+    DuskPhase       duskPhase = DuskPhase::NIGHT;
+    bool            wifiConnected = false;
+    uint8_t         selectedPot = 0;
+    uint32_t        uptimeMs = 0;
+};
+
+void applyLocalTelegramConfig(NetConfig& netCfg);
+const char* telegramConfiguredBotName();
+uint8_t telegramConfiguredTargetCount(const NetConfig& netCfg);
+
 // Sprawdź nowe komendy z Telegram i push do EventQueue
-void telegramPollCommands(uint32_t nowMs, const NetConfig& netCfg);
+void telegramPollCommands(uint32_t nowMs, const NetConfig& netCfg,
+                          const TelegramStatusData& status);
 
 // Wyślij wiadomość z retry + backoff
 bool telegramSend(const char* msg, const NetConfig& netCfg,
@@ -94,6 +112,7 @@ struct DailyReportData {
 };
 
 void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize);
+void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_t bufSize);
 
 // Sprawdź czy pora na heartbeat (SolarClock / NTP / fallback 24h)
 bool isDailyHeartbeatTime(uint32_t nowMs, const SolarClock& clk,

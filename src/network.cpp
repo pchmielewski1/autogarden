@@ -12,15 +12,36 @@
 #include "events.h"
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
+#include <UniversalTelegramBot.h>
+#include <cctype>
+#include <cstdarg>
+#include <memory>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "log_serial.h"
 
 #define Serial AGSerial
 
-// TODO(telegram): #include <UniversalTelegramBot.h>
-// TODO(telegram): #include <WiFiClientSecure.h>
+#if __has_include(<telegram_local_config.h>)
+#include <telegram_local_config.h>
+#else
+#define AG_TELEGRAM_LOCAL_ENABLED 0
+#define AG_TELEGRAM_BOT_NAME ""
+#define AG_TELEGRAM_BOT_TOKEN ""
+#define AG_TELEGRAM_CHAT_IDS ""
+#endif
+
+#ifndef AG_TELEGRAM_CHAT_IDS
+#ifdef AG_TELEGRAM_CHAT_ID
+#define AG_TELEGRAM_CHAT_IDS AG_TELEGRAM_CHAT_ID
+#else
+#define AG_TELEGRAM_CHAT_IDS ""
+#endif
+#endif
 
 // ---------------------------------------------------------------------------
 // Captive portal HTML — stored in PROGMEM
@@ -39,6 +60,863 @@ static const char SUCCESS_HTML[] PROGMEM = R"(
 static WebServer* g_webServer  = nullptr;
 static DNSServer* g_dnsServer  = nullptr;
 static NetConfig* g_apNetCfg   = nullptr;   // pointer do NetConfig w AP mode
+static WiFiClientSecure g_tgClient;
+static std::unique_ptr<UniversalTelegramBot> g_tgBot;
+static char g_tgTokenCache[64] = {};
+static char g_tgConfiguredBotName[64] = {};
+static char g_tgReplyBuf[1024] = {};
+static char g_tgKeyboardBuf[768] = {};
+static uint32_t g_tgLastIdleLogMs = 0;
+static uint32_t g_tgLastPollMs = 0;
+static uint32_t g_tgFastPollUntilMs = 0;
+static constexpr uint32_t kTelegramPollIntervalIdleMs = 2000;
+static constexpr uint32_t kTelegramPollIntervalActiveMs = 400;
+static constexpr uint32_t kTelegramFastPollWindowMs = 120000;
+static constexpr uint32_t kTelegramRequestTimeoutMs = 8000;
+static constexpr uint8_t kTelegramMaxBatchFetches = 10;
+
+static uint8_t countChatIds(const char* chatIds);
+
+static void telegramBumpFastPollWindow(uint32_t nowMs) {
+    g_tgFastPollUntilMs = nowMs + kTelegramFastPollWindowMs;
+}
+
+static uint32_t telegramCurrentPollInterval(uint32_t nowMs) {
+    return (nowMs < g_tgFastPollUntilMs)
+        ? kTelegramPollIntervalActiveMs
+        : kTelegramPollIntervalIdleMs;
+}
+
+static int appendFmt(char* buf, size_t bufSize, int pos, const char* fmt, ...) {
+    if (!buf || bufSize == 0) {
+        return 0;
+    }
+    if (pos < 0) {
+        pos = 0;
+    }
+    if (static_cast<size_t>(pos) >= bufSize) {
+        buf[bufSize - 1] = '\0';
+        return static_cast<int>(bufSize - 1);
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf + pos, bufSize - static_cast<size_t>(pos), fmt, args);
+    va_end(args);
+    if (n <= 0) {
+        return pos;
+    }
+    if (static_cast<size_t>(n) >= (bufSize - static_cast<size_t>(pos))) {
+        buf[bufSize - 1] = '\0';
+        return static_cast<int>(bufSize - 1);
+    }
+    return pos + n;
+}
+
+static void safeCopy(char* dst, size_t dstSize, const char* src) {
+    if (!dst || dstSize == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    strncpy(dst, src, dstSize - 1);
+    dst[dstSize - 1] = '\0';
+}
+
+static bool localTelegramSecretsAvailable() {
+    return AG_TELEGRAM_LOCAL_ENABLED && AG_TELEGRAM_BOT_TOKEN[0] != '\0' &&
+           AG_TELEGRAM_CHAT_IDS[0] != '\0';
+}
+
+const char* telegramConfiguredBotName() {
+    return g_tgConfiguredBotName;
+}
+
+uint8_t telegramConfiguredTargetCount(const NetConfig& netCfg) {
+    return countChatIds(netCfg.telegramChatIds);
+}
+
+static bool isChatListSeparator(char c) {
+    return c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static bool isValidChatIdToken(const String& token) {
+    if (token.length() == 0) return false;
+    size_t start = (token.charAt(0) == '-') ? 1 : 0;
+    if (start >= token.length()) return false;
+    for (size_t i = start; i < token.length(); ++i) {
+        char c = token.charAt(i);
+        if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+
+static String normalizeChatIdList(const String& raw, size_t maxLen) {
+    String normalized;
+    String token;
+    normalized.reserve(raw.length());
+    token.reserve(20);
+
+    auto flushToken = [&]() {
+        token.trim();
+        if (token.length() == 0) {
+            token = "";
+            return;
+        }
+        if (!isValidChatIdToken(token)) {
+            token = "";
+            return;
+        }
+        String wrapped = String(",") + normalized + ",";
+        String needle = String(",") + token + ",";
+        if (normalized.length() == 0) {
+            if (token.length() <= maxLen) {
+                normalized = token;
+            }
+        } else if (wrapped.indexOf(needle) < 0) {
+            if ((normalized.length() + 1 + token.length()) <= maxLen) {
+                normalized += ",";
+                normalized += token;
+            }
+        }
+        token = "";
+    };
+
+    for (size_t i = 0; i < raw.length(); ++i) {
+        char c = raw.charAt(i);
+        if (isChatListSeparator(c)) {
+            flushToken();
+        } else {
+            token += c;
+        }
+    }
+    flushToken();
+    return normalized;
+}
+
+static bool chatIdListHasAny(const char* chatIds) {
+    return chatIds && chatIds[0] != '\0';
+}
+
+static uint8_t countChatIds(const char* chatIds) {
+    if (!chatIdListHasAny(chatIds)) return 0;
+    uint8_t count = 0;
+    bool inToken = false;
+    for (size_t i = 0; chatIds[i] != '\0'; ++i) {
+        if (isChatListSeparator(chatIds[i])) {
+            inToken = false;
+        } else if (!inToken) {
+            inToken = true;
+            if (count < 255) ++count;
+        }
+    }
+    return count;
+}
+
+template<typename Callback>
+static void forEachChatId(const char* chatIds, Callback cb) {
+    if (!chatIdListHasAny(chatIds)) return;
+    char token[20];
+    size_t w = 0;
+    for (size_t i = 0;; ++i) {
+        char c = chatIds[i];
+        bool end = (c == '\0');
+        if (end || isChatListSeparator(c)) {
+            if (w > 0) {
+                token[w] = '\0';
+                cb(token);
+                w = 0;
+            }
+            if (end) break;
+        } else if (w + 1 < sizeof(token)) {
+            token[w++] = c;
+        }
+    }
+}
+
+void applyLocalTelegramConfig(NetConfig& netCfg) {
+    const char* cfgName = netCfg.telegramBotName[0] ? netCfg.telegramBotName : AG_TELEGRAM_BOT_NAME;
+    safeCopy(g_tgConfiguredBotName, sizeof(g_tgConfiguredBotName), cfgName);
+
+    if (!localTelegramSecretsAvailable()) {
+        return;
+    }
+    if (netCfg.telegramBotName[0] == '\0' && AG_TELEGRAM_BOT_NAME[0] != '\0') {
+        safeCopy(netCfg.telegramBotName, sizeof(netCfg.telegramBotName), AG_TELEGRAM_BOT_NAME);
+    }
+    if (netCfg.telegramBotToken[0] == '\0') {
+        safeCopy(netCfg.telegramBotToken, sizeof(netCfg.telegramBotToken), AG_TELEGRAM_BOT_TOKEN);
+    }
+    if (netCfg.telegramChatIds[0] == '\0') {
+        String normalized = normalizeChatIdList(String(AG_TELEGRAM_CHAT_IDS), sizeof(netCfg.telegramChatIds) - 1);
+        safeCopy(netCfg.telegramChatIds, sizeof(netCfg.telegramChatIds), normalized.c_str());
+    }
+
+    const char* finalName = netCfg.telegramBotName[0] ? netCfg.telegramBotName : AG_TELEGRAM_BOT_NAME;
+    safeCopy(g_tgConfiguredBotName, sizeof(g_tgConfiguredBotName), finalName);
+}
+
+static const char* modeStr(Mode mode) {
+    return mode == Mode::AUTO ? "AUTO" : "MANUAL";
+}
+
+static const char* duskPhaseStr(DuskPhase phase) {
+    switch (phase) {
+        case DuskPhase::NIGHT: return "NIGHT";
+        case DuskPhase::DAWN_TRANSITION: return "DAWN_TR";
+        case DuskPhase::DAY: return "DAY";
+        case DuskPhase::DUSK_TRANSITION: return "DUSK_TR";
+    }
+    return "?";
+}
+
+static bool telegramWaterBlocked(const TelegramStatusData& status,
+                                 uint8_t potIdx,
+                                 char* reasonBuf,
+                                 size_t reasonBufSize,
+                                 uint32_t* cooldownRemainingMs = nullptr) {
+    if (cooldownRemainingMs) {
+        *cooldownRemainingMs = 0;
+    }
+    if (reasonBuf && reasonBufSize > 0) {
+        reasonBuf[0] = '\0';
+    }
+
+    if (potIdx >= status.config.numPots || !status.config.pots[potIdx].enabled) {
+        safeCopy(reasonBuf, reasonBufSize, "Blocked: pot disabled.");
+        return true;
+    }
+    if (status.config.mode != Mode::AUTO) {
+        safeCopy(reasonBuf, reasonBufSize, "Blocked: water requires AUTO mode.");
+        return true;
+    }
+
+    WateringPhase phase = status.cycles[potIdx].phase;
+    if (phase != WateringPhase::IDLE) {
+        safeCopy(reasonBuf, reasonBufSize, "Blocked: watering already active.");
+        return true;
+    }
+
+    const PotConfig& potCfg = status.config.pots[potIdx];
+    const PotSensorSnapshot& pot = status.sensors.pots[potIdx];
+    if (status.config.antiOverflowEnabled) {
+        if (pot.waterGuards.potMax == WaterLevelState::TRIGGERED) {
+            safeCopy(reasonBuf, reasonBufSize, "Blocked: overflow sensor triggered.");
+            return true;
+        }
+        if (pot.waterGuards.potMax == WaterLevelState::UNKNOWN) {
+            safeCopy(reasonBuf, reasonBufSize, "Blocked: overflow sensor unknown.");
+            return true;
+        }
+        if (pot.waterGuards.reservoirMin == WaterLevelState::TRIGGERED) {
+            safeCopy(reasonBuf, reasonBufSize, "Blocked: reservoir sensor triggered.");
+            return true;
+        }
+        if (pot.waterGuards.reservoirMin == WaterLevelState::UNKNOWN) {
+            safeCopy(reasonBuf, reasonBufSize, "Blocked: reservoir sensor unknown.");
+            return true;
+        }
+    }
+
+    if (status.budget.reservoirLow && status.budget.reservoirCurrentMl <= 0.0f) {
+        safeCopy(reasonBuf, reasonBufSize, "Blocked: reservoir empty.");
+        return true;
+    }
+    if (!potCfg.pumpCalibrated || potCfg.pumpMlPerSec <= 0.0f) {
+        safeCopy(reasonBuf, reasonBufSize, "Blocked: pump not calibrated.");
+        return true;
+    }
+
+    uint32_t effCooldown = status.config.cooldownMs;
+    if (status.config.vacationMode) {
+        effCooldown = static_cast<uint32_t>(effCooldown * status.config.vacationCooldownMultiplier);
+    }
+    uint32_t lastDoneMs = status.lastCycleDoneMs[potIdx];
+    if (lastDoneMs != 0 && status.uptimeMs >= lastDoneMs) {
+        uint32_t elapsed = status.uptimeMs - lastDoneMs;
+        if (elapsed < effCooldown) {
+            uint32_t remaining = effCooldown - elapsed;
+            if (cooldownRemainingMs) {
+                *cooldownRemainingMs = remaining;
+            }
+            if (reasonBuf && reasonBufSize > 0) {
+                snprintf(reasonBuf, reasonBufSize, "Blocked: cooldown %lus remaining.",
+                         static_cast<unsigned long>((remaining + 999) / 1000));
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void telegramWaterButtonLabel(const TelegramStatusData& status,
+                                     uint8_t potIdx,
+                                     char* buf,
+                                     size_t bufSize) {
+    if (!buf || bufSize == 0) {
+        return;
+    }
+    buf[0] = '\0';
+    char reason[96] = {};
+    uint32_t cooldownRemainingMs = 0;
+    bool blocked = telegramWaterBlocked(status, potIdx, reason, sizeof(reason), &cooldownRemainingMs);
+
+    if (!blocked) {
+        snprintf(buf, bufSize, "\xF0\x9F\x92\xA7 Water %uml",
+                 static_cast<unsigned>(status.config.pots[potIdx].pulseWaterMl));
+        return;
+    }
+
+    if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
+        safeCopy(buf, bufSize, "\xF0\x9F\x92\xA7 Watering...");
+    } else if (cooldownRemainingMs > 0) {
+        snprintf(buf, bufSize, "\xE2\x8F\xB3 Water %lus",
+                 static_cast<unsigned long>((cooldownRemainingMs + 999) / 1000));
+    } else if (status.config.mode != Mode::AUTO) {
+        safeCopy(buf, bufSize, "\xF0\x9F\x9A\xAB Water AUTO");
+    } else {
+        safeCopy(buf, bufSize, "\xF0\x9F\x9A\xAB Water blocked");
+    }
+}
+
+static String normalizeTelegramCommand(String text) {
+    text.trim();
+    int nl = text.indexOf('\n');
+    if (nl >= 0) {
+        text = text.substring(0, nl);
+    }
+    int cr = text.indexOf('\r');
+    if (cr >= 0) {
+        text = text.substring(0, cr);
+    }
+    text.trim();
+
+    int space = text.indexOf(' ');
+    String head = (space >= 0) ? text.substring(0, space) : text;
+    int at = head.indexOf('@');
+    if (at >= 0) {
+        head = head.substring(0, at);
+    }
+    if (space >= 0) {
+        text = head + text.substring(space);
+    } else {
+        text = head;
+    }
+    text.trim();
+    return text;
+}
+
+static bool telegramEnsureReady(const NetConfig& netCfg) {
+    if (netCfg.telegramBotToken[0] == '\0') {
+        return false;
+    }
+    if (!g_tgBot || strcmp(g_tgTokenCache, netCfg.telegramBotToken) != 0) {
+        g_tgClient.stop();
+        g_tgClient.setInsecure();
+        g_tgClient.setTimeout(kTelegramRequestTimeoutMs);
+        g_tgBot.reset(new UniversalTelegramBot(netCfg.telegramBotToken, g_tgClient));
+        g_tgBot->longPoll = 0;
+        g_tgBot->waitForResponse = 1500;
+        safeCopy(g_tgTokenCache, sizeof(g_tgTokenCache), netCfg.telegramBotToken);
+        g_tgLastPollMs = 0;
+        g_tgFastPollUntilMs = 0;
+        Serial.printf("[TG] event=client_ready poll_idle_ms=%lu poll_active_ms=%lu timeout_ms=%lu\n",
+                      static_cast<unsigned long>(kTelegramPollIntervalIdleMs),
+                      static_cast<unsigned long>(kTelegramPollIntervalActiveMs),
+                      static_cast<unsigned long>(kTelegramRequestTimeoutMs));
+    }
+    return g_tgBot != nullptr;
+}
+
+static void telegramCloseTransport(const char* reason, bool logClose = false) {
+    if (g_tgClient.connected()) {
+        g_tgClient.stop();
+        if (logClose) {
+            Serial.printf("[TG] event=transport_close reason=%s\n",
+                          reason ? reason : "unknown");
+        }
+    }
+}
+
+static int telegramFetchUpdates(const NetConfig& netCfg) {
+    if (!telegramEnsureReady(netCfg)) {
+        return -999;
+    }
+    int count = g_tgBot->getUpdates(g_tgBot->last_message_received + 1);
+    if (count > 0) {
+        Serial.printf("[TG] event=updates count=%d last=%ld\n",
+                      count, static_cast<long>(g_tgBot->last_message_received));
+    }
+    return count;
+}
+
+static bool telegramReplyToChat(const String& chatId, const String& msg,
+                                const NetConfig& netCfg,
+                                uint8_t maxRetries = 2,
+                                uint32_t retryDelayMs = 150) {
+    if (!telegramEnsureReady(netCfg)) {
+        Serial.println("[TG] event=reply_fail reason=client_not_ready");
+        return false;
+    }
+
+    for (uint8_t attempt = 0; attempt < maxRetries; ++attempt) {
+        if (g_tgBot->sendMessage(chatId, msg, "")) {
+            telegramCloseTransport("after_send_message");
+            telegramBumpFastPollWindow(millis());
+            Serial.printf("[TG] event=reply_ok len=%u attempt=%u\n",
+                          static_cast<unsigned>(msg.length()),
+                          static_cast<unsigned>(attempt + 1));
+            return true;
+        }
+        telegramCloseTransport("send_message_fail", attempt == 0);
+        Serial.printf("[TG] event=reply_fail len=%u attempt=%u\n",
+                      static_cast<unsigned>(msg.length()),
+                      static_cast<unsigned>(attempt + 1));
+        if (attempt + 1 < maxRetries) {
+            vTaskDelay(pdMS_TO_TICKS(retryDelayMs));
+        }
+    }
+    return false;
+}
+
+static bool telegramChatAuthorized(const String& chatId, const NetConfig& netCfg) {
+    bool authorized = false;
+    forEachChatId(netCfg.telegramChatIds, [&](const char* token) {
+        if (!authorized && chatId.equals(token)) {
+            authorized = true;
+        }
+    });
+    return authorized;
+}
+
+static bool telegramSendToChat(const String& chatId, const String& msg,
+                               const NetConfig& netCfg) {
+    return telegramReplyToChat(chatId, msg, netCfg);
+}
+
+static bool telegramSendInlineKeyboardToChat(const String& chatId,
+                                             const char* msg,
+                                             const char* keyboardJson,
+                                             const NetConfig& netCfg,
+                                             int messageId = 0,
+                                             uint8_t maxRetries = 2,
+                                             uint32_t retryDelayMs = 150) {
+    if (!telegramEnsureReady(netCfg) || !msg || !keyboardJson) {
+        return false;
+    }
+
+    for (uint8_t attempt = 0; attempt < maxRetries; ++attempt) {
+        int targetMessageId = messageId;
+        if (g_tgBot->sendMessageWithInlineKeyboard(chatId, msg, "", keyboardJson, targetMessageId)) {
+            telegramCloseTransport("after_send_inline_keyboard");
+            telegramBumpFastPollWindow(millis());
+            Serial.printf("[TG] event=inline_ok len=%u attempt=%u message_id=%d\n",
+                          static_cast<unsigned>(strlen(msg)),
+                          static_cast<unsigned>(attempt + 1), targetMessageId);
+            return true;
+        }
+        telegramCloseTransport("send_inline_fail", attempt == 0);
+        Serial.printf("[TG] event=inline_fail len=%u attempt=%u message_id=%d\n",
+                      static_cast<unsigned>(strlen(msg)),
+                      static_cast<unsigned>(attempt + 1), targetMessageId);
+
+        if (targetMessageId != 0) {
+            Serial.printf("[TG] event=inline_fallback_new_message old_message_id=%d\n",
+                          targetMessageId);
+            if (g_tgBot->sendMessageWithInlineKeyboard(chatId, msg, "", keyboardJson, 0)) {
+                telegramCloseTransport("after_inline_fallback_new_message");
+                telegramBumpFastPollWindow(millis());
+                Serial.printf("[TG] event=inline_ok len=%u attempt=%u message_id=0 fallback=yes\n",
+                              static_cast<unsigned>(strlen(msg)),
+                              static_cast<unsigned>(attempt + 1));
+                return true;
+            }
+            telegramCloseTransport("inline_fallback_new_message_fail", attempt == 0);
+            Serial.printf("[TG] event=inline_fallback_fail len=%u attempt=%u old_message_id=%d\n",
+                          static_cast<unsigned>(strlen(msg)),
+                          static_cast<unsigned>(attempt + 1), targetMessageId);
+        }
+
+        if (attempt + 1 < maxRetries) {
+            vTaskDelay(pdMS_TO_TICKS(retryDelayMs));
+        }
+    }
+    return false;
+}
+
+static void formatTelegramMenuSummary(const TelegramStatusData& data, char* buf, size_t bufSize) {
+    int pos = 0;
+    pos = appendFmt(buf, bufSize, pos, "autogarden menu\n");
+    pos = appendFmt(buf, bufSize, pos, "Mode: %s | Vac: %s | WiFi: %s\n",
+                    modeStr(data.config.mode),
+                    data.config.vacationMode ? "ON" : "OFF",
+                    data.wifiConnected ? "UP" : "DOWN");
+    pos = appendFmt(buf, bufSize, pos, "Reservoir: %.0fml (~%.1fd)%s\n",
+                    data.budget.reservoirCurrentMl,
+                    data.budget.daysRemaining,
+                    data.budget.reservoirLow ? " LOW" : "");
+
+    for (uint8_t i = 0; i < data.config.numPots; ++i) {
+        if (!data.config.pots[i].enabled) continue;
+        const PlantProfile& prof = getActiveProfile(data.config, i);
+        pos = appendFmt(buf, bufSize, pos, "Pot%u %s: %.0f%%",
+                        static_cast<unsigned>(i + 1),
+                        prof.name ? prof.name : "?",
+                        data.sensors.pots[i].moisturePct);
+        if (data.sensors.pots[i].waterGuards.potMax == WaterLevelState::TRIGGERED) {
+            pos = appendFmt(buf, bufSize, pos, " overflow");
+        }
+        pos = appendFmt(buf, bufSize, pos, "\n");
+    }
+
+    pos = appendFmt(buf, bufSize, pos, "Use the buttons below.");
+}
+
+static void buildTelegramInlineMenuKeyboard(const TelegramStatusData& status,
+                                            char* buf, size_t bufSize) {
+    int pos = 0;
+    char waterBtn0[48] = {};
+    char waterBtn1[48] = {};
+    const char* statusLabel = "\xF0\x9F\x93\x8A Status";
+    const char* historyLabel = "\xF0\x9F\x93\x88 History";
+    const char* profilesLabel = "\xF0\x9F\x8C\xBF Profiles";
+    const char* helpLabel = "\xE2\x9D\x93 Help";
+    const char* stopLabel = "\xF0\x9F\x9B\x91 Stop";
+    const char* refillLabel = "\xF0\x9F\xAA\xA3 Refill";
+    const char* wifiLabel = "\xF0\x9F\x93\xB6 WiFi";
+    const char* menuLabel = "\xF0\x9F\x8F\xA0 Menu";
+    const char* waterLabel0 = "Water";
+    const char* waterLabel1 = "Water P2";
+    const char* vacationLabel = status.config.vacationMode
+        ? "\xF0\x9F\x8F\x96\xEF\xB8\x8F Vacation OFF"
+        : "\xF0\x9F\x8F\x96\xEF\xB8\x8F Vacation ON";
+    const char* modeLabel = status.config.mode == Mode::AUTO
+        ? "\xE2\x9A\x99\xEF\xB8\x8F Mode MANUAL"
+        : "\xE2\x9A\x99\xEF\xB8\x8F Mode AUTO";
+    if (status.config.numPots > 0) {
+        telegramWaterButtonLabel(status, 0, waterBtn0, sizeof(waterBtn0));
+        if (waterBtn0[0]) {
+            waterLabel0 = waterBtn0;
+        }
+    }
+    if (status.config.numPots > 1) {
+        telegramWaterButtonLabel(status, 1, waterBtn1, sizeof(waterBtn1));
+        if (waterBtn1[0]) {
+            waterLabel1 = waterBtn1;
+        }
+    }
+
+    pos = appendFmt(buf, bufSize, pos,
+                    "[[{\"text\":\"%s\",\"callback_data\":\"ag:status\"},{\"text\":\"%s\",\"callback_data\":\"ag:history\"}],"
+                    "[{\"text\":\"%s\",\"callback_data\":\"ag:profiles\"},{\"text\":\"%s\",\"callback_data\":\"ag:help\"}],",
+                    statusLabel, historyLabel, profilesLabel, helpLabel);
+
+    if (status.config.numPots <= 1) {
+        pos = appendFmt(buf, bufSize, pos,
+                        "[{\"text\":\"%s\",\"callback_data\":\"ag:water:0\"},"
+                        "{\"text\":\"%s\",\"callback_data\":\"ag:stop\"}],",
+                        waterLabel0, stopLabel);
+    } else {
+        pos = appendFmt(buf, bufSize, pos,
+                        "[{\"text\":\"%s\",\"callback_data\":\"ag:water:0\"},"
+                        "{\"text\":\"%s\",\"callback_data\":\"ag:water:1\"}],"
+                        "[{\"text\":\"%s\",\"callback_data\":\"ag:stop\"},"
+                        "{\"text\":\"%s\",\"callback_data\":\"ag:refill\"}],",
+                        waterLabel0,
+                        waterLabel1,
+                        stopLabel,
+                        refillLabel);
+    }
+
+    if (status.config.numPots <= 1) {
+        pos = appendFmt(buf, bufSize, pos,
+                        "[{\"text\":\"%s\",\"callback_data\":\"ag:refill\"},"
+                        "{\"text\":\"%s\",\"callback_data\":\"ag:wifi\"}],",
+                        refillLabel, wifiLabel);
+    } else {
+        pos = appendFmt(buf, bufSize, pos,
+                        "[{\"text\":\"%s\",\"callback_data\":\"ag:wifi\"},"
+                        "{\"text\":\"%s\",\"callback_data\":\"ag:menu\"}],",
+                        wifiLabel, menuLabel);
+    }
+
+    pos = appendFmt(buf, bufSize, pos,
+                    "[{\"text\":\"%s\",\"callback_data\":\"ag:vac:toggle\"},"
+                    "{\"text\":\"%s\",\"callback_data\":\"ag:mode:toggle\"}]]",
+                    vacationLabel,
+                    modeLabel);
+}
+
+static bool telegramSendAgMenu(const String& chatId,
+                               const TelegramStatusData& status,
+                               const NetConfig& netCfg,
+                               int messageId = 0) {
+    formatTelegramMenuSummary(status, g_tgReplyBuf, sizeof(g_tgReplyBuf));
+    buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+    return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf,
+                                            netCfg, messageId);
+}
+
+static void formatTelegramHelpMessage(char* buf, size_t bufSize) {
+    int pos = 0;
+    pos = appendFmt(buf, bufSize, pos, "autogarden Telegram\n");
+    if (telegramConfiguredBotName()[0] != '\0') {
+        pos = appendFmt(buf, bufSize, pos, "Bot: @%s\n", telegramConfiguredBotName());
+    }
+    pos = appendFmt(buf, bufSize, pos,
+                    "\nMain entry:\n"
+                    "/ag -> interactive menu\n"
+                    "\nFlow:\n"
+                    "- open /ag\n"
+                    "- use inline buttons for all actions\n"
+                    "- status/history/profiles are shown from the menu\n"
+                    "\nSafety:\n"
+                    "- Water triggers one safe pulse\n"
+                    "- Water requires AUTO mode\n"
+                    "- Stop forces all pumps OFF\n");
+}
+
+static void formatTelegramProfilesMessage(char* buf, size_t bufSize) {
+    int pos = 0;
+    pos = appendFmt(buf, bufSize, pos, "Profile indexes:\n");
+    for (uint8_t i = 0; i < kNumProfiles; ++i) {
+        pos = appendFmt(buf, bufSize, pos, "%u = %s\n", i,
+                        kProfiles[i].name ? kProfiles[i].name : "?");
+    }
+}
+
+static void formatTelegramHistoryReport(const TelegramStatusData& data,
+                                        char* buf, size_t bufSize) {
+    int pos = 0;
+    pos = appendFmt(buf, bufSize, pos, "autogarden history summary\n");
+    pos = appendFmt(buf, bufSize, pos, "Reservoir: %.0fml / %.0fml\n",
+                    data.budget.reservoirCurrentMl, data.budget.reservoirCapacityMl);
+    pos = appendFmt(buf, bufSize, pos, "Total pumped: %.1fml\n",
+                    data.budget.totalPumpedMl);
+
+    for (uint8_t i = 0; i < data.config.numPots; ++i) {
+        if (!data.config.pots[i].enabled) continue;
+        const TrendState& ts = data.trends[i];
+        pos = appendFmt(buf, bufSize, pos, "\nPot %u:\n", static_cast<unsigned>(i + 1));
+        pos = appendFmt(buf, bufSize, pos, "  pumped=%.1fml\n",
+                        data.budget.totalPumpedMlPerPot[i]);
+        if (ts.baselineCalibrated && ts.count > 0) {
+            uint8_t lastIdx = (ts.headIdx == 0) ? (TrendState::kHours - 1) : (ts.headIdx - 1);
+            pos = appendFmt(buf, bufSize, pos,
+                            "  trend=%.2f%%/h baseline=%.2f%%/h samples=%u\n",
+                            ts.hourlyDeltas[lastIdx], ts.normalDryingRate, ts.count);
+        } else {
+            pos = appendFmt(buf, bufSize, pos, "  trend=learning baseline\n");
+        }
+    }
+}
+
+void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_t bufSize) {
+    int pos = 0;
+    pos = appendFmt(buf, bufSize, pos, "autogarden status\n");
+    pos = appendFmt(buf, bufSize, pos, "Mode: %s | Vacation: %s | WiFi: %s\n",
+                    modeStr(data.config.mode),
+                    data.config.vacationMode ? "ON" : "OFF",
+                    data.wifiConnected ? "UP" : "DOWN");
+    pos = appendFmt(buf, bufSize, pos, "Dusk: %s | Uptime: %lu min\n",
+                    duskPhaseStr(data.duskPhase),
+                    static_cast<unsigned long>(data.uptimeMs / 60000UL));
+    pos = appendFmt(buf, bufSize, pos, "Reservoir: %.0fml (~%.1f days)%s\n",
+                    data.budget.reservoirCurrentMl,
+                    data.budget.daysRemaining,
+                    data.budget.reservoirLow ? " LOW" : "");
+    pos = appendFmt(buf, bufSize, pos, "Env: %.1fC %.0f%% %.0flux %.1fhPa\n",
+                    data.sensors.env.tempC,
+                    data.sensors.env.humidityPct,
+                    data.sensors.env.lux,
+                    data.sensors.env.pressureHpa);
+
+    for (uint8_t i = 0; i < data.config.numPots; ++i) {
+        if (!data.config.pots[i].enabled) continue;
+        const PlantProfile& prof = getActiveProfile(data.config, i);
+        float targetPct = prof.targetMoisturePct;
+        char waterState[96] = {};
+        telegramWaterBlocked(data, i, waterState, sizeof(waterState));
+        if (data.config.vacationMode) {
+            targetPct -= data.config.vacationTargetReductionPct;
+            if (targetPct < 5.0f) targetPct = 5.0f;
+        }
+        pos = appendFmt(buf, bufSize, pos,
+                        "\nPot %u (%s)%s\n"
+                        "  moisture=%.1f%% ema=%.1f%% target=%.1f%%\n"
+                        "  raw=%u overflow=%s cycle=%d pulses=%u\n"
+                        "  action=%s\n",
+                        static_cast<unsigned>(i + 1),
+                        prof.name ? prof.name : "?",
+                        (i == data.selectedPot) ? " [selected]" : "",
+                        data.sensors.pots[i].moisturePct,
+                        data.sensors.pots[i].moistureEma,
+                        targetPct,
+                        data.sensors.pots[i].moistureRaw,
+                        data.sensors.pots[i].waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "OK",
+                        static_cast<int>(data.cycles[i].phase),
+                        data.cycles[i].pulseCount,
+                        waterState[0] ? waterState : "Ready: one safe pulse");
+    }
+}
+
+static bool pushEvent(const Event& evt) {
+    if (!g_eventQueue.push(evt, 0)) {
+        Serial.println("[TG] event=queue_push_fail");
+        return false;
+    }
+    return true;
+}
+
+static bool pushConfigEvent(EventType type, uint8_t key, uint16_t valueU16, float valueF = 0.0f) {
+    Event evt{};
+    evt.type = type;
+    evt.payload.config.key = key;
+    evt.payload.config.valueU16 = valueU16;
+    evt.payload.config.valueF = valueF;
+    return pushEvent(evt);
+}
+
+static bool parseUIntArg(const String& token, uint8_t& out) {
+    if (token.length() == 0) return false;
+    for (size_t i = 0; i < token.length(); ++i) {
+        if (!isdigit(static_cast<unsigned char>(token.charAt(i)))) {
+            return false;
+        }
+    }
+    int v = token.toInt();
+    if (v < 0 || v > 255) return false;
+    out = static_cast<uint8_t>(v);
+    return true;
+}
+
+static bool resolvePotArgument(const String& token, const TelegramStatusData& status, uint8_t& potIdx) {
+    if (token.length() == 0) {
+        potIdx = (status.selectedPot < status.config.numPots) ? status.selectedPot : 0;
+        return true;
+    }
+    uint8_t oneBased = 0;
+    if (!parseUIntArg(token, oneBased) || oneBased < 1 || oneBased > status.config.numPots) {
+        return false;
+    }
+    potIdx = static_cast<uint8_t>(oneBased - 1);
+    return true;
+}
+
+static bool handleTelegramCallback(const telegramMessage& message,
+                                   const TelegramStatusData& status,
+                                   const NetConfig& netCfg) {
+    const String chatId = message.chat_id;
+    const String data = message.text;
+    const int messageId = message.message_id;
+
+    if (message.query_id.length() > 0) {
+        if (!g_tgBot->answerCallbackQuery(message.query_id, "")) {
+            Serial.printf("[TG] event=callback_ack_fail message_id=%d\n", messageId);
+        }
+    }
+
+    if (data == "ag:menu" || data == "ag:status") {
+        if (data == "ag:menu") {
+            return telegramSendAgMenu(chatId, status, netCfg, messageId);
+        }
+        formatTelegramStatusReport(status, g_tgReplyBuf, sizeof(g_tgReplyBuf));
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    if (data == "ag:history") {
+        formatTelegramHistoryReport(status, g_tgReplyBuf, sizeof(g_tgReplyBuf));
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    if (data == "ag:profiles") {
+        formatTelegramProfilesMessage(g_tgReplyBuf, sizeof(g_tgReplyBuf));
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    if (data == "ag:help") {
+        formatTelegramHelpMessage(g_tgReplyBuf, sizeof(g_tgReplyBuf));
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    if (data == "ag:stop") {
+        bool ok = pushEvent(Event{EventType::REQUEST_PUMP_OFF});
+        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                 ok ? "Stop queued. Pumps will be forced OFF." : "Stop queue failed.");
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    if (data == "ag:refill") {
+        bool ok = pushEvent(Event{EventType::REQUEST_REFILL});
+        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                 ok ? "Reservoir refill queued." : "Refill queue failed.");
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    if (data == "ag:wifi") {
+        bool ok = pushEvent(Event{EventType::REQUEST_START_WIFI_SETUP});
+        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                 ok ? "WiFi setup queued. AP portal will start if possible." : "WiFi setup queue failed.");
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    if (data == "ag:vac:toggle") {
+        bool enable = !status.config.vacationMode;
+        bool ok = pushConfigEvent(EventType::REQUEST_SET_VACATION, 0, enable ? 1 : 0);
+        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                 ok ? (enable ? "Vacation ON queued." : "Vacation OFF queued.")
+                    : "Vacation queue failed.");
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    if (data == "ag:mode:toggle") {
+        Mode mode = (status.config.mode == Mode::AUTO) ? Mode::MANUAL : Mode::AUTO;
+        bool ok = pushConfigEvent(EventType::REQUEST_SET_MODE, 0, static_cast<uint16_t>(mode));
+        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                 ok ? (mode == Mode::AUTO ? "Mode AUTO queued." : "Mode MANUAL queued.")
+                    : "Mode queue failed.");
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    if (data.startsWith("ag:water:")) {
+        String potTok = data.substring(String("ag:water:").length());
+        uint8_t potIdx = 0;
+        if (!parseUIntArg(potTok, potIdx) || potIdx >= status.config.numPots) {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Invalid pot in menu action.");
+        } else {
+            char preflightReason[96] = {};
+            if (telegramWaterBlocked(status, potIdx, preflightReason, sizeof(preflightReason))) {
+                safeCopy(g_tgReplyBuf, sizeof(g_tgReplyBuf), preflightReason);
+            } else {
+                bool ok = pushConfigEvent(EventType::REQUEST_MANUAL_WATER, potIdx, 1);
+                if (ok) {
+                    snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                             "Starting one safe pulse: %uml for pot %u.",
+                             static_cast<unsigned>(status.config.pots[potIdx].pulseWaterMl),
+                             static_cast<unsigned>(potIdx + 1));
+                } else {
+                    snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Water queue failed.");
+                }
+            }
+        }
+        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+    }
+
+    return telegramSendAgMenu(chatId, status, netCfg, messageId);
+}
 
 static uint32_t hashIpAddress(const IPAddress& ip) {
     uint32_t hash = 2166136261u;
@@ -78,6 +956,12 @@ static bool isNumericStr(const String& s) {
         if (s.charAt(i) < '0' || s.charAt(i) > '9') return false;
     }
     return true;
+}
+
+static bool isValidChatIdList(const String& s) {
+    if (s.length() == 0) return true;
+    String normalized = normalizeChatIdList(s, 127);
+    return normalized.length() > 0;
 }
 
 // Rough Telegram bot token format: digits:alphanumeric-_
@@ -154,10 +1038,11 @@ static void handleSave() {
     if (!g_webServer || !g_apNetCfg) return;
 
     // --- Sanitize all inputs (strip control chars, enforce max length) ---
-    String ssid     = sanitizeInput(g_webServer->arg("ssid"),     32);
-    String pass     = sanitizeInput(g_webServer->arg("pass"),     64);
-    String botToken = sanitizeInput(g_webServer->arg("bot_token"), 63);
-    String chatId   = sanitizeInput(g_webServer->arg("chat_id"),  15);
+    String ssid      = sanitizeInput(g_webServer->arg("ssid"),      32);
+    String pass      = sanitizeInput(g_webServer->arg("pass"),      64);
+    String botName   = sanitizeInput(g_webServer->arg("bot_name"),  63);
+    String botToken  = sanitizeInput(g_webServer->arg("bot_token"), 63);
+    String chatIds   = normalizeChatIdList(g_webServer->arg("chat_ids"), 127);
 
     // --- Validate ---
     if (ssid.length() == 0) {
@@ -172,8 +1057,12 @@ static void handleSave() {
         g_webServer->send(400, "text/plain", "Password min 8 chars (WPA)");
         return;
     }
-    if (chatId.length() > 0 && !isNumericStr(chatId)) {
-        g_webServer->send(400, "text/plain", "Chat ID must be numeric");
+    if ((botToken.length() > 0 || chatIds.length() > 0 || botName.length() > 0) && botName.length() == 0) {
+        g_webServer->send(400, "text/plain", "Bot name required when Telegram is configured");
+        return;
+    }
+    if (chatIds.length() > 0 && !isValidChatIdList(chatIds)) {
+        g_webServer->send(400, "text/plain", "Chat IDs must be numeric (comma separated)");
         return;
     }
     if (!isValidBotToken(botToken)) {
@@ -184,20 +1073,27 @@ static void handleSave() {
     // --- Safe copy with guaranteed null termination ---
     memset(g_apNetCfg->wifiSsid,         0, sizeof(g_apNetCfg->wifiSsid));
     memset(g_apNetCfg->wifiPass,         0, sizeof(g_apNetCfg->wifiPass));
+        memset(g_apNetCfg->telegramBotName,  0, sizeof(g_apNetCfg->telegramBotName));
     memset(g_apNetCfg->telegramBotToken, 0, sizeof(g_apNetCfg->telegramBotToken));
-    memset(g_apNetCfg->telegramChatId,   0, sizeof(g_apNetCfg->telegramChatId));
+        memset(g_apNetCfg->telegramChatIds,  0, sizeof(g_apNetCfg->telegramChatIds));
 
     strncpy(g_apNetCfg->wifiSsid, ssid.c_str(), sizeof(g_apNetCfg->wifiSsid) - 1);
     strncpy(g_apNetCfg->wifiPass, pass.c_str(), sizeof(g_apNetCfg->wifiPass) - 1);
+        strncpy(g_apNetCfg->telegramBotName, botName.c_str(), sizeof(g_apNetCfg->telegramBotName) - 1);
     strncpy(g_apNetCfg->telegramBotToken, botToken.c_str(),
             sizeof(g_apNetCfg->telegramBotToken) - 1);
-    strncpy(g_apNetCfg->telegramChatId, chatId.c_str(),
-            sizeof(g_apNetCfg->telegramChatId) - 1);
+        strncpy(g_apNetCfg->telegramChatIds, chatIds.c_str(),
+            sizeof(g_apNetCfg->telegramChatIds) - 1);
     g_apNetCfg->provisioned = true;
+        g_apNetCfg->schemaVersion = kNetConfigSchema;
+
+        safeCopy(g_tgConfiguredBotName, sizeof(g_tgConfiguredBotName), g_apNetCfg->telegramBotName);
 
     netConfigSave(*g_apNetCfg);
-    Serial.printf("[PROV] event=config_saved ssid=%s chat_id=%s action=restart\n",
-                  g_apNetCfg->wifiSsid, g_apNetCfg->telegramChatId);
+        Serial.printf("[PROV] event=config_saved ssid=%s bot=%s chat_targets=%u action=restart\n",
+              g_apNetCfg->wifiSsid,
+              g_apNetCfg->telegramBotName[0] ? g_apNetCfg->telegramBotName : "-",
+              countChatIds(g_apNetCfg->telegramChatIds));
 
     g_webServer->send_P(200, "text/html", SUCCESS_HTML);
     delay(1000);
@@ -215,7 +1111,10 @@ static WebServer  s_apWeb(80);
 void startApNonBlocking(NetConfig& netCfg, NetworkState& ns) {
     Serial.println("[AP] event=start mode=non_blocking");
 
-    WiFi.mode(WIFI_AP);
+    const bool keepSta = ns.wifiConnected ||
+                         (netCfg.provisioned && strlen(netCfg.wifiSsid) > 0);
+
+    WiFi.mode(keepSta ? WIFI_AP_STA : WIFI_AP);
     WiFi.softAP("autogarden", "");   // open, no password
     WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
                       IPAddress(192, 168, 4, 1),
@@ -262,7 +1161,8 @@ void startApNonBlocking(NetConfig& netCfg, NetworkState& ns) {
     ns.apNoClientSinceMs = millis();
     ns.provState         = ProvisioningState::AP_MODE;
 
-    Serial.printf("[AP] event=active ssid=autogarden ip=192.168.4.1 auto_off_s=%u\n",
+    Serial.printf("[AP] event=active ssid=autogarden ip=192.168.4.1 sta=%s auto_off_s=%u\n",
+                  keepSta ? "kept" : "off",
                   static_cast<unsigned>(NetworkState::kApAutoOffMs / 1000));
 }
 
@@ -290,14 +1190,14 @@ void stopAp(NetworkState& ns) {
     s_apWeb.stop();
     s_apDns.stop();
     WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_OFF);
+    WiFi.mode(WIFI_STA);
 
     g_webServer = nullptr;
     g_dnsServer = nullptr;
     g_apNetCfg  = nullptr;
 
     ns.apActive = false;
-    Serial.println("[AP] event=stop state=offline");
+    Serial.println("[AP] event=stop state=sta_only");
 }
 
 // ---------------------------------------------------------------------------
@@ -307,10 +1207,13 @@ void stopAp(NetworkState& ns) {
 void netTaskInit(const NetConfig& netCfg, NetworkState& ns) {
     ns.wifiConnected = (WiFi.status() == WL_CONNECTED);
     ns.telegramEnabled = (strlen(netCfg.telegramBotToken) > 0 &&
-                          strlen(netCfg.telegramChatId) > 0);
+                          chatIdListHasAny(netCfg.telegramChatIds));
 
     if (ns.telegramEnabled) {
-        Serial.println("[NET] event=telegram_enabled state=yes");
+        Serial.printf("[NET] event=telegram_enabled state=yes bot=%s targets=%u\n",
+                      netCfg.telegramBotName[0] ? netCfg.telegramBotName :
+                      (telegramConfiguredBotName()[0] ? telegramConfiguredBotName() : "configured"),
+                      countChatIds(netCfg.telegramChatIds));
     }
 
     // Jeśli WiFi nie provisioned → auto-start AP w tle
@@ -372,7 +1275,11 @@ void netTaskTick(uint32_t nowMs, NetworkState& ns, const NetConfig& netCfg) {
     // === AP mode active → obsłuż captive portal ===
     if (ns.apActive) {
         apTick(ns);
-        return;  // nie robimy nic innego gdy AP jest aktywne
+        // Gdy działamy w AP+STA, nadal utrzymujemy STA i Telegram.
+        // Wyjście tylko w trybie AP-only bez provisioningu.
+        if (!netCfg.provisioned || strlen(netCfg.wifiSsid) == 0) {
+            return;
+        }
     }
 
     // === Skip if not provisioned (offline mode, AP already timed out) ===
@@ -412,33 +1319,137 @@ void netTaskTick(uint32_t nowMs, NetworkState& ns, const NetConfig& netCfg) {
         // TODO(events): push WIFI_CONNECTED event
     }
 
-    // === Telegram poll ===
-    if (ns.telegramEnabled) {
-        telegramPollCommands(nowMs, netCfg);
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Telegram — stubs (do implementacji z UniversalTelegramBot)
+// Telegram — runtime
 // ---------------------------------------------------------------------------
 
-void telegramPollCommands(uint32_t nowMs, const NetConfig& netCfg) {
-    // TODO(telegram): Implementacja z UniversalTelegramBot
-    // bot.getUpdates() → parsuj komendy → push do EventQueue
-    (void)nowMs;
-    (void)netCfg;
+void telegramPollCommands(uint32_t nowMs, const NetConfig& netCfg,
+                          const TelegramStatusData& status) {
+    if (netCfg.telegramBotToken[0] == '\0' || !chatIdListHasAny(netCfg.telegramChatIds)) {
+        return;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    if (!telegramEnsureReady(netCfg)) {
+        return;
+    }
+
+    uint32_t pollIntervalMs = telegramCurrentPollInterval(nowMs);
+    if (g_tgLastPollMs != 0 && (nowMs - g_tgLastPollMs) < pollIntervalMs) {
+        return;
+    }
+    g_tgLastPollMs = nowMs;
+
+    int numNewMessages = telegramFetchUpdates(netCfg);
+    if (numNewMessages == 0 && (nowMs - g_tgLastIdleLogMs) >= 60000) {
+        g_tgLastIdleLogMs = nowMs;
+        Serial.println("[TG] event=poll_idle");
+    }
+    uint8_t batchCount = 0;
+    while (numNewMessages > 0 && batchCount < kTelegramMaxBatchFetches) {
+        for (int i = 0; i < numNewMessages; ++i) {
+            const String chatId = g_tgBot->messages[i].chat_id;
+            const String fromName = g_tgBot->messages[i].from_name;
+            const long updateId = g_tgBot->messages[i].update_id;
+            const String msgType = g_tgBot->messages[i].type;
+            if (!telegramChatAuthorized(chatId, netCfg)) {
+                Serial.printf("[TG] event=unauthorized_chat update=%ld chat_id=%s from=%s ignored=yes\n",
+                              updateId, chatId.c_str(), fromName.c_str());
+                continue;
+            }
+
+            String text = normalizeTelegramCommand(g_tgBot->messages[i].text);
+            String lower = text;
+            lower.toLowerCase();
+
+            Serial.printf("[TG] event=cmd_rx update=%ld type=%s chat_id=%s from=%s stack_hw=%u text=%s\n",
+                          updateId, msgType.c_str(), chatId.c_str(), fromName.c_str(),
+                          static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
+                          text.c_str());
+
+            telegramBumpFastPollWindow(nowMs);
+
+            if (msgType == "callback_query") {
+                handleTelegramCallback(g_tgBot->messages[i], status, netCfg);
+                continue;
+            }
+
+            int firstSpace = lower.indexOf(' ');
+            String cmd = (firstSpace >= 0) ? lower.substring(0, firstSpace) : lower;
+
+            g_tgReplyBuf[0] = '\0';
+
+            if (cmd == "/ag" || cmd == "/start") {
+                telegramSendAgMenu(chatId, status, netCfg);
+                continue;
+            }
+
+            Serial.printf("[TG] event=text_without_menu_entry cmd=%s action=show_ag_menu\n",
+                          cmd.c_str());
+            telegramSendAgMenu(chatId, status, netCfg);
+        }
+
+        telegramCloseTransport("after_update_batch");
+
+        ++batchCount;
+        numNewMessages = telegramFetchUpdates(netCfg);
+    }
+
+    telegramCloseTransport("after_poll_cycle");
 }
 
 bool telegramSend(const char* msg, const NetConfig& netCfg,
                   uint8_t maxRetries, uint32_t backoffMs)
 {
-    // TODO(telegram): bot.sendMessage(netCfg.telegramChatId, msg)
-    (void)msg;
-    (void)netCfg;
-    (void)maxRetries;
-    (void)backoffMs;
-    Serial.printf("[TG] event=send_stub message=%s\n", msg);
-    return false;
+    if (!msg || msg[0] == '\0') {
+        return false;
+    }
+    if (!chatIdListHasAny(netCfg.telegramChatIds) || WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+    if (!telegramEnsureReady(netCfg)) {
+        return false;
+    }
+
+    uint32_t waitMs = backoffMs;
+    if (waitMs > 250) {
+        waitMs = 250;
+    }
+
+    bool anyOk = false;
+    uint8_t targets = 0;
+    forEachChatId(netCfg.telegramChatIds, [&](const char* token) {
+        ++targets;
+        bool sent = false;
+        for (uint8_t attempt = 0; attempt < maxRetries; ++attempt) {
+            if (telegramSendToChat(token, msg, netCfg)) {
+                Serial.printf("[TG] event=send_ok chat_id=%s len=%u attempt=%u\n",
+                              token,
+                              static_cast<unsigned>(strlen(msg)),
+                              static_cast<unsigned>(attempt + 1));
+                sent = true;
+                anyOk = true;
+                break;
+            }
+            if (attempt + 1 < maxRetries) {
+                vTaskDelay(pdMS_TO_TICKS(waitMs));
+            }
+        }
+        if (!sent) {
+            Serial.printf("[TG] event=send_fail chat_id=%s len=%u retries=%u\n",
+                          token,
+                          static_cast<unsigned>(strlen(msg)),
+                          static_cast<unsigned>(maxRetries));
+        }
+    });
+
+    if (targets == 0) {
+        Serial.println("[TG] event=send_fail reason=no_targets");
+    }
+    return anyOk;
 }
 
 void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize) {
@@ -594,10 +1605,12 @@ btn,.btn{display:block;width:100%;padding:12px;border:none;border-radius:8px;fon
 
 <div class="card">
   <div class="section-title">Telegram (optional)</div>
+    <label>Bot Name</label>
+    <input type="text" name="bot_name" maxlength="63" autocomplete="off" placeholder="smartrozi_bot">
   <label>Bot Token</label>
   <input type="text" name="bot_token" maxlength="63" autocomplete="off" pattern="[0-9]+:[A-Za-z0-9_-]+" placeholder="123456:ABC-DEF...">
-  <label>Chat ID</label>
-  <input type="text" name="chat_id" maxlength="15" autocomplete="off" pattern="-?[0-9]+" inputmode="numeric" placeholder="e.g. 123456789">
+    <label>Chat IDs</label>
+    <input type="text" name="chat_ids" maxlength="127" autocomplete="off" placeholder="e.g. 5952898918,6371618192">
 </div>
 
 <button type="submit" class="btn btn-save">&#128190; Save &amp; Restart</button>

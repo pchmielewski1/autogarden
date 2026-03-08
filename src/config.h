@@ -25,6 +25,7 @@ static constexpr const char* kNvsHist    = "ag_hist";
 static constexpr const char* kNvsDusk    = "ag_dusk";
 static constexpr const char* kNvsRuntime = "ag_runtime";
 
+static constexpr uint16_t kNetConfigSchema = 2;
 static constexpr uint16_t kRuntimeSchema = 2;  // bump on struct change
 
 // ---------------------------------------------------------------------------
@@ -162,11 +163,13 @@ struct Config {
 // NetConfig — sieć (osobny NVS namespace "ag_net")
 // ---------------------------------------------------------------------------
 struct NetConfig {
-    bool  provisioned       = false;
-    char  wifiSsid[33]      = {};
-    char  wifiPass[65]      = {};
-    char  telegramBotToken[64] = {};
-    char  telegramChatId[16]   = {};
+    uint16_t schemaVersion  = kNetConfigSchema;
+    bool     provisioned       = false;
+    char     wifiSsid[33]      = {};
+    char     wifiPass[65]      = {};
+    char     telegramBotName[64] = {};
+    char     telegramBotToken[64] = {};
+    char     telegramChatIds[128] = {};
 };
 
 // ---------------------------------------------------------------------------

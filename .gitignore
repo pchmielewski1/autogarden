@@ -16,3 +16,6 @@ agent.md
 Thumbs.db
 *.swp
 *~
+
+# Local secrets
+include/telegram_local_config.h

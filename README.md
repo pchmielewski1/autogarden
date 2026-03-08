@@ -48,7 +48,7 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 
 ### Network (Optional)
 - **Wi-Fi with captive portal** — AP mode for initial provisioning, auto-off after 5 min idle.
-- **Telegram bot** — remote commands: `/status`, `/water`, `/stop`, `/refill`, `/vacation`, `/history`, `/help`.
+- **Telegram bot** — interactive remote control via `/ag` with inline menu, status/history/profile views, safe watering pulse, stop, refill, vacation, mode toggle, and Wi-Fi portal launch.
 - **Daily heartbeat report** — automated snapshot with sensor readings, water budget, and trends.
 - **Reconnect with backoff** — Wi-Fi auto-reconnects (5 s → 5 min exponential backoff), never blocks the watering task.
 
@@ -59,7 +59,7 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 | Multi-task runtime (Control/UI/Net/Config) | Implemented |
 | Config + runtime persistence (NVS) | Implemented |
 | Captive portal provisioning (embedded HTML) | Implemented |
-| Telegram command handling | Partial (stubs present) |
+| Telegram remote control (`/ag` + inline menu) | Implemented |
 | NTP-based scheduling helpers | Partial (fallback active) |
 
 ### Configuration & Persistence
@@ -163,7 +163,7 @@ All operations are performed through the **PlatformIO sidebar** in VS Code:
 
 1. **Build** — click the checkmark icon or run `PlatformIO: Build` from the command palette.
 2. **Upload** — click the arrow icon. If upload fails, put StickS3 into download mode by pressing the reset button on the side while holding the front button.
-3. **Monitor** — click the plug icon for serial output at 9600 baud.
+3. **Monitor** — click the plug icon for serial output at 115200 baud.
 
 > The project does **not** require the PlatformIO CLI (`pio`) to be installed system-wide.
 
@@ -205,19 +205,24 @@ autogarden/
 
 ---
 
-## Telegram Commands
+## Telegram Remote Control
 
 Once Wi-Fi is provisioned and a Telegram bot token is configured:
 
-| Command | Description |
+| Entry / Action | Description |
 |---|---|
-| `/status` | Current sensor readings, watering phase, budget |
-| `/water` | Trigger a manual watering cycle |
-| `/stop` | Emergency stop — abort all active watering |
-| `/refill` | Mark reservoir as refilled |
-| `/vacation on/off` | Toggle vacation mode |
-| `/history` | Recent watering events |
-| `/help` | List available commands |
+| `/ag` | Opens the main Telegram GUI |
+| `📊 Status` | Current sensor readings, watering phase, budget, and action state |
+| `📈 History` | Pumped water and trend summary |
+| `🌿 Profiles` | Built-in plant profile list |
+| `💧 Water Xml` | Starts one safe pulse using the current configured pulse size |
+| `🛑 Stop` | Forces all pumps OFF and aborts active cycles |
+| `🪣 Refill` | Marks the reservoir as refilled |
+| `🏖 Vacation ON/OFF` | Toggles vacation mode |
+| `⚙️ Mode AUTO/MANUAL` | Switches operating mode |
+| `📶 WiFi` | Starts the captive portal without stopping automation |
+
+Secrets can be provided through [include/telegram_local_config.example.h](include/telegram_local_config.example.h) copied to [include/telegram_local_config.h](include/telegram_local_config.h) or via the captive portal and NVS.
 
 ---
 
