@@ -109,6 +109,7 @@ struct DuskDetector {
     uint32_t transitionStartMs     = 0;
     uint32_t lastDawnMs            = 0;
     uint32_t lastDuskMs            = 0;
+    uint32_t nightSequence         = 0;   // incremented on each confirmed dusk
     uint32_t dayLengthMs           = 0;
     uint32_t nightLengthMs         = 0;
 

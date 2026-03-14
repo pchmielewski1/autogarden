@@ -456,7 +456,22 @@ static void buildRuntimeState(RuntimeState& rs) {
         } else {
             rs.secsSinceLastCycleDone[i] = 0;
         }
+        rs.lastAutoWaterNightSeq[i] = g_actuator.lastAutoWaterNightSeq[i];
     }
+
+    if (g_duskDetector.lastDuskMs > 0) {
+        rs.secsSinceLastDusk = (now - g_duskDetector.lastDuskMs) / 1000;
+    } else {
+        rs.secsSinceLastDusk = 0;
+    }
+
+    if (g_duskDetector.lastDawnMs > 0) {
+        rs.secsSinceLastDawn = (now - g_duskDetector.lastDawnMs) / 1000;
+    } else {
+        rs.secsSinceLastDawn = 0;
+    }
+
+    rs.nightSequence = g_duskDetector.nightSequence;
 
     // Solar clock
     rs.solarCycleCount = g_solarClock.cycleCount;
@@ -652,7 +667,22 @@ static void controlTaskFn(void* /*param*/) {
                 Serial.printf("[CTRL] Cooldown[%d] restored: %ds ago\n",
                               i, rs.secsSinceLastCycleDone[i]);
             }
+            g_actuator.lastAutoWaterNightSeq[i] = rs.lastAutoWaterNightSeq[i];
         }
+
+        if (rs.secsSinceLastDusk > 0) {
+            uint32_t elapsedMs = rs.secsSinceLastDusk * 1000UL;
+            g_duskDetector.lastDuskMs = (elapsedMs < bootMs) ? (bootMs - elapsedMs) : 1;
+        }
+        if (rs.secsSinceLastDawn > 0) {
+            uint32_t elapsedMs = rs.secsSinceLastDawn * 1000UL;
+            g_duskDetector.lastDawnMs = (elapsedMs < bootMs) ? (bootMs - elapsedMs) : 1;
+        }
+        g_duskDetector.nightSequence = rs.nightSequence;
+        Serial.printf("[CTRL] Dusk runtime restored: last_dusk=%us last_dawn=%us night_seq=%lu\n",
+                      rs.secsSinceLastDusk,
+                      rs.secsSinceLastDawn,
+                      static_cast<unsigned long>(g_duskDetector.nightSequence));
 
         // Solar clock
         g_solarClock.cycleCount = rs.solarCycleCount;
@@ -730,7 +760,8 @@ static void controlTaskFn(void* /*param*/) {
 
             // FSM podlewania (AUTO mode)
             if (g_config.mode == Mode::AUTO) {
-                wateringTick(now, snap, g_config, g_cycles, g_budget,
+                wateringTick(now, snap, g_config, g_duskDetector, g_solarClock,
+                             g_cycles, g_budget,
                              g_actuator, g_hardware);
                 publishWateringFeedback(prevFeedbackSeq);
             } else {
@@ -798,6 +829,9 @@ static void controlTaskFn(void* /*param*/) {
             }
 
             // Dusk detector
+            uint32_t prevLastDuskMs = g_duskDetector.lastDuskMs;
+            uint32_t prevLastDawnMs = g_duskDetector.lastDawnMs;
+            uint32_t prevNightSequence = g_duskDetector.nightSequence;
             duskDetectorTick(now,
                              snap.env.lux,
                              snap.env.tempC,
@@ -805,6 +839,12 @@ static void controlTaskFn(void* /*param*/) {
                              snap.env.pressureHpa,
                              g_duskDetector, g_config);
             updateSolarClock(g_duskDetector, g_solarClock);
+            if (g_duskDetector.lastDuskMs != prevLastDuskMs ||
+                g_duskDetector.lastDawnMs != prevLastDawnMs ||
+                g_duskDetector.nightSequence != prevNightSequence) {
+                s_runtimeDirty = true;
+                saveRuntimeNow(lastRuntimeSave);
+            }
 
             // Sensor history
             SensorSample sample{};

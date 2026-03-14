@@ -17,6 +17,7 @@
 #include "config.h"
 #include "hardware.h"
 #include "events.h"
+#include "analysis.h"
 
 // ---------------------------------------------------------------------------
 // Fazy cyklu podlewania (PLAN.md → "Stany cyklu podlewania")
@@ -67,10 +68,12 @@ struct WateringCycle {
     uint32_t pulseDurationMs = 0;
     uint32_t soakTimeMs      = 0;
     uint32_t phaseStartMs    = 0;
+    uint32_t scheduledNightSeq = 0;
     float    moistureBeforeCycle    = 0.0f;
     float    moistureAfterLastSoak  = 0.0f;
     uint32_t totalPumpedMs   = 0;
     float    totalPumpedMl   = 0.0f;
+    bool     countsTowardNightLimit = false;
 
     void reset() { *this = WateringCycle{}; }
 };
@@ -131,9 +134,11 @@ enum class ScheduleDecision : uint8_t {
 struct ScheduleResult {
     ScheduleDecision decision = ScheduleDecision::NO_ACTION;
     const char* reason = nullptr;
+    bool countsTowardNightLimit = false;
 
     ScheduleResult() = default;
-    ScheduleResult(ScheduleDecision d, const char* r) : decision(d), reason(r) {}
+    ScheduleResult(ScheduleDecision d, const char* r, bool countsNight = false)
+        : decision(d), reason(r), countsTowardNightLimit(countsNight) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -142,6 +147,7 @@ struct ScheduleResult {
 struct ActuatorState {
     uint32_t lastPumpStopAtMs[kMaxPots] = {};
     uint32_t lastCycleDoneMs[kMaxPots]  = {};
+    uint32_t lastAutoWaterNightSeq[kMaxPots] = {};
     uint32_t lastFeedbackSeq[kMaxPots]  = {};
     WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
     float    lastFeedbackValue1[kMaxPots] = {};
@@ -158,6 +164,8 @@ struct ActuatorState {
 void wateringTick(uint32_t nowMs,
                   const SensorSnapshot& sensors,
                   const Config& cfg,
+                  const DuskDetector& dusk,
+                  const SolarClock& solar,
                   WateringCycle cycles[],
                   WaterBudget& budget,
                   ActuatorState& actuator,
@@ -168,6 +176,9 @@ ScheduleResult evaluateSchedule(uint32_t nowMs,
                                 const PotSensorSnapshot& potSens,
                                 const EnvSnapshot& envSens,
                                 const Config& cfg,
+                                const DuskDetector& dusk,
+                                const SolarClock& solar,
+                                const ActuatorState& actuator,
                                 uint8_t potIdx);
 
 // Polityki bezpieczeństwa

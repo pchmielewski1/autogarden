@@ -417,11 +417,15 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
         {
             det.phase = DuskPhase::NIGHT;
             det.lastDuskMs = nowMs;
+            det.nightSequence++;
             if (det.lastDawnMs > 0) {
                 det.dayLengthMs = nowMs - det.lastDawnMs;
-                Serial.printf("[DUSK] event=dusk_confirmed day_len_min=%u\n", det.dayLengthMs / 60000);
+                Serial.printf("[DUSK] event=dusk_confirmed day_len_min=%u night_seq=%lu\n",
+                              det.dayLengthMs / 60000,
+                              static_cast<unsigned long>(det.nightSequence));
             } else {
-                Serial.println("[DUSK] event=dusk_confirmed first_since_boot=yes");
+                Serial.printf("[DUSK] event=dusk_confirmed first_since_boot=yes night_seq=%lu\n",
+                              static_cast<unsigned long>(det.nightSequence));
             }
             duskStateSave(det);
             // >>> PODLEWANIE OKNO <<<
@@ -429,7 +433,10 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
         } else if (elapsed > DuskDetector::kTransitionMaxDurationMs) {
             det.phase = DuskPhase::NIGHT;
             det.lastDuskMs = nowMs;
-            Serial.printf("[DUSK] event=dusk_timeout elapsed_min=%u action=assume_night\n", elapsed / 60000);
+            det.nightSequence++;
+            Serial.printf("[DUSK] event=dusk_timeout elapsed_min=%u action=assume_night night_seq=%lu\n",
+                          elapsed / 60000,
+                          static_cast<unsigned long>(det.nightSequence));
             duskStateSave(det);
         }
         break;

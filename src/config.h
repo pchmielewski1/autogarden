@@ -26,7 +26,7 @@ static constexpr const char* kNvsDusk    = "ag_dusk";
 static constexpr const char* kNvsRuntime = "ag_runtime";
 
 static constexpr uint16_t kNetConfigSchema = 2;
-static constexpr uint16_t kRuntimeSchema = 2;  // bump on struct change
+static constexpr uint16_t kRuntimeSchema = 3;  // bump on struct change
 
 // ---------------------------------------------------------------------------
 // Profil rośliny (PlantProfile) — PLAN.md → "Profile roślin"
@@ -65,7 +65,7 @@ struct PotConfig {
     float    customTargetPct         = 60.0f;
     float    customCriticalLowPct    = 30.0f;
     float    customMaxMoisturePct    = 80.0f;
-    float    customHysteresisPct     = 5.0f;
+    float    customHysteresisPct     = 3.0f;
     uint32_t customSoakTimeMs        = 35000;
     uint16_t customPulseWaterMl      = 40;
     uint8_t  customMaxPulsesPerCycle = 5;
@@ -248,15 +248,21 @@ struct RuntimeState {
 
     // ── Cooldown — seconds since last cycle completed (0 = unknown) ──
     uint32_t secsSinceLastCycleDone[kMaxPots] = {};
+    uint32_t lastAutoWaterNightSeq[kMaxPots] = {};
 
     // ── Refill timestamp (seconds since last refill at save time) ──
     uint32_t secsSinceRefill          = 0;
+
+    // ── Dusk scheduling supplement ──
+    uint32_t secsSinceLastDusk        = 0;
+    uint32_t secsSinceLastDawn        = 0;
+    uint32_t nightSequence            = 0;
 
     // ── Solar clock supplement ──
     uint8_t  solarCycleCount         = 0;
     bool     solarCalibrated         = false;
 
-    uint8_t  _pad[2] = {};
+    uint8_t  _pad[3] = {};
 };
 
 // NVS persist
