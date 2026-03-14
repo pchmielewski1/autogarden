@@ -55,6 +55,7 @@ void trendTick(uint32_t nowMs, float moisturePct, TrendState& ts, const Config& 
 // Weak overrides wywoływane z watering.cpp
 bool  trendBaselineLearned(uint8_t potIdx);
 float trendCurrentRate(uint8_t potIdx);
+float trendBaselineRate(uint8_t potIdx);
 
 // ---------------------------------------------------------------------------
 // DuskDetector — fuzja sensorowa (BH1750 + SHT30 + QMP6988)
@@ -151,7 +152,7 @@ EnvDerivatives computeDerivatives(const EnvSample* window, uint8_t count,
                                   uint8_t lookbackSamples = 10);
 
 // ---------------------------------------------------------------------------
-// SolarClock — estymowany zegar (bez RTC/NTP)
+// SolarClock — estymowany zegar oparty na obserwowanych przejściach dzień/noc
 // PLAN.md → "Estymacja zegara słonecznego"
 // ---------------------------------------------------------------------------
 struct SolarClock {
@@ -229,10 +230,14 @@ struct SensorHistory {
 };
 
 // Tick — dodaj sample i wykonaj downsampling / NVS flush
-void historyTick(uint32_t nowMs, const SensorSample& sample, SensorHistory& hist);
+bool historyTick(uint32_t nowMs, const SensorSample& sample, SensorHistory& hist);
 
 // Dodaj rekord podlewania
-void historyAddWatering(SensorHistory& hist, const WateringRecord& rec);
+bool historyAddWatering(SensorHistory& hist, const WateringRecord& rec);
 
 // Analiza dziennego zużycia (sum all pots, last 24h)
 float historyCalcDailyConsumption(const SensorHistory& hist, uint32_t nowMs);
+
+// NVS persist — level2/level3/wateringLog (namespace ag_hist)
+bool historyStateSave(uint32_t nowMs, const SensorHistory& hist);
+bool historyStateLoad(uint32_t nowMs, SensorHistory& hist);

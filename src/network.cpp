@@ -1663,7 +1663,7 @@ void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize) {
 }
 
 bool isDailyHeartbeatTime(uint32_t nowMs, const SolarClock& clk,
-                          const DuskDetector& det, bool ntpAvailable,
+                          const DuskDetector& det,
                           NetworkState& ns)
 {
     // Debounce: max 1 heartbeat per 20h
@@ -1691,9 +1691,7 @@ bool isDailyHeartbeatTime(uint32_t nowMs, const SolarClock& clk,
         }
     }
 
-    // Strategy 2: NTP (8:00 local) — TODO when NTP available
-
-    // Strategy 3: fallback — every 24h from last heartbeat (or 5 min from boot)
+    // Strategy 2: fallback — every 24h from last heartbeat (or 5 min from boot)
     if (ns.lastHeartbeatMs == 0) {
         if (nowMs > 5UL * 60 * 1000) {
             ns.lastHeartbeatMs = nowMs;

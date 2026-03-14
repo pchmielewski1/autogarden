@@ -139,6 +139,13 @@ float trendCurrentRate(uint8_t potIdx) {
     return ts.hourlyDeltas[lastIdx];
 }
 
+float trendBaselineRate(uint8_t potIdx) {
+    if (potIdx >= kMaxPots) return 0.0f;
+    TrendState& ts = g_trendStates[potIdx];
+    if (!ts.baselineCalibrated || std::isnan(ts.normalDryingRate)) return 0.0f;
+    return ts.normalDryingRate;
+}
+
 // ===========================================================================
 // DuskDetector — scoring + FSM
 // PLAN.md → "Detektor zmierzchu/świtu — fuzja sensorowa"
@@ -591,10 +598,91 @@ template class RingBuffer<SensorSample, 288>;
 template class RingBuffer<SensorSample, 720>;
 template class RingBuffer<WateringRecord, 100>;
 
+namespace {
+static constexpr uint16_t kHistorySchema = 1;
+
+struct PersistSensorSample {
+    uint32_t ageSec = 0;
+    uint16_t moistureRaw = 0;
+    int16_t  tempC_x10 = 0;
+    uint16_t lux = 0;
+    uint8_t  flags = 0;
+    uint8_t  _pad = 0;
+};
+
+struct PersistWateringRecord {
+    uint32_t ageSec = 0;
+    uint8_t  potIndex = 0;
+    uint8_t  pulseCount = 0;
+    uint16_t totalPumpedMl_x10 = 0;
+    uint16_t moistureBefore_x10 = 0;
+    uint16_t moistureAfter_x10 = 0;
+    uint8_t  reason = 0;
+    uint8_t  _pad = 0;
+};
+
+struct HistoryMeta {
+    uint16_t schema = kHistorySchema;
+    uint16_t level2Count = 0;
+    uint16_t level3Count = 0;
+    uint16_t wateringCount = 0;
+    uint32_t secsSinceLastLevel1Add = 0;
+    uint32_t secsSinceLastLevel2Flush = 0;
+    uint32_t secsSinceLastLevel3Flush = 0;
+};
+
+static PersistSensorSample toPersistSample(uint32_t nowMs, const SensorSample& src) {
+    PersistSensorSample out{};
+    out.ageSec = (src.timestampMs > 0 && nowMs > src.timestampMs) ? ((nowMs - src.timestampMs) / 1000UL) : 0;
+    out.moistureRaw = src.moistureRaw;
+    out.tempC_x10 = src.tempC_x10;
+    out.lux = src.lux;
+    out.flags = src.flags;
+    return out;
+}
+
+static SensorSample fromPersistSample(uint32_t nowMs, const PersistSensorSample& src) {
+    SensorSample out{};
+    uint32_t ageMs = src.ageSec * 1000UL;
+    out.timestampMs = (ageMs < nowMs) ? (nowMs - ageMs) : 1;
+    out.moistureRaw = src.moistureRaw;
+    out.tempC_x10 = src.tempC_x10;
+    out.lux = src.lux;
+    out.flags = src.flags;
+    return out;
+}
+
+static PersistWateringRecord toPersistWatering(uint32_t nowMs, const WateringRecord& src) {
+    PersistWateringRecord out{};
+    out.ageSec = (src.timestampMs > 0 && nowMs > src.timestampMs) ? ((nowMs - src.timestampMs) / 1000UL) : 0;
+    out.potIndex = src.potIndex;
+    out.pulseCount = src.pulseCount;
+    out.totalPumpedMl_x10 = src.totalPumpedMl_x10;
+    out.moistureBefore_x10 = src.moistureBefore_x10;
+    out.moistureAfter_x10 = src.moistureAfter_x10;
+    out.reason = src.reason;
+    return out;
+}
+
+static WateringRecord fromPersistWatering(uint32_t nowMs, const PersistWateringRecord& src) {
+    WateringRecord out{};
+    uint32_t ageMs = src.ageSec * 1000UL;
+    out.timestampMs = (ageMs < nowMs) ? (nowMs - ageMs) : 1;
+    out.potIndex = src.potIndex;
+    out.pulseCount = src.pulseCount;
+    out.totalPumpedMl_x10 = src.totalPumpedMl_x10;
+    out.moistureBefore_x10 = src.moistureBefore_x10;
+    out.moistureAfter_x10 = src.moistureAfter_x10;
+    out.reason = src.reason;
+    return out;
+}
+}
+
 // ===========================================================================
 // SensorHistory — tick + NVS flush
 // ===========================================================================
-void historyTick(uint32_t nowMs, const SensorSample& sample, SensorHistory& hist) {
+bool historyTick(uint32_t nowMs, const SensorSample& sample, SensorHistory& hist) {
+    bool persistedChanged = false;
     auto averageLevel1Tail = [&](uint16_t samplesToAvg, SensorSample& out) -> bool {
         uint16_t size = hist.level1.size();
         if (size == 0) return false;
@@ -659,6 +747,7 @@ void historyTick(uint32_t nowMs, const SensorSample& sample, SensorHistory& hist
             SensorSample avg = sample;
             if (averageLevel1Tail(30, avg)) {
                 hist.level2.push(avg);
+                persistedChanged = true;
             }
         }
         hist.lastLevel2FlushMs = nowMs;
@@ -670,14 +759,18 @@ void historyTick(uint32_t nowMs, const SensorSample& sample, SensorHistory& hist
             SensorSample avg = sample;
             if (averageLevel2Tail(12, avg)) {
                 hist.level3.push(avg);
+                persistedChanged = true;
             }
         }
         hist.lastLevel3FlushMs = nowMs;
     }
+
+    return persistedChanged;
 }
 
-void historyAddWatering(SensorHistory& hist, const WateringRecord& rec) {
+bool historyAddWatering(SensorHistory& hist, const WateringRecord& rec) {
     hist.wateringLog.push(rec);
+    return true;
 }
 
 float historyCalcDailyConsumption(const SensorHistory& hist, uint32_t nowMs) {
@@ -691,4 +784,126 @@ float historyCalcDailyConsumption(const SensorHistory& hist, uint32_t nowMs) {
         }
     }
     return total;
+}
+
+bool historyStateSave(uint32_t nowMs, const SensorHistory& hist) {
+    Preferences prefs;
+    if (!prefs.begin(kNvsHist, false)) {
+        Serial.println("[HIST] event=nvs_save_failed reason=open_namespace");
+        return false;
+    }
+
+    static PersistSensorSample s_level2[288];
+    static PersistSensorSample s_level3[720];
+    static PersistWateringRecord s_watering[100];
+
+    HistoryMeta meta{};
+    meta.level2Count = hist.level2.size();
+    meta.level3Count = hist.level3.size();
+    meta.wateringCount = hist.wateringLog.size();
+    meta.secsSinceLastLevel1Add = (hist.lastLevel1AddMs > 0 && nowMs > hist.lastLevel1AddMs)
+        ? ((nowMs - hist.lastLevel1AddMs) / 1000UL) : 0;
+    meta.secsSinceLastLevel2Flush = (hist.lastLevel2FlushMs > 0 && nowMs > hist.lastLevel2FlushMs)
+        ? ((nowMs - hist.lastLevel2FlushMs) / 1000UL) : 0;
+    meta.secsSinceLastLevel3Flush = (hist.lastLevel3FlushMs > 0 && nowMs > hist.lastLevel3FlushMs)
+        ? ((nowMs - hist.lastLevel3FlushMs) / 1000UL) : 0;
+
+    for (uint16_t i = 0; i < meta.level2Count; ++i) {
+        s_level2[i] = toPersistSample(nowMs, hist.level2.at(i));
+    }
+    for (uint16_t i = 0; i < meta.level3Count; ++i) {
+        s_level3[i] = toPersistSample(nowMs, hist.level3.at(i));
+    }
+    for (uint16_t i = 0; i < meta.wateringCount; ++i) {
+        s_watering[i] = toPersistWatering(nowMs, hist.wateringLog.at(i));
+    }
+
+    bool ok = true;
+    ok = ok && (prefs.putBytes("meta", &meta, sizeof(meta)) == sizeof(meta));
+    ok = ok && (prefs.putBytes("lvl2", s_level2, meta.level2Count * sizeof(PersistSensorSample))
+                == meta.level2Count * sizeof(PersistSensorSample));
+    ok = ok && (prefs.putBytes("lvl3", s_level3, meta.level3Count * sizeof(PersistSensorSample))
+                == meta.level3Count * sizeof(PersistSensorSample));
+    ok = ok && (prefs.putBytes("wlog", s_watering, meta.wateringCount * sizeof(PersistWateringRecord))
+                == meta.wateringCount * sizeof(PersistWateringRecord));
+    prefs.end();
+
+    Serial.printf("[HIST] event=nvs_save result=%s level2=%u level3=%u watering=%u\n",
+                  ok ? "ok" : "fail",
+                  meta.level2Count,
+                  meta.level3Count,
+                  meta.wateringCount);
+    return ok;
+}
+
+bool historyStateLoad(uint32_t nowMs, SensorHistory& hist) {
+    Preferences prefs;
+    hist = SensorHistory{};
+    if (!prefs.begin(kNvsHist, true)) {
+        return false;
+    }
+    if (!prefs.isKey("meta")) {
+        prefs.end();
+        return false;
+    }
+
+    HistoryMeta meta{};
+    if (prefs.getBytes("meta", &meta, sizeof(meta)) != sizeof(meta) || meta.schema != kHistorySchema) {
+        prefs.end();
+        Serial.println("[HIST] event=nvs_load_failed reason=meta_invalid");
+        return false;
+    }
+    if (meta.level2Count > 288 || meta.level3Count > 720 || meta.wateringCount > 100) {
+        prefs.end();
+        Serial.println("[HIST] event=nvs_load_failed reason=count_invalid");
+        return false;
+    }
+
+    static PersistSensorSample s_level2[288];
+    static PersistSensorSample s_level3[720];
+    static PersistWateringRecord s_watering[100];
+
+    bool ok = true;
+    if (meta.level2Count > 0) {
+        ok = ok && (prefs.getBytes("lvl2", s_level2, meta.level2Count * sizeof(PersistSensorSample))
+                    == meta.level2Count * sizeof(PersistSensorSample));
+    }
+    if (meta.level3Count > 0) {
+        ok = ok && (prefs.getBytes("lvl3", s_level3, meta.level3Count * sizeof(PersistSensorSample))
+                    == meta.level3Count * sizeof(PersistSensorSample));
+    }
+    if (meta.wateringCount > 0) {
+        ok = ok && (prefs.getBytes("wlog", s_watering, meta.wateringCount * sizeof(PersistWateringRecord))
+                    == meta.wateringCount * sizeof(PersistWateringRecord));
+    }
+    prefs.end();
+
+    if (!ok) {
+        hist = SensorHistory{};
+        Serial.println("[HIST] event=nvs_load_failed reason=blob_read");
+        return false;
+    }
+
+    for (uint16_t i = 0; i < meta.level2Count; ++i) {
+        hist.level2.push(fromPersistSample(nowMs, s_level2[i]));
+    }
+    for (uint16_t i = 0; i < meta.level3Count; ++i) {
+        hist.level3.push(fromPersistSample(nowMs, s_level3[i]));
+    }
+    for (uint16_t i = 0; i < meta.wateringCount; ++i) {
+        hist.wateringLog.push(fromPersistWatering(nowMs, s_watering[i]));
+    }
+
+    hist.lastLevel1AddMs = (meta.secsSinceLastLevel1Add > 0 && meta.secsSinceLastLevel1Add * 1000UL < nowMs)
+        ? (nowMs - meta.secsSinceLastLevel1Add * 1000UL) : 0;
+    hist.lastLevel2FlushMs = (meta.secsSinceLastLevel2Flush > 0 && meta.secsSinceLastLevel2Flush * 1000UL < nowMs)
+        ? (nowMs - meta.secsSinceLastLevel2Flush * 1000UL) : 0;
+    hist.lastLevel3FlushMs = (meta.secsSinceLastLevel3Flush > 0 && meta.secsSinceLastLevel3Flush * 1000UL < nowMs)
+        ? (nowMs - meta.secsSinceLastLevel3Flush * 1000UL) : 0;
+
+    Serial.printf("[HIST] event=nvs_load result=ok level2=%u level3=%u watering=%u\n",
+                  meta.level2Count,
+                  meta.level3Count,
+                  meta.wateringCount);
+    return true;
 }

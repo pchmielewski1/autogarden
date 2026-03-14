@@ -120,9 +120,9 @@ struct DailyReportData {
 void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize);
 void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_t bufSize);
 
-// Sprawdź czy pora na heartbeat (SolarClock / NTP / fallback 24h)
+// Sprawdź czy pora na heartbeat (SolarClock / fallback 24h)
 bool isDailyHeartbeatTime(uint32_t nowMs, const SolarClock& clk,
-                          const DuskDetector& det, bool ntpAvailable,
+                          const DuskDetector& det,
                           NetworkState& ns);
 
 // ---------------------------------------------------------------------------

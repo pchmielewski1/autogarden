@@ -184,11 +184,19 @@ ScheduleResult evaluateSchedule(uint32_t nowMs,
     if (cfg.vacationMode) {
         if (trendBaselineLearned(potIdx)) {
             float rate = trendCurrentRate(potIdx);
-            // TODO(analysis): normalDryingRate dostępny z TrendState
-            // Na razie: absolutny fallback threshold
-            if (rate < -(cfg.anomalyDryingRateThreshold * cfg.anomalyDryingRateMultiplier)) {
-                Serial.printf("[POT%d] SCHEDULE_BLOCK reason=vacation_anomaly rate=%.2f%%/h\n",
-                              potIdx, rate);
+            float baseline = trendBaselineRate(potIdx);
+            float threshold = baseline * cfg.anomalyDryingRateMultiplier;
+            if (rate < threshold) {
+                Serial.printf("[POT%d] SCHEDULE_BLOCK reason=vacation_anomaly rate=%.2f%%/h baseline=%.2f%%/h threshold=%.2f%%/h\n",
+                              potIdx, rate, baseline, threshold);
+                return { ScheduleDecision::NO_ACTION, "VACATION_ANOMALY_BLOCK" };
+            }
+        } else {
+            float rate = trendCurrentRate(potIdx);
+            float threshold = -cfg.anomalyDryingRateThreshold;
+            if (rate < threshold) {
+                Serial.printf("[POT%d] SCHEDULE_BLOCK reason=vacation_anomaly_unlearned rate=%.2f%%/h threshold=%.2f%%/h\n",
+                              potIdx, rate, threshold);
                 return { ScheduleDecision::NO_ACTION, "VACATION_ANOMALY_BLOCK" };
             }
         }
@@ -240,17 +248,9 @@ ScheduleResult evaluateSchedule(uint32_t nowMs,
     if (dusk.lastDuskMs > 0 && nowMs >= dusk.lastDuskMs && isNightPhase(dusk.phase)) {
         uint32_t timeSinceDusk = nowMs - dusk.lastDuskMs;
         if (timeSinceDusk <= cfg.duskWateringWindowMs) {
-            if (dusk.nightSequence != 0 && actuator.lastAutoWaterNightSeq[potIdx] == dusk.nightSequence) {
-                throttledSchedBlockLog("night_done",
-                                       "[POT%d] SCHEDULE_BLOCK reason=already_watered_this_night moisture=%.1f\n",
-                                       moisture);
-                return { ScheduleDecision::NO_ACTION, "ALREADY_WATERED_THIS_NIGHT" };
-            }
-
-            Serial.printf("[POT%d] SCHEDULE_START reason=dusk_window moisture=%.1f%% trigger=%.1f%% night_seq=%lu\n",
-                          potIdx, moisture, triggerPct,
-                          static_cast<unsigned long>(dusk.nightSequence));
-            return { ScheduleDecision::START_CYCLE, "DUSK_SENSOR", true };
+            Serial.printf("[POT%d] SCHEDULE_START reason=dusk_window moisture=%.1f%% trigger=%.1f%%\n",
+                          potIdx, moisture, triggerPct);
+            return { ScheduleDecision::START_CYCLE, "DUSK_SENSOR" };
         }
 
         throttledSchedBlockLog("window_closed",
@@ -265,17 +265,10 @@ ScheduleResult evaluateSchedule(uint32_t nowMs,
         if (estimatedDawn > nowMs) {
             uint32_t timeUntilDawn = estimatedDawn - nowMs;
             if (timeUntilDawn <= 3600000UL) {
-                if (dusk.nightSequence != 0 && actuator.lastAutoWaterNightSeq[potIdx] == dusk.nightSequence) {
-                    throttledSchedBlockLog("predawn_done",
-                                           "[POT%d] SCHEDULE_BLOCK reason=predawn_already_watered moisture=%.1f\n",
-                                           moisture);
-                    return { ScheduleDecision::NO_ACTION, "ALREADY_WATERED_THIS_NIGHT" };
-                }
-
                 Serial.printf("[POT%d] SCHEDULE_START reason=pre_dawn moisture=%.1f%% trigger=%.1f%% time_to_dawn_min=%lu\n",
                               potIdx, moisture, triggerPct,
                               static_cast<unsigned long>(timeUntilDawn / 60000UL));
-                return { ScheduleDecision::START_CYCLE, "PRE_DAWN_ESTIMATE", true };
+                return { ScheduleDecision::START_CYCLE, "PRE_DAWN_ESTIMATE" };
             }
         }
     }
@@ -286,7 +279,7 @@ ScheduleResult evaluateSchedule(uint32_t nowMs,
             (nowMs - actuator.lastCycleDoneMs[potIdx]) >= cfg.fallbackIntervalMs) {
             Serial.printf("[POT%d] SCHEDULE_START reason=fallback_night moisture=%.1f%% trigger=%.1f%%\n",
                           potIdx, moisture, triggerPct);
-            return { ScheduleDecision::START_CYCLE, "FALLBACK_TIMER", false };
+            return { ScheduleDecision::START_CYCLE, "FALLBACK_TIMER" };
         }
 
         throttledSchedBlockLog("fallback_wait",
@@ -386,8 +379,6 @@ void wateringTick(uint32_t nowMs,
                 cycle = newCycle(prof, potCfg, potIdx);
                 cycle.moistureBeforeCycle = potSens.moisturePct;
                 cycle.phaseStartMs = nowMs;
-                cycle.countsTowardNightLimit = sched.countsTowardNightLimit;
-                cycle.scheduledNightSeq = dusk.nightSequence;
                 actuator.lastFeedbackCode[potIdx] = WateringFeedbackCode::NONE;
                 actuator.lastFeedbackValue1[potIdx] = 0.0f;
                 actuator.lastFeedbackValue2[potIdx] = 0.0f;
@@ -472,14 +463,9 @@ void wateringTick(uint32_t nowMs,
         case WateringPhase::PULSE: {
             if (!pump.isOn()) {
                 if (pump.on(nowMs, cycle.pulseDurationMs)) {
-                    if (cycle.countsTowardNightLimit && cycle.scheduledNightSeq != 0) {
-                        actuator.lastAutoWaterNightSeq[potIdx] = cycle.scheduledNightSeq;
-                    }
-                    Serial.printf("[POT%d] PULSE_START n=%d/%d duration=%dms night_seq=%lu counts_night=%s\n",
+                    Serial.printf("[POT%d] PULSE_START n=%d/%d duration=%dms\n",
                                   potIdx, cycle.pulseCount + 1, cycle.maxPulses,
-                                  cycle.pulseDurationMs,
-                                  static_cast<unsigned long>(cycle.scheduledNightSeq),
-                                  cycle.countsTowardNightLimit ? "yes" : "no");
+                                  cycle.pulseDurationMs);
                 } else {
                     cycle.phase = WateringPhase::BLOCKED;
                     Serial.printf("[POT%d] SAFETY_BLOCK reason=pump_on_failed\n", potIdx);
@@ -631,7 +617,9 @@ void wateringTick(uint32_t nowMs,
             rec.moistureAfter_x10 = static_cast<uint16_t>(
                 std::min(65535.0f, cycle.moistureAfterLastSoak * 10.0f));
             rec.reason = static_cast<uint8_t>(actuator.lastFeedbackCode[potIdx]);
-            historyAddWatering(g_history, rec);
+            if (historyAddWatering(g_history, rec)) {
+                historyStateSave(nowMs, g_history);
+            }
 
             actuator.lastCycleDoneMs[potIdx] = nowMs;
             if (actuator.lastFeedbackCode[potIdx] == WateringFeedbackCode::NONE) {
@@ -923,6 +911,11 @@ __attribute__((weak)) bool trendBaselineLearned(uint8_t potIdx) {
 }
 
 __attribute__((weak)) float trendCurrentRate(uint8_t potIdx) {
+    (void)potIdx;
+    return 0.0f;
+}
+
+__attribute__((weak)) float trendBaselineRate(uint8_t potIdx) {
     (void)potIdx;
     return 0.0f;
 }

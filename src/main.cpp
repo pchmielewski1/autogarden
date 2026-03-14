@@ -456,7 +456,6 @@ static void buildRuntimeState(RuntimeState& rs) {
         } else {
             rs.secsSinceLastCycleDone[i] = 0;
         }
-        rs.lastAutoWaterNightSeq[i] = g_actuator.lastAutoWaterNightSeq[i];
     }
 
     if (g_duskDetector.lastDuskMs > 0) {
@@ -667,7 +666,6 @@ static void controlTaskFn(void* /*param*/) {
                 Serial.printf("[CTRL] Cooldown[%d] restored: %ds ago\n",
                               i, rs.secsSinceLastCycleDone[i]);
             }
-            g_actuator.lastAutoWaterNightSeq[i] = rs.lastAutoWaterNightSeq[i];
         }
 
         if (rs.secsSinceLastDusk > 0) {
@@ -694,6 +692,10 @@ static void controlTaskFn(void* /*param*/) {
         g_budget.reservoirCurrentMl = g_config.reservoirCapacityMl;
         g_budget.lastRefillMs = millis();  // treat first boot as fresh refill
         Serial.println("[CTRL] event=runtime_restore result=missing action=defaults");
+    }
+
+    if (!historyStateLoad(millis(), g_history)) {
+        Serial.println("[CTRL] event=history_restore result=missing action=ram_only");
     }
 
     // Restore dusk detector phase from NVS (persisted across reboots)
@@ -871,7 +873,9 @@ static void controlTaskFn(void* /*param*/) {
             for (uint8_t i = 0; i < kMaxPots; ++i) {
                 if (g_hardware.pump(i).isOn())  sample.flags |= 0x04;
             }
-            historyTick(now, sample, g_history);
+            if (historyTick(now, sample, g_history)) {
+                historyStateSave(now, g_history);
+            }
 
             publishSharedStateFromControl();
         }
@@ -1498,7 +1502,7 @@ static void netTaskFn(void* /*param*/) {
             shared = readSharedState();
             latestSnap = readSnapshot();
             if (isDailyHeartbeatTime(now, g_solarClock, g_duskDetector,
-                                     false /* NTP TODO */, g_netState)) {
+                                     g_netState)) {
                 rptData.sensors  = latestSnap;
                 rptData.budget   = shared.budget;
                 memcpy(rptData.trends, shared.trends, sizeof(shared.trends));

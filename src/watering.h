@@ -68,12 +68,10 @@ struct WateringCycle {
     uint32_t pulseDurationMs = 0;
     uint32_t soakTimeMs      = 0;
     uint32_t phaseStartMs    = 0;
-    uint32_t scheduledNightSeq = 0;
     float    moistureBeforeCycle    = 0.0f;
     float    moistureAfterLastSoak  = 0.0f;
     uint32_t totalPumpedMs   = 0;
     float    totalPumpedMl   = 0.0f;
-    bool     countsTowardNightLimit = false;
 
     void reset() { *this = WateringCycle{}; }
 };
@@ -134,11 +132,10 @@ enum class ScheduleDecision : uint8_t {
 struct ScheduleResult {
     ScheduleDecision decision = ScheduleDecision::NO_ACTION;
     const char* reason = nullptr;
-    bool countsTowardNightLimit = false;
 
     ScheduleResult() = default;
-    ScheduleResult(ScheduleDecision d, const char* r, bool countsNight = false)
-        : decision(d), reason(r), countsTowardNightLimit(countsNight) {}
+    ScheduleResult(ScheduleDecision d, const char* r)
+        : decision(d), reason(r) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -147,7 +144,6 @@ struct ScheduleResult {
 struct ActuatorState {
     uint32_t lastPumpStopAtMs[kMaxPots] = {};
     uint32_t lastCycleDoneMs[kMaxPots]  = {};
-    uint32_t lastAutoWaterNightSeq[kMaxPots] = {};
     uint32_t lastFeedbackSeq[kMaxPots]  = {};
     WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
     float    lastFeedbackValue1[kMaxPots] = {};

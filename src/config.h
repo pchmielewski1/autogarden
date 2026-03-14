@@ -26,7 +26,7 @@ static constexpr const char* kNvsDusk    = "ag_dusk";
 static constexpr const char* kNvsRuntime = "ag_runtime";
 
 static constexpr uint16_t kNetConfigSchema = 2;
-static constexpr uint16_t kRuntimeSchema = 3;  // bump on struct change
+static constexpr uint16_t kRuntimeSchema = 4;  // bump on struct change
 
 // ---------------------------------------------------------------------------
 // Profil rośliny (PlantProfile) — PLAN.md → "Profile roślin"
@@ -135,7 +135,7 @@ struct Config {
     uint32_t transitionConfirmMs        = 900000;    // 15 min
     uint32_t fallbackIntervalMs         = 6UL * 3600 * 1000;  // 6h
 
-    // Opcjonalnie (WiFi/NTP)
+    // Opcjonalnie (lokalizacja / offset czasu)
     float    latitude       = 52.23f;
     float    longitude      = 21.01f;
     int8_t   utcOffsetHours = 1;
@@ -248,7 +248,6 @@ struct RuntimeState {
 
     // ── Cooldown — seconds since last cycle completed (0 = unknown) ──
     uint32_t secsSinceLastCycleDone[kMaxPots] = {};
-    uint32_t lastAutoWaterNightSeq[kMaxPots] = {};
 
     // ── Refill timestamp (seconds since last refill at save time) ──
     uint32_t secsSinceRefill          = 0;

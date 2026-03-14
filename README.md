@@ -37,7 +37,7 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 
 ### Dusk/Dawn Detection & Scheduling
 - **Sensor-fusion dusk detector** — combines light level, light rate-of-change, temperature, humidity, and pressure into a transition score.
-- **Solar clock** — learns the day/night cycle from observed transitions, no RTC or NTP required.
+- **Solar clock** — learns the day/night cycle from observed transitions without external time sync.
 - **Dusk watering window** — schedules watering during the optimal evening window (configurable).
 
 ### User Interface
@@ -60,7 +60,7 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 | Config + runtime persistence (NVS) | Implemented |
 | Captive portal provisioning (embedded HTML) | Implemented |
 | Telegram remote control (`/ag` + inline menu) | Implemented |
-| NTP-based scheduling helpers | Partial (fallback active) |
+| Dusk-based scheduling and fallback timing | Implemented |
 
 ### Configuration & Persistence
 - **NVS storage** — all settings persist across reboots (mode, profiles, reservoir, vacation, calibration).
