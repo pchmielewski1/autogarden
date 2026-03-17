@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 static constexpr uint8_t  kMaxPots      = 2;
 static constexpr uint8_t  kNumProfiles  = 6;  // Pomidor..Custom
-static constexpr uint16_t kConfigSchema = 2;  // wersja schematu NVS
+static constexpr uint16_t kConfigSchema = 3;  // wersja schematu NVS
 
 // NVS namespace names
 static constexpr const char* kNvsConfig  = "ag_config";
@@ -76,7 +76,6 @@ struct PotConfig {
 
     // Sensory — per-pot
     SoilCalib soilCalib;
-    float    sagFactor          = 1.14f;   // crosstalk compensation
     bool     potMaxActiveLow    = true;    // overflow sensor polaryzacja
     float    moistureEmaAlpha   = 0.1f;    // EMA smoothing
 

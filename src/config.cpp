@@ -63,10 +63,6 @@ bool configValidate(const Config& cfg) {
             Serial.printf("[CONFIG] FAIL: pots[%d].moistureEmaAlpha=%.2f\n", i, pot.moistureEmaAlpha);
             ok = false;
         }
-        if (pot.sagFactor <= 0.5f || pot.sagFactor >= 2.0f) {
-            Serial.printf("[CONFIG] FAIL: pots[%d].sagFactor=%.2f\n", i, pot.sagFactor);
-            ok = false;
-        }
     }
 
     if (cfg.pumpOnMsMax == 0) { Serial.println("[CONFIG] FAIL: pumpOnMsMax=0"); ok = false; }

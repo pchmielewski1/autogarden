@@ -30,7 +30,7 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 - **Mode-switch abort** — switching from AUTO to MANUAL immediately stops any active watering cycle and turns off pumps.
 
 ### Environment Sensing
-- **Soil moisture** — capacitive sensor via PbHUB ADC with automatic crosstalk compensation.
+- **Soil moisture** — capacitive sensor via PbHUB ADC.
 - **Temperature & humidity** — SHT30 (ENV III).
 - **Barometric pressure** — QMP6988 with OTP calibration.
 - **Ambient light** — BH1750 lux sensor, used for dusk/dawn detection and direct-sun blocking.
@@ -100,12 +100,26 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 
 ### Known Hardware Quirks (PbHUB v1.1)
 
-The STM32F030 inside PbHUB v1.1 has a single ADC with an internal multiplexer. This causes **crosstalk** between channels:
-
-- A water-level sensor at ~4.85 V on an adjacent channel inflates moisture readings by ~14%.
-- The firmware applies automatic compensation (`sagFactor ≈ 1.14`) based on the current water-level state.
-- Crosstalk is caused by the physical voltage on the pin, not the read mode — reading a channel as digital vs. ADC makes no difference to crosstalk on other channels.
 - PbHUB requires I²C STOP+START sequences (no repeated start) with ~10 ms inter-transaction delay.
+
+### Water Level Sensor Protection (3.3 V Zener Clamp)
+
+Water level sensors output ~4.85 V (HIGH) which exceeds the STM32F030 3.3 V VDDA.
+Each sensor channel (CH2, CH3, CH4) has a Zener clamp circuit:
+
+```
+        Sensor ──── 1 kΩ ───┬─── PbHUB CHx
+                             │
+                         BZX84C3V3
+                         (cathode up)
+                             │
+                            GND
+```
+
+- **HIGH** (water detected): 4.85 V → clamped to ~3.3 V (clean logic HIGH for STM32)
+- **LOW** (no water): 0 V → passes through as 0 V (logic LOW)
+- Non-inverting — no firmware changes needed for sensor polarity.
+- Components per channel: 1× BZX84C3V3, 1× 1 kΩ . Total: 3 channels.
 
 ---
 

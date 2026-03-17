@@ -767,21 +767,11 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
                 : potCfg.soilCalib.rawDry;
         }
 
-        // Crosstalk compensation (PLAN.md → "Wzorzec odczytu z kompensacją")
-        bool uplift = (snap.pots[i].waterGuards.potMax == WaterLevelState::OK)
-                   || (snap.pots[i].waterGuards.reservoirMin == WaterLevelState::TRIGGERED);
-        snap.pots[i].crosstalkUplift = uplift;
-
-        float comp = (float)snap.pots[i].moistureRaw;
-        if (uplift) {
-            comp /= potCfg.sagFactor;
-        }
-        snap.pots[i].moistureComp = comp;
-
         // Normalizacja → procent (EMA stosowane w analysis module)
         float pct = 0.0f;
+        float raw = (float)snap.pots[i].moistureRaw;
         if (potCfg.soilCalib.rawDry != potCfg.soilCalib.rawWet) {
-            pct = 100.0f * (float)(potCfg.soilCalib.rawDry - comp)
+            pct = 100.0f * (potCfg.soilCalib.rawDry - raw)
                 / (float)(potCfg.soilCalib.rawDry - potCfg.soilCalib.rawWet);
             if (pct < 0.0f) pct = 0.0f;
             if (pct > 100.0f) pct = 100.0f;

@@ -926,8 +926,8 @@ static void controlTaskFn(void* /*param*/) {
                         case WateringPhase::DONE:          phaseStr = "DONE"; break;
                         case WateringPhase::BLOCKED:       phaseStr = "BLOCK"; break;
                     }
-                    Serial.printf("[POT%d] raw=%d comp=%.0f pct=%.1f%% ema=%.1f%% phase=%s\n",
-                                  i, ps.moistureRaw, ps.moistureComp,
+                    Serial.printf("[POT%d] raw=%d pct=%.1f%% ema=%.1f%% phase=%s\n",
+                                  i, ps.moistureRaw,
                                   ps.moisturePct, ps.moistureEma, phaseStr);
 
                     if (cyc.phase == WateringPhase::IDLE && g_config.mode == Mode::AUTO) {
@@ -966,13 +966,12 @@ static void controlTaskFn(void* /*param*/) {
                         }
                     }
 
-                    Serial.printf("[POT%d] overflow=%s reservoir=%s crosstalk=%s\n",
+                    Serial.printf("[POT%d] overflow=%s reservoir=%s\n",
                                   i,
                                   ps.waterGuards.potMax == WaterLevelState::OK ? "OK" :
                                   ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
                                   ps.waterGuards.reservoirMin == WaterLevelState::OK ? "OK" :
-                                  ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
-                                  ps.crosstalkUplift ? "yes" : "no");
+                                  ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "UNK");
                     if (cyc.phase != WateringPhase::IDLE && cyc.phase != WateringPhase::DONE) {
                         Serial.printf("[POT%d] pulse=%d/%d pumped=%.1fml phaseSince=%ds\n",
                                       i, cyc.pulseCount, cyc.maxPulses,

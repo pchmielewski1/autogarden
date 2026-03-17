@@ -35,7 +35,6 @@ struct ReadResult {
 
 // ---------------------------------------------------------------------------
 // WaterLevelState — stan czujnika poziomu wody (domenowy)
-// PLAN.md → "Crosstalk model"
 // ---------------------------------------------------------------------------
 enum class WaterLevelState : uint8_t {
     OK,          // woda obecna (brak problemu)
@@ -59,10 +58,8 @@ struct WaterGuards {
 struct PotSensorSnapshot {
     float    moisturePct;        // znormalizowany 0-100%
     uint16_t moistureRaw;        // surowy ADC
-    float    moistureComp;       // po crosstalk compensation
     float    moistureEma;        // po EMA filter
     WaterGuards waterGuards;
-    bool     crosstalkUplift;    // czy kompensacja była aktywna
 };
 
 struct EnvSnapshot {
