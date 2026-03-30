@@ -818,15 +818,33 @@ bool historyStateSave(uint32_t nowMs, const SensorHistory& hist) {
         s_watering[i] = toPersistWatering(nowMs, hist.wateringLog.at(i));
     }
 
-    bool ok = true;
-    ok = ok && (prefs.putBytes("meta", &meta, sizeof(meta)) == sizeof(meta));
-    ok = ok && (prefs.putBytes("lvl2", s_level2, meta.level2Count * sizeof(PersistSensorSample))
-                == meta.level2Count * sizeof(PersistSensorSample));
-    ok = ok && (prefs.putBytes("lvl3", s_level3, meta.level3Count * sizeof(PersistSensorSample))
-                == meta.level3Count * sizeof(PersistSensorSample));
-    ok = ok && (prefs.putBytes("wlog", s_watering, meta.wateringCount * sizeof(PersistWateringRecord))
-                == meta.wateringCount * sizeof(PersistWateringRecord));
+    const size_t metaExpected = sizeof(meta);
+    const size_t lvl2Expected = meta.level2Count * sizeof(PersistSensorSample);
+    const size_t lvl3Expected = meta.level3Count * sizeof(PersistSensorSample);
+    const size_t wlogExpected = meta.wateringCount * sizeof(PersistWateringRecord);
+
+    const size_t metaWritten = prefs.putBytes("meta", &meta, metaExpected);
+    const size_t lvl2Written = prefs.putBytes("lvl2", s_level2, lvl2Expected);
+    const size_t lvl3Written = prefs.putBytes("lvl3", s_level3, lvl3Expected);
+    const size_t wlogWritten = prefs.putBytes("wlog", s_watering, wlogExpected);
+
+    bool ok = metaWritten == metaExpected
+           && lvl2Written == lvl2Expected
+           && lvl3Written == lvl3Expected
+           && wlogWritten == wlogExpected;
     prefs.end();
+
+    if (!ok) {
+        Serial.printf("[HIST] event=nvs_save_detail meta=%u/%u lvl2=%u/%u lvl3=%u/%u wlog=%u/%u\n",
+                      static_cast<unsigned>(metaWritten),
+                      static_cast<unsigned>(metaExpected),
+                      static_cast<unsigned>(lvl2Written),
+                      static_cast<unsigned>(lvl2Expected),
+                      static_cast<unsigned>(lvl3Written),
+                      static_cast<unsigned>(lvl3Expected),
+                      static_cast<unsigned>(wlogWritten),
+                      static_cast<unsigned>(wlogExpected));
+    }
 
     Serial.printf("[HIST] event=nvs_save result=%s level2=%u level3=%u watering=%u\n",
                   ok ? "ok" : "fail",

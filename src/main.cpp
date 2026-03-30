@@ -181,6 +181,17 @@ static void queueTelegramFeedbackFmt(const char* fmt, ...) {
     }
 }
 
+static const char* pumpOwnerName(PumpOwner owner) {
+    switch (owner) {
+        case PumpOwner::AUTO: return "AUTO";
+        case PumpOwner::MANUAL: return "MANUAL";
+        case PumpOwner::REMOTE: return "REMOTE";
+        case PumpOwner::NONE:
+        default:
+            return "NONE";
+    }
+}
+
 static float effectiveTargetForPot(const Config& cfg, uint8_t potIdx) {
     const PlantProfile& prof = getActiveProfile(cfg, potIdx);
     float target = prof.targetMoisturePct;
@@ -511,6 +522,7 @@ static bool forcePumpOffWithRetry(uint8_t potIdx, uint32_t nowMs,
     PumpActuator& pump = g_hardware.pump(potIdx);
     for (uint8_t attempt = 0; attempt < retries; ++attempt) {
         if (pump.off(nowMs, reason)) {
+            g_actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
             return true;
         }
         vTaskDelay(pdMS_TO_TICKS(2));
@@ -573,6 +585,7 @@ static bool startRemoteWateringPulse(uint32_t nowMs,
     WateringCycle cycle{};
     cycle.potIndex = potIdx;
     cycle.phase = WateringPhase::EVALUATING;
+    cycle.source = PumpOwner::REMOTE;
     cycle.maxPulses = 1;
     cycle.pulseDurationMs = static_cast<uint32_t>((potCfg.pulseWaterMl / potCfg.pumpMlPerSec) * 1000.0f);
     if (cycle.pulseDurationMs > g_config.pumpOnMsMax) {
@@ -721,6 +734,8 @@ static void controlTaskFn(void* /*param*/) {
 
     SensorSnapshot snap{};
     bool duskBootstrapped = false;  // one-shot lux-based phase check
+    uint32_t lastFailsafeOffMs[kMaxPots] = {};
+    uint32_t lastUnexpectedPumpLogMs[kMaxPots] = {};
 
     for (;;) {
         uint32_t now = millis();
@@ -731,7 +746,7 @@ static void controlTaskFn(void* /*param*/) {
             // 10ms: odczyt Dual Button, manual pump
             DualButtonState dualBtn = g_hardware.dualButton().read(now);
             SharedState shared = readSharedState();
-            manualPumpTick(now, dualBtn, snap, g_config, g_manual,
+            manualPumpTick(now, dualBtn, snap, g_config, g_manual, g_actuator,
                            shared.selectedPot, g_budget, g_hardware);
         }
 
@@ -790,6 +805,24 @@ static void controlTaskFn(void* /*param*/) {
                     forcePumpOffWithRetry(i, now, "HW_SAFETY_TIMEOUT");
                     Serial.printf("[POT%d] HW_SAFETY: pump forced off after %dms\n",
                                   i, p.onDuration(now));
+                }
+
+                bool cycleOwnsPump = g_cycles[i].phase == WateringPhase::PULSE;
+                bool manualOwnsPump = g_manual.blueOwnsPump && g_manual.activePot == i;
+                bool legalContext = cycleOwnsPump || manualOwnsPump;
+
+                if (!legalContext && (now - lastFailsafeOffMs[i]) >= 1000) {
+                    lastFailsafeOffMs[i] = now;
+                    forcePumpOffWithRetry(i, now, "FAILSAFE_IDLE_OFF");
+                }
+
+                if (!legalContext && p.isOn() && (now - lastUnexpectedPumpLogMs[i]) >= 2000) {
+                    lastUnexpectedPumpLogMs[i] = now;
+                    Serial.printf("[POT%d] PUMP_UNEXPECTED_ON_CONTEXT owner=%s phase=%d manual=%d\n",
+                                  i,
+                                  pumpOwnerName(g_actuator.currentPumpOwner[i]),
+                                  static_cast<int>(g_cycles[i].phase),
+                                  manualOwnsPump ? 1 : 0);
                 }
             }
 
@@ -929,6 +962,10 @@ static void controlTaskFn(void* /*param*/) {
                     Serial.printf("[POT%d] raw=%d pct=%.1f%% ema=%.1f%% phase=%s\n",
                                   i, ps.moistureRaw,
                                   ps.moisturePct, ps.moistureEma, phaseStr);
+                    Serial.printf("[POT%d] pump_owner=%s manual_lock=%s\n",
+                                  i,
+                                  pumpOwnerName(g_actuator.currentPumpOwner[i]),
+                                  g_manual.locked ? "YES" : "no");
 
                     if (cyc.phase == WateringPhase::IDLE && g_config.mode == Mode::AUTO) {
                         const PlantProfile& pr = getActiveProfile(g_config, i);

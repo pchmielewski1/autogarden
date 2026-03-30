@@ -56,6 +56,13 @@ enum class WateringFeedbackCode : uint8_t {
     CYCLE_DONE_GENERIC,
 };
 
+enum class PumpOwner : uint8_t {
+    NONE = 0,
+    AUTO,
+    MANUAL,
+    REMOTE,
+};
+
 // ---------------------------------------------------------------------------
 // WateringCycle — kontekst jednego cyklu per-pot
 // PLAN.md → "Kontekst jednego cyklu podlewania"
@@ -72,6 +79,7 @@ struct WateringCycle {
     float    moistureAfterLastSoak  = 0.0f;
     uint32_t totalPumpedMs   = 0;
     float    totalPumpedMl   = 0.0f;
+    PumpOwner source         = PumpOwner::AUTO;
 
     void reset() { *this = WateringCycle{}; }
 };
@@ -99,6 +107,7 @@ struct WaterBudget {
 struct ManualState {
     uint32_t blueHeldMs       = 0;     // timestamp wciśnięcia (0 = nie wciśnięty)
     bool     blueOwnsPump     = false; // true jeśli manual uruchomił pompę
+    uint8_t  activePot        = 0xFF;  // pot controlled by manual button
     bool     locked           = false;
     uint32_t lockUntilMs      = 0;
 
@@ -144,6 +153,7 @@ struct ScheduleResult {
 struct ActuatorState {
     uint32_t lastPumpStopAtMs[kMaxPots] = {};
     uint32_t lastCycleDoneMs[kMaxPots]  = {};
+    PumpOwner currentPumpOwner[kMaxPots] = {};
     uint32_t lastFeedbackSeq[kMaxPots]  = {};
     WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
     float    lastFeedbackValue1[kMaxPots] = {};
@@ -199,6 +209,7 @@ void manualPumpTick(uint32_t nowMs,
                     const SensorSnapshot& sensors,
                     const Config& cfg,
                     ManualState& manual,
+                    ActuatorState& actuator,
                     uint8_t selectedPot,
                     WaterBudget& budget,
                     HardwareManager& hw);

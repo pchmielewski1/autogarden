@@ -17,6 +17,7 @@
 #include "hardware.h"
 #include <Wire.h>
 #include <Arduino.h>
+#include <cstring>
 #include "log_serial.h"
 
 #define Serial AGSerial
@@ -475,6 +476,9 @@ bool PumpActuator::off(uint32_t nowMs, const char* reason) {
     }
     uint32_t dur = _isOn ? (nowMs - _onSinceMs) : 0;
     _isOn = false;
+    if (!_isOn && reason && strcmp(reason, "FAILSAFE_IDLE_OFF") == 0 && dur == 0) {
+        return true;
+    }
     Serial.printf("[PUMP] CH%d.pin%d OFF reason=%s duration=%dms\n",
                   _channel, _pin, reason ? reason : "none", dur);
     return true;
@@ -498,24 +502,66 @@ void DualButton::init(PbHubBus* bus, uint8_t channel, uint8_t bluePin, uint8_t r
 
 DualButtonState DualButton::read(uint32_t nowMs) {
     DualButtonState s;
-    s.bluePressed = false;
-    s.redPressed  = false;
     if (!_bus) return s;
 
     auto blue = _bus->digitalRead(_channel, _bluePin);
     auto red  = _bus->digitalRead(_channel, _redPin);
-    // Active LOW — wciśnięty = LOW = false w digitalRead
-    s.bluePressed = blue.ok() && !blue.value;
-    s.redPressed  = red.ok()  && !red.value;
+    s.blueOk = blue.ok();
+    s.redOk = red.ok();
+    s.blueRawPressed = blue.ok() && !blue.value;
+    s.redRawPressed = red.ok() && !red.value;
+
+    auto updateStableState = [](bool ok,
+                                bool rawPressed,
+                                bool& lastRawPressed,
+                                bool& stablePressed,
+                                uint8_t& stableSamples,
+                                bool& stable) {
+        if (!ok) {
+            stableSamples = 0;
+            stablePressed = false;
+            stable = false;
+            return;
+        }
+
+        if (rawPressed == lastRawPressed) {
+            if (stableSamples < DualButton::kStableSampleThreshold) {
+                stableSamples++;
+            }
+        } else {
+            lastRawPressed = rawPressed;
+            stableSamples = 1;
+        }
+
+        stable = stableSamples >= DualButton::kStableSampleThreshold;
+        if (stable) {
+            stablePressed = rawPressed;
+        }
+    };
+
+    updateStableState(s.blueOk, s.blueRawPressed,
+                      _blueLastRawPressed, _blueStablePressed,
+                      _blueStableSamples, s.blueStable);
+    updateStableState(s.redOk, s.redRawPressed,
+                      _redLastRawPressed, _redStablePressed,
+                      _redStableSamples, s.redStable);
+
+    s.bluePressed = s.blueStable ? _blueStablePressed : false;
+    s.redPressed = s.redStable ? _redStablePressed : false;
+    s.unstable = !s.blueOk || !s.redOk
+              || (s.blueRawPressed != s.bluePressed)
+              || (s.redRawPressed != s.redPressed);
 
     // Diagnostyka co 2s (nie spamuj co 10ms)
     static uint32_t lastDbg = 0;
-    if (nowMs - lastDbg > 2000 && (s.bluePressed || s.redPressed || !blue.ok() || !red.ok())) {
+    if (nowMs - lastDbg > 2000
+        && (s.bluePressed || s.redPressed || s.unstable || !blue.ok() || !red.ok())) {
         lastDbg = nowMs;
-        Serial.printf("[DBTN] CH%d blue: ok=%d val=%d pressed=%d | red: ok=%d val=%d pressed=%d\n",
+        Serial.printf("[DBTN] CH%d blue: ok=%d raw=%d stable=%d pressed=%d | red: ok=%d raw=%d stable=%d pressed=%d unstable=%d\n",
                       _channel,
-                      blue.ok(), blue.value, s.bluePressed,
-                      red.ok(), red.value, s.redPressed);
+                      s.blueOk, s.blueRawPressed, s.blueStable, s.bluePressed,
+                      s.redOk, s.redRawPressed, s.redStable, s.redPressed,
+                      s.unstable);
     }
     return s;
 }
@@ -704,6 +750,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     // Throttled I2C failure logging (max every 10s)
     static uint32_t s_lastFailLogMs = 0;
     static uint16_t s_failCountSoil[kMaxPots] = {};
+    static uint16_t s_invalidCountSoil[kMaxPots] = {};
     static uint16_t s_zeroCountSoil[kMaxPots] = {};
     static uint16_t s_lastValidSoilRaw[kMaxPots] = {};
     static bool s_hasValidSoilRaw[kMaxPots] = {};
@@ -713,6 +760,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     static uint16_t s_failCountBaro = 0;
     static uint16_t s_failCountRes = 0;
     static uint32_t s_lastSoilWarnMs[kMaxPots] = {};
+    static constexpr uint16_t kMaxPbHubAdcRaw = 4095;
 
     if (!resState.ok()) s_failCountRes++;
 
@@ -731,10 +779,20 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
 
         // Moisture ADC
         auto rawResult = _soilSensors[i].readRaw(nowMs);
-        if (rawResult.ok() && rawResult.value > 0) {
+        if (rawResult.ok() && rawResult.value > 0 && rawResult.value <= kMaxPbHubAdcRaw) {
             snap.pots[i].moistureRaw = rawResult.value;
             s_lastValidSoilRaw[i] = rawResult.value;
             s_hasValidSoilRaw[i] = true;
+        } else if (rawResult.ok() && rawResult.value > kMaxPbHubAdcRaw) {
+            s_invalidCountSoil[i]++;
+            snap.pots[i].moistureRaw = s_hasValidSoilRaw[i]
+                ? s_lastValidSoilRaw[i]
+                : potCfg.soilCalib.rawDry;
+            if ((nowMs - s_lastSoilWarnMs[i]) >= 10000) {
+                s_lastSoilWarnMs[i] = nowMs;
+                Serial.printf("[POT%d] MOISTURE_RAW_INVALID raw=%u fallback_raw=%d\n",
+                              i, rawResult.value, snap.pots[i].moistureRaw);
+            }
         } else if (!rawResult.ok()) {
             // Preserve last valid value to avoid false 100% from raw=0 fallback
             s_failCountSoil[i]++;
@@ -782,7 +840,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
         // M5Stack Watering Unit U101: pin0=PUMP_EN, pin1=AOUT
         // If raw stays at fallback for long, print a clear hint.
         static uint16_t s_rawFallbackCount[kMaxPots] = {};
-        if (!rawResult.ok() || rawResult.value == 0) {
+        if (!rawResult.ok() || rawResult.value == 0 || rawResult.value > kMaxPbHubAdcRaw) {
             s_rawFallbackCount[i]++;
         } else {
             s_rawFallbackCount[i] = 0;
@@ -859,8 +917,8 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
             for (uint8_t fi = 0; fi < cfg.numPots; ++fi) {
                 if (pos > 0 && pos < static_cast<int>(sizeof(summary))) {
                     pos += snprintf(summary + pos, sizeof(summary) - pos,
-                                    " soil%u=%u soil%u_zero=%u ovf%u=%u",
-                                    fi, s_failCountSoil[fi], fi, s_zeroCountSoil[fi],
+                                    " soil%u=%u soil%u_invalid=%u soil%u_zero=%u ovf%u=%u",
+                                    fi, s_failCountSoil[fi], fi, s_invalidCountSoil[fi], fi, s_zeroCountSoil[fi],
                                     fi, s_failCountOverflow[fi]);
                 }
             }
@@ -869,6 +927,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
         s_failCountRes = s_failCountEnv = s_failCountLux = s_failCountBaro = 0;
         for (uint8_t fi = 0; fi < kMaxPots; ++fi) {
             s_failCountSoil[fi] = s_failCountOverflow[fi] = 0;
+            s_invalidCountSoil[fi] = 0;
             s_zeroCountSoil[fi] = 0;
         }
         s_lastFailLogMs = nowMs;

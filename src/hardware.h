@@ -210,8 +210,15 @@ private:
 // DualButton — odczyt Dual Button na CH5 PbHUB (IN/IN mode)
 // ---------------------------------------------------------------------------
 struct DualButtonState {
-    bool bluePressed;   // pin A (niebieski) — active LOW
-    bool redPressed;    // pin B (czerwony)  — active LOW
+    bool bluePressed = false;      // stabilized press state
+    bool redPressed = false;       // stabilized press state
+    bool blueRawPressed = false;   // single-sample raw state
+    bool redRawPressed = false;    // single-sample raw state
+    bool blueStable = false;       // enough consecutive samples collected
+    bool redStable = false;        // enough consecutive samples collected
+    bool blueOk = false;           // transport-level read success
+    bool redOk = false;            // transport-level read success
+    bool unstable = false;         // any line is unstable / failed
 };
 
 class DualButton {
@@ -224,6 +231,14 @@ private:
     uint8_t   _channel = 5;
     uint8_t   _bluePin = 0;
     uint8_t   _redPin  = 1;
+    bool      _blueLastRawPressed = false;
+    bool      _redLastRawPressed = false;
+    bool      _blueStablePressed = false;
+    bool      _redStablePressed = false;
+    uint8_t   _blueStableSamples = 0;
+    uint8_t   _redStableSamples = 0;
+
+    static constexpr uint8_t kStableSampleThreshold = 4;
 };
 
 // ---------------------------------------------------------------------------
