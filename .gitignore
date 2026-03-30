@@ -6,7 +6,8 @@
 !.vscode/extensions.json
 
 # Internal docs (design notes, firmware references, hardware journals)
-docs/
+docs/*
+!docs/PLAN.md
 
 # Agent/AI session notes
 agent.md
