@@ -11,6 +11,9 @@ docs/
 # Agent/AI session notes
 agent.md
 
+# Local runtime logs
+logs/
+
 # OS junk
 .DS_Store
 Thumbs.db
