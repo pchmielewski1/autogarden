@@ -55,10 +55,6 @@ bool configValidate(const Config& cfg) {
             Serial.printf("[CONFIG] FAIL: pots[%d].pumpMlPerSec=%.2f\n", i, pot.pumpMlPerSec);
             ok = false;
         }
-        if (pot.soilCalib.rawDry == pot.soilCalib.rawWet) {
-            Serial.printf("[CONFIG] FAIL: pots[%d].soilCalib dry==wet\n", i);
-            ok = false;
-        }
         if (pot.moistureEmaAlpha <= 0.0f || pot.moistureEmaAlpha > 1.0f) {
             Serial.printf("[CONFIG] FAIL: pots[%d].moistureEmaAlpha=%.2f\n", i, pot.moistureEmaAlpha);
             ok = false;

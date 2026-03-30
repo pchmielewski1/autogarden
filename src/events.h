@@ -57,7 +57,6 @@ enum class EventType : uint8_t {
     // --- Config requests (UI/NET → ControlTask) ---
     REQUEST_SET_MODE,
     REQUEST_SET_PLANT,
-    REQUEST_SET_SOIL_CALIB,
     REQUEST_MANUAL_WATER,
     REQUEST_PUMP_OFF,
     REQUEST_REFILL,

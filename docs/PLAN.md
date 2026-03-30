@@ -55,7 +55,7 @@ Uwagi:
 Konceptualne struktury danych (pseudotypy):
 - `SensorSnapshot`:
   - `soilMoistureRaw`          // surowy ADC z PbHUB
-  - `soilMoisturePct`          // znormalizowany 0-100% (z soilRaw + soilCalib)
+  - `soilMoisturePct`          // znormalizowany 0-100% (z soilRaw, bez per-pot kalibracji)
   - `waterGuards`:
     - `potMax` (np. OK / TRIGGERED / UNKNOWN) — max poziom wody w doniczce (anti-overflow)
     - `reservoirMin` (np. OK / TRIGGERED / UNKNOWN) — min poziom wody w rezerwuarze (anti-dry-run)
@@ -71,7 +71,6 @@ Konceptualne struktury danych (pseudotypy):
   - `pumpOnMsMax`, `cooldownMs`
   - `pumpMlPerSec` (z kalibracji pompy)
   - `antiOverflowEnabled` + progi
-  - `sensorCalibration` (opcjonalnie: min/max dla wilgotności)
   - `potMaxActiveLow` (bool, domyślnie true), `reservoirMinActiveLow` (bool, domyślnie false)
   - pełna lista pól → sekcja „Zaktualizowana struktura Config (pełna)"
 - `SystemStatus`:
@@ -173,6 +172,15 @@ evaluateSafety(nowMs, sensors, config, actuatorState):
   return { ok: true }
 ```
 
+### Dodatkowe zabezpieczenia zaimplementowane po incydentach runtime
+
+- **Pump owner tracking**: runtime śledzi właściciela każdej pompy (`AUTO`, `MANUAL`, `REMOTE`, `NONE`).
+- **Failsafe OFF poza legalnym kontekstem**: jeśli pompa jest fizycznie `ON`, ale nie ma aktywnego
+  cyklu `PULSE` ani ważnego manual hold, `ControlTask` okresowo wymusza `OFF` i loguje
+  `PUMP_UNEXPECTED_ON_CONTEXT`.
+- **Fail-closed dla wejść manualnych**: niestabilny stan Dual Button nie może uruchomić pompy;
+  jeśli pompa już działa manualnie, zostaje natychmiast wyłączona.
+
 ## Scheduler ticków (bez blokowania)
 
 Zamiast `delay()`:
@@ -227,11 +235,6 @@ NetTask:
 
 ## Warstwa konfiguracji — dekompozycja (walidacja, wersjonowanie, zapis async)
 
-### Cele
-- `Config` to jedyne źródło prawdy dla domeny (progi, czasy, tryby, polityki bezpieczeństwa).
-- Zmiana configu nie może blokować sterowania (ControlTask).
-- Konfiguracja przetrwa restart i ma być odporna na błędy (walidacja, migracje).
-
 ### Podział odpowiedzialności
 - `ConfigModel` (domena): struktura `Config` + zasady walidacji + domyślne wartości.
 - `ConfigStore` (persist): zapis/odczyt do Preferences/EEPROM + wersjonowanie.
@@ -250,8 +253,6 @@ struct PotConfig {
   uint8  plantProfileIndex = 0      // profil rośliny (0=Pomidor, ..., 5=Custom)
   float  pumpMlPerSec = 0           // z kalibracji pompy (0 = nie skalibrowana)
   bool   pumpCalibrated = false
-  struct SoilCalib { uint16 rawDry; uint16 rawWet; }
-  SoilCalib soilCalib               // per-pot kalibracja (różna ziemia, różny sensor)
   bool   potMaxActiveLow = true     // per-pot — overflow sensor polaryzacja
   float  moistureEmaAlpha = 0.1     // per-pot — EMA alpha
 }
@@ -323,7 +324,6 @@ validate(config):
     assert pot.enabled == true          // aktywna doniczka musi być enabled
     assert pot.plantProfileIndex < NUM_PROFILES
     assert pot.pumpMlPerSec >= 0        // 0 = nie skalibrowana (blokuje AUTO)
-    assert pot.soilCalib.rawDry != pot.soilCalib.rawWet
     assert pot.moistureEmaAlpha > 0 and <= 1.0
   // Globalne
   assert pumpOnMsMax > 0
@@ -412,7 +412,6 @@ ControlTask:
 - Domyślnie: `antiOverflowEnabled = true`.
 - `waterLevelUnknownPolicy = BLOCK`.
 - Konserwatywne `pumpOnMsMax` i sensowny `cooldownMs`.
-- Jeśli nie ma kalibracji (`rawDry/rawWet`) → sensor health = WARN/FAIL i domena może zablokować AUTO.
 
 ### Spec eventów konfiguracji (REQUEST/ACK)
 Cel: UI/NET nie modyfikuje `Config` bezpośrednio — wysyła żądanie, a domena odpowiada ACK/ERR.
@@ -441,7 +440,6 @@ Minimalny zestaw (warto trzymać mały):
 - `REQUEST_SET_COOLDOWN(ms)`
 - `REQUEST_SET_ANTIOVERFLOW(enabled)`
 - `REQUEST_SET_WATERLEVEL_UNKNOWN_POLICY(policy)`
-- `REQUEST_SET_SOIL_CALIB(rawDry, rawWet)`
 - `REQUEST_SAVE_CONFIG_NOW()` (wymuszenie natychmiastowego zapisu; normalnie zapis jest debounce)
 - `REQUEST_FACTORY_RESET_CONFIG()`
 
@@ -553,23 +551,25 @@ struct NetConfig {               // persisted w NVS (namespace "ag_net")
 ### Telegram — źródła konfiguracji i precedencja
 
 ```
-resolveTelegramConfig(netCfg):
-  // 1. Start od NVS (captive portal / runtime config)
-  final.botName  = netCfg.telegramBotName
-  final.botToken = netCfg.telegramBotToken
-  final.chatIds  = netCfg.telegramChatIds
+bootSequence():
+  netCfg = netConfigLoad()
+  applyLocalTelegramConfig(netCfg)
 
-  // 2. Jeśli pole puste, uzupełnij lokalnym configiem z include/telegram_local_config.h
-  if empty(final.botName):
-    final.botName = AG_TELEGRAM_BOT_NAME
-  if empty(final.botToken):
-    final.botToken = AG_TELEGRAM_BOT_TOKEN
-  if empty(final.chatIds):
-    final.chatIds = normalizeChatIdList(AG_TELEGRAM_CHAT_IDS)
+applyLocalTelegramConfig(netCfg):
+  configuredName = netCfg.telegramBotName
+  if empty(configuredName):
+    configuredName = AG_TELEGRAM_BOT_NAME
 
-  // 3. Telegram aktywny tylko gdy token i co najmniej jeden chat_id są ustawione
-  final.enabled = not empty(final.botToken) and hasAnyChatId(final.chatIds)
-  return final
+  if localTelegramSecretsAvailable():
+    if empty(netCfg.telegramBotName):
+      netCfg.telegramBotName = AG_TELEGRAM_BOT_NAME
+    if empty(netCfg.telegramBotToken):
+      netCfg.telegramBotToken = AG_TELEGRAM_BOT_TOKEN
+    if empty(netCfg.telegramChatIds):
+      netCfg.telegramChatIds = normalizeChatIdList(AG_TELEGRAM_CHAT_IDS)
+
+  netState.telegramEnabled = not empty(netCfg.telegramBotToken)
+                          and hasAnyChatId(netCfg.telegramChatIds)
 ```
 
 ### Stany provisioning (FSM)
@@ -578,65 +578,80 @@ resolveTelegramConfig(netCfg):
 enum ProvisioningState {
   BOOT_CHECK,        // sprawdź NVS: czy jest zapisany config?
   AP_MODE,           // brak configu lub factory reset → rozgłaszaj AP + captive portal
-  WIFI_CONNECTING,   // credenciale zapisane → próba połączenia (max 3 retry)
-  WIFI_CONNECTED,    // połączono → normalna praca (przejdź do ControlTask/NetTask)
-  WIFI_FAILED,       // 3 nieudane próby → fallback do AP_MODE
+  WIFI_CONNECTING,   // stan logiczny: STA connect / reconnect wykonywany w tle przez NetTask
+  WIFI_CONNECTED,    // STA połączone; AP może nadal działać równolegle w AP+STA
+  WIFI_FAILED,       // stan przejściowy / diagnostyczny; runtime używa reconnect z backoff zamiast twardego abortu po 3 próbach
 }
 ```
 
 ### Pseudokod provisioning
 
 ```
-provisioningEntry():
+setup():
   netCfg = NVS.load("ag_net", NetConfig)
+  applyLocalTelegramConfig(netCfg)
 
-  // === BOOT CHECK ===
   if netCfg.provisioned and len(netCfg.wifiSsid) > 0:
-    goto WIFI_CONNECTING
+    WiFi.mode(WIFI_STA)
+    WiFi.begin(netCfg.wifiSsid, netCfg.wifiPass)
+    log("BOOT quick WiFi begin; retries handled later by NetTask")
   else:
-    goto AP_MODE
+    log("BOOT offline mode; WiFi not provisioned")
 
-AP_MODE:
-  log("PROV state=AP_MODE")
-  WiFi.mode(WIFI_AP)
-  WiFi.softAP("autogarden", "")              // open, no password
+netTaskInit(netCfg, netState):
+  netState.wifiConnected = (WiFi.status() == WL_CONNECTED)
+  netState.telegramEnabled = hasTokenAndChatIds(netCfg)
+
+  if !netCfg.provisioned or len(netCfg.wifiSsid) == 0:
+    startApNonBlocking(netCfg, netState)
+
+startApNonBlocking(netCfg, netState):
+  keepSta = netState.wifiConnected or (netCfg.provisioned and len(netCfg.wifiSsid) > 0)
+  WiFi.mode(keepSta ? WIFI_AP_STA : WIFI_AP)
+  WiFi.softAP("autogarden", "")
   WiFi.softAPConfig(192.168.4.1, 192.168.4.1, 255.255.255.0)
-  dnsServer.start(53, "*", 192.168.4.1)      // captive portal: all DNS → us
-  mdns.begin("autogarden")                    // autogarden.local backup
-  webServer.on("/",        handleRoot)        // formularz HTML
-  webServer.on("/scan",    handleScan)        // GET: lista sieci JSON
-  webServer.on("/save",    handleSave)        // POST: zapisz config
-  webServer.onNotFound(handleRoot)            // captive portal redirect
+  dnsServer.start(53, "*", 192.168.4.1)
+  mdns.begin("autogarden")
+  webServer.on("/", handleRoot)
+  webServer.on("/scan", handleScan)
+  webServer.on("/save", HTTP_POST, handleSave)
+  webServer.on("/skip", handleSkipWifi)
+  webServer.on(captivePortalPaths..., handleRoot)
+  webServer.onNotFound(handleRoot)
   webServer.begin()
+  netState.apActive = true
+  netState.apNoClientSinceMs = millis()
 
-  // Wyświetl na LCD StickS3:
-  display.clear()
-  display.print("WiFi Setup Mode")
-  display.print("Connect to: autogarden")
-  display.print("Open: http://192.168.4.1")
+apTick(netState):
+  dnsServer.processNextRequest()
+  webServer.handleClient()
+  if WiFi.softAPgetStationNum() > 0:
+    netState.apNoClientSinceMs = millis()
+  if millis() - netState.apNoClientSinceMs >= 5 min:
+    stopAp(netState)
 
-  apNoClientSinceMs = millis()  // timer auto-off AP
-  AP_AUTO_OFF_MS    = 5 * 60 * 1000  // 5 minut
+netTaskTick(nowMs, netState, netCfg):
+  if netState.apActive:
+    apTick(netState)
+    if !netCfg.provisioned or len(netCfg.wifiSsid) == 0:
+      return
 
-  while (state == AP_MODE):
-    dnsServer.processNextRequest()
-    webServer.handleClient()
-    M5.update()
+  if !netCfg.provisioned or len(netCfg.wifiSsid) == 0:
+    netState.wifiConnected = false
+    return
 
-    // --- AP auto-off: wyłącz AP po 5 min bez klienta ---
-    if WiFi.softAPgetStationNum() > 0:
-      apNoClientSinceMs = millis()          // reset timer gdy ktoś podłączony
-    elif (millis() - apNoClientSinceMs) >= AP_AUTO_OFF_MS:
-      log("AP auto-off: no client for 5 min, stopping AP")
-      WiFi.softAPdisconnect(true)
-      display.clear()
-      display.print("AP timeout (5 min)")
-      display.print("No client connected")
-      display.print("Restarting...")
-      delay(2000)
-      ESP.restart()   // restart → BOOT_CHECK → jeśli dalej brak config → AP_MODE ponownie
+  if WiFi.status() != WL_CONNECTED:
+    netState.wifiConnected = false
+    if backoffExpired(nowMs, netState.reconnectBackoffMs):
+      WiFi.disconnect()
+      WiFi.begin(netCfg.wifiSsid, netCfg.wifiPass)
+      netState.reconnectAttempts += 1
+      netState.reconnectBackoffMs = min(netState.reconnectBackoffMs * 2, 5 min)
+    return
 
-    delay(1)   // yield; nie blokuje długo — AP_MODE to jednorazowy setup
+  netState.wifiConnected = true
+  netState.reconnectAttempts = 0
+  netState.reconnectBackoffMs = 5 s
 
 handleRoot():
   webServer.send_P(200, "text/html", PROVISIONING_HTML)
@@ -647,18 +662,30 @@ handleScan():
   webServer.send(200, "application/json", json)
 
 handleSave():
-  ssid     = webServer.arg("ssid")
-  pass     = webServer.arg("pass")
-  botName  = webServer.arg("bot_name")      // opcjonalny
-  botToken = webServer.arg("bot_token")     // opcjonalny
-  chatIds  = normalizeChatIdList(webServer.arg("chat_ids"))
+  ssid     = sanitizeInput(webServer.arg("ssid"), 32)
+  pass     = sanitizeInput(webServer.arg("pass"), 64)
+  botName  = sanitizeInput(webServer.arg("bot_name"), 63)
+  botToken = sanitizeInput(webServer.arg("bot_token"), 63)
+  chatIds  = normalizeChatIdList(webServer.arg("chat_ids"), 127)
 
   if len(ssid) == 0:
     webServer.send(400, "text/plain", "SSID required")
     return
 
+  if len(pass) > 0 and len(pass) < 8:
+    webServer.send(400, "text/plain", "Password min 8 chars (WPA)")
+    return
+
   if (len(botToken) > 0 or len(chatIds) > 0 or len(botName) > 0) and len(botName) == 0:
     webServer.send(400, "text/plain", "Bot name required when Telegram is configured")
+    return
+
+  if chatIds not empty and !isValidChatIdList(chatIds):
+    webServer.send(400, "text/plain", "Chat IDs must be numeric (comma separated)")
+    return
+
+  if !isValidBotToken(botToken):
+    webServer.send(400, "text/plain", "Invalid bot token format")
     return
 
   netCfg.wifiSsid = ssid
@@ -667,57 +694,12 @@ handleSave():
   netCfg.telegramBotToken = botToken
   netCfg.telegramChatIds = chatIds
   netCfg.provisioned = true
+  netCfg.schemaVersion = kNetConfigSchema
   NVS.save("ag_net", netCfg)
 
   webServer.send(200, "text/html", SUCCESS_HTML)   // "Saved! Restarting..."
   delay(1000)
   ESP.restart()
-
-WIFI_CONNECTING:
-  log("PROV state=WIFI_CONNECTING ssid=%s", netCfg.wifiSsid)
-  WiFi.mode(WIFI_STA)
-
-  for attempt in 1..3:
-    WiFi.begin(netCfg.wifiSsid, netCfg.wifiPass)
-
-    // Wyświetl na LCD:
-    display.print("Connecting WiFi (%d/3)...", attempt)
-
-    deadline = millis() + 15000   // 15s timeout per attempt
-    while WiFi.status() != WL_CONNECTED and millis() < deadline:
-      delay(100)
-      M5.update()
-
-    if WiFi.status() == WL_CONNECTED:
-      log("PROV state=WIFI_CONNECTED ip=%s", WiFi.localIP())
-      display.print("WiFi OK: %s", WiFi.localIP())
-      goto WIFI_CONNECTED
-    else:
-      log("PROV wifi_attempt=%d failed status=%d", attempt, WiFi.status())
-      WiFi.disconnect()
-      delay(1000)
-
-  // trzy nieudane próby
-  log("PROV state=WIFI_FAILED after 3 attempts")
-  goto WIFI_FAILED
-
-WIFI_CONNECTED:
-  // WiFi działa — uruchom normalne taski
-  mdns.begin("autogarden")
-  startControlTask()
-  startUiTask()
-  startNetTask()    // Telegram + HTTP API
-  return            // provisioning zakończony
-
-WIFI_FAILED:
-  log("PROV fallback to AP_MODE")
-  // Wyświetl komunikat na LCD, potem przejdź do AP
-  display.print("WiFi FAILED!")
-  display.print("Entering setup mode...")
-  delay(2000)
-  netCfg.provisioned = false    // wymuś ponowny setup
-  NVS.save("ag_net", netCfg)
-  ESP.restart()                 // restart → BOOT_CHECK → AP_MODE
 ```
 
 ### Factory Reset — przywrócenie domyślnych
@@ -1798,6 +1780,22 @@ estimateNextDusk(detector, clock):
   Jeśli firmware PbHUB v1.1 nie wspiera trybu IN/IN, alternatywa: odczyt analogowy obu pinów
   (LOW < ~500, HIGH > ~3500) lub podłączenie Dual Button bezpośrednio do GPIO StickS3 (Port.A).
 
+### Dual Button — hardening wdrożony po fałszywych aktywacjach
+
+- Odczyt przycisków nie jest już traktowany jako pojedyncza próbka prawdy.
+- Stan `pressed` powstaje dopiero po kilku kolejnych zgodnych próbkach (`kStableSampleThreshold = 4`).
+- Runtime rozróżnia:
+  - `rawPressed` — chwilowy odczyt z PbHUB,
+  - `stable` — czy uzyskano wystarczającą liczbę zgodnych próbek,
+  - `pressed` — dopiero ustabilizowany stan używany przez domenę,
+  - `unstable` — błąd transportu lub rozjazd raw vs stable.
+- `unstable == true` powoduje zachowanie fail-closed:
+  - brak startu manualnego podlewania,
+  - natychmiastowy stop pompy, jeśli była trzymana ręcznie,
+  - log diagnostyczny `MANUAL_INPUT_UNSTABLE` / `event=unstable_input`.
+- Manual steruje tylko aktualnie wybraną doniczką i pamięta `activePot`, żeby nie zgubić kontekstu
+  przy puszczeniu przycisku albo lockoucie.
+
 ```
 // Dual Button na CH5 PbHUB: niebieski (pin A) i czerwony (pin B)
 // Niebieski: manualny tryb pompy (trzymaj = pompuj wybraną doniczkę)
@@ -1879,6 +1877,13 @@ manualPumpTick(nowMs, dualBtn, snapshot, config, selectedPot):
     manualState.lockUntilMs = nowMs + 60000
     log("MANUAL_BLOCK reason=button_spam count=%d", manualState.pressHistory.count)
 ```
+
+### Manual pump — dodatkowe reguły runtime
+
+- `UNKNOWN` na overflow sensorze traktowany jest tak samo konserwatywnie jak `TRIGGERED`
+  dla manualnego podlewania: blokada i lockout.
+- Manualne uruchomienie ustawia właściciela pompy na `MANUAL`; każde `OFF` lub blokada czyści owner.
+- Red button nadal robi emergency stop wszystkich pomp, ale runtime dodatkowo czyści owner i aktywną doniczkę.
 
 ---
 
@@ -2296,7 +2301,7 @@ W sensorTick:
 if sensorHealth == OK:
   moistureRaw = PbHubBus.analogRead(...)
   moistureEma = emaUpdate(moistureFilter, moistureRaw, nowMs)
-  moisturePct = normalizeSoil(moistureEma, ...)
+  moisturePct = normalizeSoil(moistureEma)
 else:
   // Sensor offline — nie aktualizuj EMA, zachowaj ostatnią wartość
   log("SENSOR_OFFLINE — EMA frozen at %.1f", moistureFilter.value)
@@ -2332,189 +2337,141 @@ inline i prowadzą cały dalszy flow.
 - wydzielone submenu konfiguracji,
 - zastąpienie niepewnego TLS przez pinned CA / walidację certyfikatu.
 
+
+Aktualna implementacja nie ma jeszcze ogólnego `NotificationService` z `NotificationType`
+i wspólną `notificationQueue`. Stan faktyczny jest prostszy i składa się z dwóch
+oddzielnych ścieżek outbound:
+
+- `s_tgFeedbackQueue` — krótka kolejka tekstowych komunikatów z `ControlTask` do
+  `NetTask`, używana dla start/stop cyklu, safety block/unblock, refill, mode change
+  i komunikatów o WiFi portal.
+- heartbeat dzienny generowany bezpośrednio w `NetTask` przez `isDailyHeartbeatTime()`
+  i `formatDailyReport()`.
+
+Dedykowana deduplikacja i pełny model typów powiadomień pozostają przyszłym etapem,
+a nie opisem obecnego kodu.
+
 ```
-enum NotificationType {
-  // Krytyczne (wysyłaj natychmiast)
-  RESERVOIR_EMPTY,
-  RESERVOIR_LOW,
-  SENSOR_FAIL,
-  OVERFLOW_STUCK,
-  ANOMALY_FAST_DRYING,
+queueTelegramFeedbackFmt(fmt, ...):
+  if feedbackQueue full:
+    log("[TG] feedback_drop reason=queue_full")
+    return
+  feedbackQueue.push(formattedText)
 
-  // Informacyjne (wysyłaj z throttlingiem)
-  WATERING_DONE,
-  RESERVOIR_REFILLED,
-  RESERVOIR_WARNING,      // "woda na ~2 dni"
-  SAFETY_BLOCK,
-  SAFETY_UNBLOCK,
+NetTask loop:
+  netTaskTick(nowMs, netState, netCfg)
 
-  // Periodic (raz dziennie)
-  DAILY_HEARTBEAT,
-}
+  if wifiConnected and telegramEnabled:
+    while feedbackQueue has message:
+      telegramSend(message, netCfg, maxRetries=2, backoffMs=250)
 
-// --- isDailyHeartbeatTime() ---
-// Strategia: używa SolarClock (dawn estimate + offset) jeśli skalibrowany,
-// inaczej fallback 24h od ostatniego heartbeatu.
+    if isDailyHeartbeatTime(nowMs, solarClock, duskDetector, netState):
+      report = formatDailyReport(sensors, budget, trends, config, uptimeMs)
+      telegramSend(report, netCfg)
+```
 
-static uint32 lastHeartbeatMs = 0
-static bool   heartbeatSentToday = false
+### Heartbeat dzienny — stan faktyczny
 
-fn isDailyHeartbeatTime(nowMs: uint32, solarClock: SolarClock, duskDetector: DuskDetector, netState: NetworkState) -> bool:
-  // Debounce — max 1 heartbeat na 20h (ochrona przed podwójnym wysłaniem)
-  if lastHeartbeatMs > 0 and (nowMs - lastHeartbeatMs) < 20 * 3600 * 1000:
+```
+isDailyHeartbeatTime(nowMs, solarClock, duskDetector, netState):
+  if netState.lastHeartbeatMs > 0 and (nowMs - netState.lastHeartbeatMs) < 20h:
     return false
 
-  // Strategia 1: SolarClock — heartbeat 30 min po świcie
   if solarClock.calibrated:
-    estimatedDawn := estimateNextDawn(duskDetector, solarClock)
-    if estimatedDawn != UNKNOWN:
-      heartbeatTarget := estimatedDawn + 30 * 60 * 1000  // dawn + 30min
-      // Okno ±5 min wokół celu (tick co 10s → na pewno złapiemy)
-      if abs((int32)(nowMs - heartbeatTarget)) < 5 * 60 * 1000:
-        if not heartbeatSentToday:
-          heartbeatSentToday = true
-          lastHeartbeatMs = nowMs
-          return true
-      else:
-        // Reset flagi po wyjściu z okna → gotowy na jutro
-        heartbeatSentToday = false
+    estimatedDawn = estimateNextDawn(duskDetector, solarClock, nowMs)
+    if estimatedDawn is known:
+      target = estimatedDawn + 30 min
+      if nowMs in window target ± 5 min and !netState.heartbeatSentToday:
+        netState.heartbeatSentToday = true
+        netState.lastHeartbeatMs = nowMs
+        return true
+      if nowMs outside target window:
+        netState.heartbeatSentToday = false
       return false
 
-  // Strategia 2: fallback — co 24h od ostatniego heartbeatu (lub od boot)
-  if lastHeartbeatMs == 0:
-    // Pierwszy heartbeat — wyślij 5 min po starcie (daj czas na init)
-    if nowMs > 5 * 60 * 1000:
-      lastHeartbeatMs = nowMs
-      return true
-    return false
-  if (nowMs - lastHeartbeatMs) >= 24 * 3600 * 1000:
-    lastHeartbeatMs = nowMs
-    return true
-  return false
+  if netState.lastHeartbeatMs == 0:
+    return nowMs > 5 min
 
-
-// --- formatDailyReport() ---
-// Buduje wiadomość Telegram z podsumowaniem stanu systemu.
-
-fn formatDailyReport(
-    snapshot: SensorSnapshot,    // zawiera snapshot.pots[MAX_POTS]
-    history: HistoryStore,
-    budget: WaterBudget,
-    trendStates: TrendState[MAX_POTS],
-    config: Config
-) -> String:
-
-  // --- Nagłówek ---
-  msg := "🌱 autogarden — raport poranny\n"
-  msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
-
-  // --- Per-pot odczyty ---
-  for potIdx in 0 ..< config.numPots:
-    if not config.pots[potIdx].enabled: continue
-    potCfg  = config.pots[potIdx]
-    potSnap = snapshot.pots[potIdx]
-    profile = PROFILES[potCfg.plantProfileIndex]
-    ts      = trendStates[potIdx]
-
-    potLabel = (config.numPots == 1) ? "" : fmt(" [Doniczka %d: %s]", potIdx+1, profile.name)
-    target = config.vacationMode
-               ? max(profile.targetMoisturePct - config.vacationTargetReductionPct, 5.0)
-               : profile.targetMoisturePct
-
-    msg += fmt("\n%s💧 Wilgotność: %.0f%% (target %.0f%%)\n",
-               potLabel, potSnap.moisturePct, target)
-
-    // Trend per-pot
-    if ts.baselineCalibrated:
-      lastDelta = ts.hourlyDeltas[(ts.headIdx - 1) % 24]
-      msg += fmt("  📈 Trend: %.1f%%/h (baseline: %.1f%%/h)\n",
-                 lastDelta, ts.normalDryingRate)
-      if abs(lastDelta) > abs(ts.normalDryingRate) * config.anomalyDryingRateMultiplier:
-        msg += "  🚨 ANOMALIA — wysychanie szybsze niż normalnie!\n"
-    else:
-      msg += "  📈 Trend: uczę się baseline...\n"
-
-    // Statystyki per-pot z ostatnich 24h
-    stats = history.getLast24hStats(potIdx)
-    msg += fmt("  📊 Cykle: %d, zużycie: ~%dml\n", stats.cycleCount, stats.totalMlUsed)
-
-  // --- Wspólne: env ---
-  msg += fmt("\n🌡 Temperatura: %.1f°C\n", snapshot.env.tempC)
-  msg += fmt("☀️ Światło: %.0f lux\n", snapshot.env.lux)
-
-  // --- Rezerwuar (wspólny) ---
-  daysLeft := budget.reservoirCurrentMl / budget.dailyUsageMlEstimate
-  msg += fmt("\n🪣 Rezerwuar: ~%dml (~%.1f dni)\n",
-             (int)budget.reservoirCurrentMl, daysLeft)
-  if config.numPots > 1:
-    msg += fmt("  Zużycie: pot1=%.0fml pot2=%.0fml (od refill)\n",
-               budget.totalPumpedMlPerPot[0], budget.totalPumpedMlPerPot[1])
-  if daysLeft < 3.0:
-    msg += "  ⚠️ Uzupełnij wkrótce!\n"
-
-  // --- Vacation mode ---
-  if config.vacationMode:
-    msg += "\n🏖 Tryb wakacyjny: AKTYWNY\n"
-
-  // --- Status ogólny ---
-  hasAlarm := false
-  for potIdx in 0 ..< config.numPots:
-    if snapshot.pots[potIdx].sensorStatus != OK: hasAlarm = true
-    if snapshot.pots[potIdx].waterGuards.potMax == TRIGGERED: hasAlarm = true
-  if budget.reservoirPct < config.reservoirCriticalPct: hasAlarm = true
-
-  msg += "\n"
-  if hasAlarm:
-    msg += "⚠️ Status: WYMAGA UWAGI\n"
-    for potIdx in 0 ..< config.numPots:
-      ps = snapshot.pots[potIdx]
-      if ps.sensorStatus != OK:
-        msg += fmt("  - Doniczka %d: czujnik wilgotności BŁĄD\n", potIdx+1)
-      if ps.waterGuards.potMax == TRIGGERED:
-        msg += fmt("  - Doniczka %d: OVERFLOW\n", potIdx+1)
-    if budget.reservoirPct < config.reservoirCriticalPct:
-      msg += "  - Rezerwuar: KRYTYCZNY\n"
-  else:
-    msg += "✅ Status: OK\n"
-
-  // --- Uptime ---
-  uptimeH := millis() / 3600000
-  msg += fmt("⏱ Uptime: %dh\n", uptimeH)
-
-  return msg
-
-
-// --- notificationTick() ---
-
-notificationTick(nowMs, snapshot, history, budget, trendStates, config, solarClock):
-  // === Codzienny heartbeat ===
-  if isDailyHeartbeatTime(nowMs, solarClock):
-    msg = formatDailyReport(snapshot, history, budget, trendStates, config)
-    telegram.sendWithRetry(msg, maxRetries=3, backoff=10s)
-
-  // === Event-driven notifications ===
-  pendingNotifications = notificationQueue.popAll()
-  for notif in pendingNotifications:
-    msg = formatNotification(notif)
-    telegram.sendWithRetry(msg, maxRetries=3, backoff=5s)
-
-// Komendy Telegram → eventy / menu:
-handleTelegramCommand(cmd):
-  switch cmd:
-    "/ag" | "/start" → respondWithInlineMenu()
-    callback("status")   → respond(formatStatus(snapshot))
-    callback("history")  → respond(formatLast24h(history))
-    callback("profiles") → respond(formatProfiles(config))
-    callback("help")     → respond(HELP_TEXT)
-    callback("water")    → EventQueue.push(REQUEST_MANUAL_WATER)
-    callback("stop")     → EventQueue.push(REQUEST_PUMP_OFF)
-    callback("refill")   → handleRefill(waterBudget)
-    callback("vacation_on")  → handleVacationToggle(true, config)
-    callback("vacation_off") → handleVacationToggle(false, config)
-    callback("mode_auto")    → EventQueue.push(REQUEST_SET_MODE_AUTO)
-    callback("mode_manual")  → EventQueue.push(REQUEST_SET_MODE_MANUAL)
-    callback("wifi")         → respond(formatWifiStatus(netState))
+  return (nowMs - netState.lastHeartbeatMs) >= 24h
 ```
+
+### Raport dzienny — stan faktyczny
+
+Aktualna implementacja używa `DailyReportData`:
+- `sensors`
+- `budget`
+- `trends`
+- `config`
+- `uptimeMs`
+
+Nie korzysta jeszcze z pełnego persisted history store. Raport zawiera:
+- wilgotność i target per doniczka,
+- trend `%/h` jeśli baseline został już wyuczony,
+- zużycie wody od ostatniego refill per doniczka,
+- temperaturę i lux,
+- poziom rezerwuaru i szacowane dni pracy,
+- status vacation mode,
+- uptime.
+
+### Telegram polling i menu inline — stan faktyczny
+
+```
+telegramPollCommands(nowMs, netCfg, status):
+  if telegram disabled or WiFi down:
+    return
+
+  pollIntervalMs = 2000 ms idle
+  if withinFastPollWindowAfterInteraction:
+    pollIntervalMs = 400 ms
+
+  fetch updates in batches (max 10)
+  authorize chat_id against netCfg.telegramChatIds
+
+  if update.type == callback_query:
+    handleTelegramCallback(update, status, netCfg)
+  else if text command is /ag or /start:
+    sendAgMenu()
+  else:
+    log("text_without_menu_entry")
+    sendAgMenu()
+```
+
+#### Faktyczne callbacki menu inline
+- `ag:status`
+- `ag:history`
+- `ag:profiles`
+- `ag:help`
+- `ag:water:0`
+- `ag:water:1`
+- `ag:stop`
+- `ag:refill`
+- `ag:wifi`
+- `ag:menu`
+- `ag:vac:toggle`
+- `ag:mode:toggle`
+
+#### Faktyczne mapowanie callbacków na akcje
+```
+handleTelegramCallback(cmd):
+  "ag:status"       → formatTelegramStatusReport()
+  "ag:history"      → formatTelegramHistoryReport()
+  "ag:profiles"     → formatTelegramProfilesMessage()
+  "ag:help"         → formatTelegramHelpMessage()
+  "ag:water:<pot>"  → preflightCheck + EventQueue.push(REQUEST_MANUAL_WATER)
+  "ag:stop"         → EventQueue.push(REQUEST_PUMP_OFF)
+  "ag:refill"       → EventQueue.push(REQUEST_REFILL)
+  "ag:wifi"         → EventQueue.push(REQUEST_START_WIFI_SETUP)
+  "ag:vac:toggle"   → EventQueue.push(REQUEST_SET_VACATION)
+  "ag:mode:toggle"  → EventQueue.push(REQUEST_SET_MODE)
+  "ag:menu"         → redraw inline menu
+```
+
+#### Faktyczne ograniczenia akcji `Water`
+- działa per doniczka (`potIdx` z callbacku), nie jako jedna globalna komenda,
+- uruchamia tylko jeden bezpieczny pulse przez istniejący FSM,
+- przed wrzuceniem eventu przechodzi preflight: tryb AUTO, brak aktywnego cyklu,
+  cooldown, kalibracja pompy, overflow, stan rezerwuaru i stany `UNKNOWN` sensorów,
+- przy błędzie użytkownik dostaje od razu tekstowy powód blokady zamiast ślepego enqueue.
 
 ---
 
@@ -2845,9 +2802,7 @@ struct PotConfig {
   // Pompa per-pot
   float  pumpMlPerSec = 0                       // z kalibracji pompy (0 = nie skalibrowana)
   bool   pumpCalibrated = false
-  // Kalibracja / sensory per-pot
-  struct SoilCalib { uint16 rawDry; uint16 rawWet; }
-  SoilCalib soilCalib
+  // Sensory per-pot
   bool   potMaxActiveLow = true                 // per-pot overflow sensor polaryzacja
   float  moistureEmaAlpha = 0.1                 // per-pot EMA alpha
 }
@@ -2966,7 +2921,6 @@ SENSOR_ANOMALY(potIndex, sensorId, description)
 
 - [ ] **Per-pot (powtórz dla każdej aktywnej doniczki)**:
   - [ ] Kalibracja pompy: `pots[i].pumpMlPerSec` — zmierzyć na stanowisku (30s test).
-  - [ ] Kalibracja wilgotności: `pots[i].soilCalib.rawDry` (w powietrzu) i `rawWet` (w mokrej ziemi).
   - [ ] Weryfikacja czujnika doniczki: czy TRIGGERED = woda na dnie podwójnego dna.
   - [ ] EMA alpha: dostroić per-pot — mniejsze α = wolniejsza reakcja, mniej szumu.
   - [ ] Profile roślin: sprawdzić czy domyślne wartości pasują do konkretnych sadzonek.
@@ -3017,17 +2971,22 @@ Odkrycia te **muszą** być uwzględnione w implementacji.
    To oznacza, że pełny zakres ADC (0–4095) odpowiada 0–3.3V,
    a sensor nie przekracza tego zakresu. Odczyt ~2230 ADC ≈ 1.8V jest poprawny.
 
-6. **Firmware wewnętrzny PbHUB v1.1** — STM32F030F4P6, I2C slave @0x61, FW version 2.
+6. **Walidacja krzyżowa po usunięciu per-pot `soilCalib`** — odczyt po zmianie normalizacji
+   został sprawdzony w tym samym miejscu drugim, niezależnym czujnikiem Zigbee **CS-201Z**.
+   Referencyjny czujnik pokazał **57%**, a M5Stack Watering Unit po wdrożonych zmianach
+   pokazał ten sam wynik (**57%**), co potwierdza poprawność bieżącego odczytu w testowanym punkcie.
+
+7. **Firmware wewnętrzny PbHUB v1.1** — STM32F030F4P6, I2C slave @0x61, FW version 2.
    ADC: 22 próbki, odrzuca min/max, uśrednia 20, sampling time = `LL_ADC_SAMPLINGTIME_1CYCLE_5`.
    GPIO: PA0→CH0, PA1→CH1, PA2→CH2, PA3→CH3, PA4→CH4, PA5→CH5.
    Dynamiczna rekonfiguracja pinów (analog/digital/PWM/servo) w callbacku I2C ISR.
 
-7. **Digital read daje poprawny odczyt binarny** — `pbDigitalRead(ch)` (register `kChCode[ch] | 0x04`)
+8. **Digital read daje poprawny odczyt binarny** — `pbDigitalRead(ch)` (register `kChCode[ch] | 0x04`)
    rekonfiguruje pin jako `GPIO_MODE_INPUT` i zwraca 0/1. Sam odczyt jest poprawny (nie zależy od ADC).
    Z diodami Zenera na CH2/CH3/CH4, napięcie na pinach nie przekracza 3.3V,
    więc crosstalk na ADC jest pomijalny.
 
-8. **4095 po włączeniu (osobny artefakt)** — tuż po starcie PbHUB, nim firmware STM32
+9. **4095 po włączeniu (osobny artefakt)** — tuż po starcie PbHUB, nim firmware STM32
    przełączy GPIO na analog mode, porty mają pull-up do VCC → ADC = 4095.
    Po pierwszym odczycie firmware dynamicznie rekonfiguruje pin
    (`GPIO_MODE_ANALOG, GPIO_NOPULL`) i kolejne odczyty są poprawne.
@@ -3048,7 +3007,7 @@ Odkrycia te **muszą** być uwzględnione w implementacji.
    Z diodami Zenera crosstalk jest pomijalny. ADC raw → EMA → normalize.
 
 3. **Moisture sensor: zakres 0–3.3V** — mimo zasilania 5V, wyjście analogowe
-   M5Stack Watering Unit operuje w zakresie 0–3.3V. Kalibracja rawDry/rawWet musi to uwzględniać.
+  M5Stack Watering Unit operuje w zakresie 0–3.3V. Logika firmware ma traktować to jako stały zakres pracy czujnika.
 
 4. **Warm-up po starcie** — odrzuć 5 pierwszych cykli odczytów (4095 → stabilizacja).
 
@@ -3057,6 +3016,25 @@ Odkrycia te **muszą** być uwzględnione w implementacji.
 
 6. **Delay między write i read: 10ms** — STM32 potrzebuje czasu na przełączenie GPIO
    i wykonanie 22 próbek ADC.
+
+### Hardening runtime po incydentach I2C / PbHUB
+
+- **ADC sanity check**: odczyty wilgotności spoza zakresu ADC (`>4095`) są odrzucane jako niewiarygodne.
+  Zamiast nich używany jest ostatni poprawny `raw`, a jeśli go brak — konserwatywny fallback „sucho / brak wiarygodnego pomiaru”.
+- **Log diagnostyczny invalid raw**: firmware emituje `MOISTURE_RAW_INVALID raw=... fallback_raw=...`
+  oraz zlicza takie przypadki w zbiorczym logu health.
+- **Fail-closed na sensor health**: krótkie błędy komunikacji nie mogą bezpośrednio włączyć pompy;
+  safety i manual działają konserwatywnie przy `UNKNOWN` / `FAIL`.
+- **Warstwa software została utwardzona, ale root cause „zwisów I2C” okazał się sprzętowy**:
+  weryfikacja na stanowisku wykazała niestabilny zasilacz USB. Plan powinien traktować to jako
+  problem zasilania/warstwy fizycznej, nie jako dowód, że sam protokół I2C lub PbHUB jest logicznie błędny.
+
+### Wniosek operacyjny po debugowaniu magistrali
+
+- Jeśli jednocześnie „znikają” PbHUB, SHT30, QMP6988 i BH1750, należy najpierw podejrzewać zasilanie USB,
+  przewód, hub lub spadki napięcia, a dopiero później sam firmware I2C.
+- Software ma tylko ograniczać skutki uboczne: blokować podlewanie, utrzymać ostatni sensowny odczyt,
+  logować `sensor health` i nie dopuścić do przypadkowego startu pompy.
 
 ---
 
@@ -3129,10 +3107,10 @@ on sensorTick(nowMs):
     if sensorHealth == OK:
       moistureFilters[potIdx].alpha = potCfg.moistureEmaAlpha
       moistureEma = emaUpdate(moistureFilters[potIdx], moistureRaw.value, nowMs)
-      moisturePct = normalizeSoil(moistureEma, potCfg.soilCalib)
+      moisturePct = normalizeSoil(moistureEma)
     else:
       log("[POT%d] SENSOR_OFFLINE — EMA frozen at %.1f", potIdx, moistureFilters[potIdx].value)
-      moisturePct = normalizeSoil(moistureFilters[potIdx].value, potCfg.soilCalib)
+      moisturePct = normalizeSoil(moistureFilters[potIdx].value)
 
     snapshot.pots[potIdx] = { moisturePct, moistureRaw, waterGuards }
 
@@ -3178,11 +3156,10 @@ interface SoilMoistureSensor : Sensor {
   readPct(nowMs) -> ReadResult<float>
 }
 
-normalizeSoil(raw, calib):
-  // calib.rawDry i calib.rawWet ustawiane na stanowisku
-  // UWAGA: sensor 0-3.3V, więc rawDry/rawWet będą w zakresie ~0-4095
+normalizeSoil(raw):
+  // Stała mapa dla Watering Unit 0-3.3V, bez per-pot kalibracji.
   // Zmierzono suchy na biurku: ~2230 ADC = ~1.8V
-  pct = mapClamp(raw, calib.rawDry..calib.rawWet -> 0..100)
+  pct = mapClamp(raw -> 0..100)
   return pct
 ```
 
@@ -3274,7 +3251,7 @@ on TICK_100MS:
     waterGuards = { potMax, reservoirMin }
 
     soilRaw = PbHubBus.analogRead(ch.soilAdcChannel)
-    soilPct = normalizeSoil(soilRaw, potCfg.soilCalib)
+    soilPct = normalizeSoil(soilRaw)
 
     snapshot.pots[potIdx] = { soilPct, soilRaw, waterGuards }
 
@@ -3360,7 +3337,6 @@ struct HardwareConfig {
 - [x] Crosstalk ADC: wyeliminowany sprzętowo — diody Zenera 3.3V na CH2/CH3/CH4 (2026-03-17).
 - [x] Per-sensor activeLow: potMax=true (LOW=overflow), reservoirMin=false (HIGH=brak wody). TRIGGERED = problem w domenie.
 - [x] Moisture sensor (Watering Unit): zakres wyjścia **0–3.3V** mimo 5V VCC. Suchy na biurku = 1.797V.
-- [ ] Kalibracja wilgotności: `rawDry` i `rawWet` — do uzupełnienia na stanowisku.
 - [x] Polityka `LevelState.UNKNOWN` -> domyślnie `BLOCK`.
 - [ ] Dobór `pumpOnMsMax`, `cooldownMs` w zależności od wydajności pompy.
 - [ ] Mapowanie przycisków: które akcje (menu, zmiana trybu, manual ON/OFF).

@@ -25,6 +25,16 @@
 // Out-of-class definition for static constexpr (ODR-used)
 constexpr uint8_t PbHubBus::kChBase[6];
 
+namespace {
+constexpr uint16_t kMaxPbHubAdcRaw = 4095;
+constexpr uint16_t kMoistureFallbackDryRaw = kMaxPbHubAdcRaw;
+
+float normalizeMoistureRaw(uint16_t raw) {
+    if (raw >= kMaxPbHubAdcRaw) return 0.0f;
+    return 100.0f * (float)(kMaxPbHubAdcRaw - raw) / (float)kMaxPbHubAdcRaw;
+}
+}
+
 // ===== PbHubBus =============================================================
 
 bool PbHubBus::init(uint8_t i2cAddr, uint8_t delayMs) {
@@ -760,14 +770,12 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     static uint16_t s_failCountBaro = 0;
     static uint16_t s_failCountRes = 0;
     static uint32_t s_lastSoilWarnMs[kMaxPots] = {};
-    static constexpr uint16_t kMaxPbHubAdcRaw = 4095;
 
     if (!resState.ok()) s_failCountRes++;
 
     // Per-pot
     for (uint8_t i = 0; i < cfg.numPots; i++) {
         if (!cfg.pots[i].enabled) continue;
-        const auto& potCfg = cfg.pots[i];
 
         // Overflow sensor
         auto potMaxState = _overflowSensors[i].readState(nowMs);
@@ -787,7 +795,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
             s_invalidCountSoil[i]++;
             snap.pots[i].moistureRaw = s_hasValidSoilRaw[i]
                 ? s_lastValidSoilRaw[i]
-                : potCfg.soilCalib.rawDry;
+                : kMoistureFallbackDryRaw;
             if ((nowMs - s_lastSoilWarnMs[i]) >= 10000) {
                 s_lastSoilWarnMs[i] = nowMs;
                 Serial.printf("[POT%d] MOISTURE_RAW_INVALID raw=%u fallback_raw=%d\n",
@@ -808,7 +816,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
             if (s_hasValidSoilRaw[i]) {
                 snap.pots[i].moistureRaw = s_lastValidSoilRaw[i];
             } else {
-                snap.pots[i].moistureRaw = potCfg.soilCalib.rawDry;
+                snap.pots[i].moistureRaw = kMoistureFallbackDryRaw;
             }
             if ((nowMs - s_lastSoilWarnMs[i]) >= 10000) {
                 s_lastSoilWarnMs[i] = nowMs;
@@ -822,19 +830,11 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
         if (snap.pots[i].moistureRaw == 0) {
             snap.pots[i].moistureRaw = s_hasValidSoilRaw[i]
                 ? s_lastValidSoilRaw[i]
-                : potCfg.soilCalib.rawDry;
+                : kMoistureFallbackDryRaw;
         }
 
         // Normalizacja → procent (EMA stosowane w analysis module)
-        float pct = 0.0f;
-        float raw = (float)snap.pots[i].moistureRaw;
-        if (potCfg.soilCalib.rawDry != potCfg.soilCalib.rawWet) {
-            pct = 100.0f * (potCfg.soilCalib.rawDry - raw)
-                / (float)(potCfg.soilCalib.rawDry - potCfg.soilCalib.rawWet);
-            if (pct < 0.0f) pct = 0.0f;
-            if (pct > 100.0f) pct = 100.0f;
-        }
-        snap.pots[i].moisturePct = pct;
+        snap.pots[i].moisturePct = normalizeMoistureRaw(snap.pots[i].moistureRaw);
 
         // Mapping diagnostic for Watering Unit on PbHUB channel:
         // M5Stack Watering Unit U101: pin0=PUMP_EN, pin1=AOUT

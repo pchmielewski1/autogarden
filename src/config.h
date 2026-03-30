@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 static constexpr uint8_t  kMaxPots      = 2;
 static constexpr uint8_t  kNumProfiles  = 6;  // Pomidor..Custom
-static constexpr uint16_t kConfigSchema = 3;  // wersja schematu NVS
+static constexpr uint16_t kConfigSchema = 4;  // wersja schematu NVS
 
 // NVS namespace names
 static constexpr const char* kNvsConfig  = "ag_config";
@@ -47,14 +47,6 @@ struct PlantProfile {
 extern const PlantProfile kProfiles[kNumProfiles];
 
 // ---------------------------------------------------------------------------
-// Kalibracja gleby per-pot
-// ---------------------------------------------------------------------------
-struct SoilCalib {
-    uint16_t rawDry  = 3000;   // odczyt ADC w powietrzu (sucho)
-    uint16_t rawWet  = 1200;   // odczyt ADC w mokrej ziemi
-};
-
-// ---------------------------------------------------------------------------
 // PotConfig — per-pot (PLAN.md → "PotConfig")
 // ---------------------------------------------------------------------------
 struct PotConfig {
@@ -75,7 +67,6 @@ struct PotConfig {
     bool     pumpCalibrated     = false;
 
     // Sensory — per-pot
-    SoilCalib soilCalib;
     bool     potMaxActiveLow    = true;    // overflow sensor polaryzacja
     float    moistureEmaAlpha   = 0.1f;    // EMA smoothing
 
