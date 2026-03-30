@@ -58,6 +58,7 @@ struct WaterGuards {
 struct PotSensorSnapshot {
     float    moisturePct;        // znormalizowany 0-100%
     uint16_t moistureRaw;        // surowy ADC
+    uint16_t moistureRawFiltered; // przefiltrowany raw do UI/sterowania
     float    moistureEma;        // po EMA filter
     WaterGuards waterGuards;
 };
@@ -74,6 +75,10 @@ struct SensorSnapshot {
     EnvSnapshot       env;
     uint32_t          timestampMs;
 };
+
+// Normalize M5 Watering Unit raw ADC to moisture percent using the current
+// installation-specific two-point nonlinear model.
+float normalizeMoistureRaw(uint16_t raw);
 
 // ---------------------------------------------------------------------------
 // PbHubBus — jedyny punkt dostępu do PbHUB v1.1

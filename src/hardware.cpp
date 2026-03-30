@@ -27,12 +27,61 @@ constexpr uint8_t PbHubBus::kChBase[6];
 
 namespace {
 constexpr uint16_t kMaxPbHubAdcRaw = 4095;
-constexpr uint16_t kMoistureFallbackDryRaw = kMaxPbHubAdcRaw;
+constexpr uint16_t kMoistureDryRaw = 2230;
+constexpr uint16_t kMoistureWetRaw = 1752;
+constexpr uint16_t kMoistureFallbackDryRaw = kMoistureDryRaw;
+constexpr uint8_t kMoistureMedianWindow = 10;
+
+float clamp01(float value) {
+    if (value < 0.0f) return 0.0f;
+    if (value > 1.0f) return 1.0f;
+    return value;
+}
+
+float moistureCurve(float t) {
+    t = clamp01(t);
+    // A symmetric S-curve saturates too early near the wet endpoint.
+    // Use a one-sided convex curve so 100% is reached only very close to wetRaw.
+    const float t2 = t * t;
+    return t2 * t2 * t;
+}
+
+uint16_t medianOfUint16(const uint16_t* samples, uint8_t count) {
+    if (count == 0) return kMoistureFallbackDryRaw;
+
+    uint16_t sorted[kMoistureMedianWindow] = {};
+    for (uint8_t i = 0; i < count; ++i) {
+        sorted[i] = samples[i];
+    }
+
+    for (uint8_t i = 0; i < count; ++i) {
+        for (uint8_t j = i + 1; j < count; ++j) {
+            if (sorted[j] < sorted[i]) {
+                uint16_t temp = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = temp;
+            }
+        }
+    }
+
+    if ((count % 2U) == 0U) {
+        return static_cast<uint16_t>((sorted[count / 2 - 1] + sorted[count / 2]) / 2U);
+    }
+    return sorted[count / 2];
+}
+}
 
 float normalizeMoistureRaw(uint16_t raw) {
-    if (raw >= kMaxPbHubAdcRaw) return 0.0f;
-    return 100.0f * (float)(kMaxPbHubAdcRaw - raw) / (float)kMaxPbHubAdcRaw;
-}
+    if (raw >= kMoistureDryRaw) return 0.0f;
+    if (raw <= kMoistureWetRaw) return 100.0f;
+
+    // Two-point nonlinear mapping based only on measured dry and wet endpoints.
+    // We normalize raw ADC to 0..1 and then apply a convex curve that delays
+    // saturation near wetRaw, so values close to the wet endpoint do not jump
+    // to 100% too early.
+    const float span = (float)(kMoistureDryRaw - kMoistureWetRaw);
+    const float normalizedWetness = clamp01(((float)kMoistureDryRaw - (float)raw) / span);
+    return 100.0f * moistureCurve(normalizedWetness);
 }
 
 // ===== PbHubBus =============================================================
@@ -770,6 +819,9 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     static uint16_t s_failCountBaro = 0;
     static uint16_t s_failCountRes = 0;
     static uint32_t s_lastSoilWarnMs[kMaxPots] = {};
+    static uint16_t s_soilMedianSamples[kMaxPots][kMoistureMedianWindow] = {};
+    static uint8_t s_soilMedianCount[kMaxPots] = {};
+    static uint8_t s_soilMedianHead[kMaxPots] = {};
 
     if (!resState.ok()) s_failCountRes++;
 
@@ -833,8 +885,17 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
                 : kMoistureFallbackDryRaw;
         }
 
-        // Normalizacja → procent (EMA stosowane w analysis module)
-        snap.pots[i].moisturePct = normalizeMoistureRaw(snap.pots[i].moistureRaw);
+        s_soilMedianSamples[i][s_soilMedianHead[i]] = snap.pots[i].moistureRaw;
+        s_soilMedianHead[i] = (s_soilMedianHead[i] + 1) % kMoistureMedianWindow;
+        if (s_soilMedianCount[i] < kMoistureMedianWindow) {
+            s_soilMedianCount[i]++;
+        }
+
+        uint16_t filteredMoistureRaw = medianOfUint16(s_soilMedianSamples[i], s_soilMedianCount[i]);
+        snap.pots[i].moistureRawFiltered = filteredMoistureRaw;
+
+        // Median on raw ADC rejects short spikes; EMA still runs later on moisturePct.
+        snap.pots[i].moisturePct = normalizeMoistureRaw(filteredMoistureRaw);
 
         // Mapping diagnostic for Watering Unit on PbHUB channel:
         // M5Stack Watering Unit U101: pin0=PUMP_EN, pin1=AOUT

@@ -13,6 +13,7 @@
 #include <Arduino.h>   // Serial, millis
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 
 #include "analysis.h"
 #include "log_serial.h"
@@ -81,6 +82,17 @@ static const char* pumpOwnerName(PumpOwner owner) {
         default:
             return "NONE";
     }
+}
+
+static float moistureForScheduleDecision(const PotSensorSnapshot& potSens) {
+    if (!std::isnan(potSens.moistureEma) && potSens.moistureEma >= 0.0f) {
+        return potSens.moistureEma;
+    }
+    return potSens.moisturePct;
+}
+
+static float moistureForCycleControl(const PotSensorSnapshot& potSens) {
+    return potSens.moisturePct;
 }
 
 // ===========================================================================
@@ -189,7 +201,7 @@ ScheduleResult evaluateSchedule(uint32_t nowMs,
     };
 
     const PlantProfile& prof = getActiveProfile(cfg, potIdx);
-    float moisture = potSens.moisturePct;
+    float moisture = moistureForScheduleDecision(potSens);
 
     // == 0. VACATION ANOMALY BLOCK ==
     if (cfg.vacationMode) {
@@ -389,7 +401,7 @@ void wateringTick(uint32_t nowMs,
                 sched.decision == ScheduleDecision::RESCUE_WATER)
             {
                 cycle = newCycle(prof, potCfg, potIdx);
-                cycle.moistureBeforeCycle = potSens.moisturePct;
+                cycle.moistureBeforeCycle = moistureForScheduleDecision(potSens);
                 cycle.phaseStartMs = nowMs;
                 actuator.lastFeedbackCode[potIdx] = WateringFeedbackCode::NONE;
                 actuator.lastFeedbackValue1[potIdx] = 0.0f;
@@ -397,19 +409,20 @@ void wateringTick(uint32_t nowMs,
                 actuator.lastFeedbackPulseCount[potIdx] = 0;
 
                 Serial.printf("[POT%d] WATERING_CYCLE_START moisture=%.1f%% reason=%s\n",
-                              potIdx, potSens.moisturePct,
+                              potIdx, cycle.moistureBeforeCycle,
                               sched.reason ? sched.reason : "?");
                 publishFeedback(actuator, potIdx,
                                 sched.decision == ScheduleDecision::RESCUE_WATER
                                     ? WateringFeedbackCode::CYCLE_START_RESCUE
                                     : WateringFeedbackCode::CYCLE_START_SCHEDULE,
-                                potSens.moisturePct);
+                                cycle.moistureBeforeCycle);
             }
             break;
         }
 
         // ==================== EVALUATING ====================
         case WateringPhase::EVALUATING: {
+            float moistureEval = moistureForScheduleDecision(potSens);
             float effectiveTarget = prof.targetMoisturePct;
             float effectiveMax    = prof.maxMoisturePct;
             if (cfg.vacationMode) {
@@ -417,20 +430,20 @@ void wateringTick(uint32_t nowMs,
                 if (effectiveTarget < 5.0f) effectiveTarget = 5.0f;
             }
 
-            if (potSens.moisturePct >= effectiveTarget) {
+            if (moistureEval >= effectiveTarget) {
                 cycle.phase = WateringPhase::DONE;
                 Serial.printf("[POT%d] WATERING_SKIP reason=already_wet moisture=%.1f%%\n",
-                              potIdx, potSens.moisturePct);
+                              potIdx, moistureEval);
                 publishFeedback(actuator, potIdx, WateringFeedbackCode::SKIP_ALREADY_WET,
-                                potSens.moisturePct, effectiveTarget, cycle.pulseCount);
+                                moistureEval, effectiveTarget, cycle.pulseCount);
                 break;
             }
-            if (potSens.moisturePct >= effectiveMax) {
+            if (moistureEval >= effectiveMax) {
                 cycle.phase = WateringPhase::DONE;
                 Serial.printf("[POT%d] WATERING_SKIP reason=above_max moisture=%.1f%%\n",
-                              potIdx, potSens.moisturePct);
+                              potIdx, moistureEval);
                 publishFeedback(actuator, potIdx, WateringFeedbackCode::SKIP_ABOVE_MAX,
-                                potSens.moisturePct, effectiveMax, cycle.pulseCount);
+                                moistureEval, effectiveMax, cycle.pulseCount);
                 break;
             }
 
@@ -534,7 +547,7 @@ void wateringTick(uint32_t nowMs,
 
         // ==================== MEASURING ====================
         case WateringPhase::MEASURING: {
-            float moistureNow = potSens.moisturePct;
+            float moistureNow = moistureForCycleControl(potSens);
             cycle.moistureAfterLastSoak = moistureNow;
 
             float effectiveTarget = prof.targetMoisturePct;

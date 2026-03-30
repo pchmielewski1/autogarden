@@ -611,7 +611,7 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
 
     // ── Section 7: Sensor raw data (y 184-200) ───────────────
     C.setTextColor(COL_DIM);
-    snprintf(buf, sizeof(buf), "RAW:%d EMA:%.1f %%", ps.moistureRaw, ps.moistureEma);
+    snprintf(buf, sizeof(buf), "RAWf:%d EMA:%.1f %%", ps.moistureRawFiltered, ps.moistureEma);
     C.drawString(buf, 4, 184);
 
     // ── Section 8: Alert banners (y 210+) ────────────────────
@@ -791,8 +791,8 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
         if (!snap.config.pots[i].enabled) continue;
         const PotSensorSnapshot& ps2 = snap.sensors.pots[i];
         int16_t ry = 180 + i * 12;
-        snprintf(buf, sizeof(buf), "%d:RAW:%d E:%.1f %%",
-                 i + 1, ps2.moistureRaw, ps2.moistureEma);
+        snprintf(buf, sizeof(buf), "%d:RAWf:%d E:%.1f %%",
+             i + 1, ps2.moistureRawFiltered, ps2.moistureEma);
         C.drawString(buf, 4, ry);
     }
 

@@ -12,6 +12,7 @@
 #include <Preferences.h>
 #include <algorithm>
 #include <cmath>
+#include <math.h>
 #include "log_serial.h"
 
 #define Serial AGSerial
@@ -38,7 +39,10 @@ float EmaFilter::update(float sample, uint32_t nowMs) {
         Serial.printf("[ANL] event=ema_reinit gap_ms=%u\n", gap);
         value = sample;
     } else {
-        value = alpha * sample + (1.0f - alpha) * value;
+        float delta = sample - value;
+        if (fabsf(delta) >= kNoiseDeadband) {
+            value = alpha * sample + (1.0f - alpha) * value;
+        }
     }
     lastUpdateMs = nowMs;
     return value;

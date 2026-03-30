@@ -24,6 +24,7 @@ struct EmaFilter {
 
     // Reinicjalizuj jeśli gap > maxGapMs
     static constexpr uint32_t kMaxGapMs = 60000;
+    static constexpr float kNoiseDeadband = 1.5f;
 
     float update(float sample, uint32_t nowMs);
     void  reset();

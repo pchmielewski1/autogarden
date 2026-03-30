@@ -868,7 +868,7 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
                         data.sensors.pots[i].moisturePct,
                         data.sensors.pots[i].moistureEma,
                         targetPct,
-                        data.sensors.pots[i].moistureRaw,
+                        data.sensors.pots[i].moistureRawFiltered,
                         data.sensors.pots[i].waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "OK",
                         static_cast<int>(data.cycles[i].phase),
                         data.cycles[i].pulseCount,

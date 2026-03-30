@@ -21,6 +21,7 @@
 #include <ESPmDNS.h>
 #include <esp_log.h>
 #include <cstdarg>
+#include <cmath>
 
 #include "events.h"
 #include "config.h"
@@ -765,8 +766,9 @@ static void controlTaskFn(void* /*param*/) {
             // EMA filtracja moisture per-pot
             for (uint8_t i = 0; i < g_config.numPots; ++i) {
                 if (!g_config.pots[i].enabled) continue;
-                snap.pots[i].moistureEma =
-                    g_emaFilters[i].update(snap.pots[i].moisturePct, now);
+                float rawEma = g_emaFilters[i].update(static_cast<float>(snap.pots[i].moistureRawFiltered), now);
+                uint16_t rawEmaRounded = static_cast<uint16_t>(std::lround(rawEma));
+                snap.pots[i].moistureEma = normalizeMoistureRaw(rawEmaRounded);
             }
 
             // Publikuj snapshot (thread-safe)
@@ -959,8 +961,8 @@ static void controlTaskFn(void* /*param*/) {
                         case WateringPhase::DONE:          phaseStr = "DONE"; break;
                         case WateringPhase::BLOCKED:       phaseStr = "BLOCK"; break;
                     }
-                    Serial.printf("[POT%d] raw=%d pct=%.1f%% ema=%.1f%% phase=%s\n",
-                                  i, ps.moistureRaw,
+                    Serial.printf("[POT%d] raw_filt=%d raw_adc=%d pct=%.1f%% ema=%.1f%% phase=%s\n",
+                                  i, ps.moistureRawFiltered, ps.moistureRaw,
                                   ps.moisturePct, ps.moistureEma, phaseStr);
                     Serial.printf("[POT%d] pump_owner=%s manual_lock=%s\n",
                                   i,

@@ -868,7 +868,7 @@ factoryReset(scope):
 
 **Co bym jeszcze dodał** (zaimplementowane poniżej):
 1. **Trend wilgotności** — obliczaj ΔmoisturePct/h z historii; alarm jeśli spada szybciej niż normalnie (np. pęknięty wąż, wyciek). → sekcja „Analiza trendów".
-2. **Średnia krocząca** (EMA) na odczycie moisture — eliminuje szpilki ADC i chwilowe artefakty. → sekcja „Filtracja odczytów — EMA".
+2. **Dwustopniowa filtracja moisture** — najpierw krótka mediana na surowym ADC, potem EMA na `%`. Mediana zbija pojedyncze szpilki z PbHUB/ADC, a EMA wygładza trend. → sekcja „Filtracja odczytów — EMA".
 3. **Tryb wakacyjny** — zredukowane podlewanie + agresywne oszczędzanie wody z rezerwuaru. → sekcja „Tryb wakacyjny (Vacation Mode)".
 4. **Detektor zmierzchu/świtu sensorowy** — fuzja BH1750 + SHT30 + QMP6988 wykrywa zachód/wschód bez RTC. SolarClock buduje model dnia po jednym cyklu. → sekcja „Detektor zmierzchu/świtu — fuzja sensorowa".
 5. **Heartbeat Telegram** — codziennie rano krótki raport „wszystko OK / woda na X dni". → sekcja „Powiadomienia Telegram (NotificationService)".
@@ -2258,11 +2258,26 @@ on TICK_1S:
 
 ---
 
-### Filtracja odczytów — EMA (Exponential Moving Average)
+### Filtracja odczytów — mediana + EMA
 
-Surowy ADC ma szum ±20-50 jednostek. Zamiast reagować na szpilki:
+Surowy ADC ma szum ±20-50 jednostek. Zamiast reagować na pojedyncze szpilki, pipeline jest rozdzielony na tor szybki i tor stabilny:
+
+1. mediana z ostatnich 10 próbek raw per-pot
+2. szybki tor sterowania: `median(raw) -> normalize -> moisturePct`
+3. stabilny tor prezentacji/startu: `EMA(raw) -> normalize -> moistureEma`
+
+W runtime rozróżniamy też dwa warianty sygnału RAW:
+- `moistureRaw` = ostatni surowy odczyt ADC, zostaje do diagnostyki i historii.
+- `moistureRawFiltered` = przefiltrowany sygnał po medianie, używany do sterowania,
+  dalszego wygładzania i prezentacji użytkowej.
 
 ```
+const MEDIAN_WINDOW = 10
+
+median5(samples):
+  sort(samples)
+  return middle(samples)
+
 // EMA z konfigurowalnym alpha (domyślnie 0.1 = wolna reakcja, stabilna)
 struct EmaFilter {
   float alpha = 0.1        // 0.0-1.0; mniejsze = wolniejsze, stabilniejsze
@@ -2271,8 +2286,9 @@ struct EmaFilter {
   uint32 lastUpdateMs = 0  // timestamp ostatniej aktualizacji
 }
 
-// Per-pot EMA:
-EmaFilter moistureFilters[MAX_POTS]  // filtr na każdą doniczkę
+// Per-pot filtry:
+RawMedianFilter moistureRawMedian[MAX_POTS]
+EmaFilter moistureRawEmaFilters[MAX_POTS]
 
 emaUpdate(filter, newSample, nowMs):
   if not filter.initialized:
@@ -2300,12 +2316,32 @@ W sensorTick:
 ```
 if sensorHealth == OK:
   moistureRaw = PbHubBus.analogRead(...)
-  moistureEma = emaUpdate(moistureFilter, moistureRaw, nowMs)
-  moisturePct = normalizeSoil(moistureEma)
+  moistureRawStable = medianPushAndRead(moistureRawMedian[pot], moistureRaw)
+  moistureRawFiltered = moistureRawStable
+  moisturePct = normalizeSoil(moistureRawFiltered)
+
+  moistureRawEma = emaUpdate(moistureRawEmaFilter, moistureRawFiltered, nowMs)
+  moistureEma = normalizeSoil(round(moistureRawEma))
 else:
   // Sensor offline — nie aktualizuj EMA, zachowaj ostatnią wartość
-  log("SENSOR_OFFLINE — EMA frozen at %.1f", moistureFilter.value)
+  log("SENSOR_OFFLINE — EMA frozen")
 ```
+
+Ta architektura działa niezależnie dla obu doniczek, bo każdy POT ma własne okno mediany i własny filtr EMA.
+
+Podział ról sygnałów w runtime:
+- `moisturePct` = szybki tor sterowania po `median(raw) -> normalize`.
+  Tę wartość wykorzystuje aktywny cykl podlewania po `SOAK`, bo nie może czekać na długi filtr
+  przy decyzji `STOP/next pulse`.
+- UI i raporty użytkowe pokazują `moistureRawFiltered`, a nie pojedynczy surowy strzał ADC,
+  żeby to co widzi użytkownik odpowiadało rzeczywistemu torowi sterowania.
+- `moistureEma` = spokojniejszy tor do UI, Telegram, trendów i decyzji o starcie cyklu.
+  Dzięki temu pojedyncze wahania rzędu kilku dziesiątych procenta nie uruchamiają podlewania zbyt łatwo.
+- EMA działa w domenie RAW, nie w domenie `%`. To ważne przy nieliniowej krzywej `raw -> %`, bo
+  kilka countów ADC blisko `wetRaw` może dawać duży skok procentów. Wygładzanie przed normalizacją
+  ogranicza takie sztuczne fluktuacje bez wydłużania reakcji aktywnego podlewania.
+- EMA ma mały deadband anty-szumowy w jednostkach RAW, więc bardzo małe oscylacje nie zmieniają
+  wskazania przy każdym ticku, ale większa zmiana nadal przechodzi bez dokładania długiego opóźnienia.
 
 ---
 
@@ -2972,9 +3008,12 @@ Odkrycia te **muszą** być uwzględnione w implementacji.
    a sensor nie przekracza tego zakresu. Odczyt ~2230 ADC ≈ 1.8V jest poprawny.
 
 6. **Walidacja krzyżowa po usunięciu per-pot `soilCalib`** — odczyt po zmianie normalizacji
-   został sprawdzony w tym samym miejscu drugim, niezależnym czujnikiem Zigbee **CS-201Z**.
-   Referencyjny czujnik pokazał **57%**, a M5Stack Watering Unit po wdrożonych zmianach
-   pokazał ten sam wynik (**57%**), co potwierdza poprawność bieżącego odczytu w testowanym punkcie.
+  został porównany z drugim, niezależnym czujnikiem Zigbee **CS-201Z** w tym samym miejscu.
+  Początkowo oba czujniki pokazały **57%**, ale po kilku minutach pojawił się rozjazd:
+  **CS-201Z = 61%**, a M5Stack Watering Unit = **57%**.
+  Wniosek: nowa normalizacja daje odczyt zbliżony do zewnętrznego punktu odniesienia,
+  ale pojedyncza zgodność startowa nie jest dowodem pełnej równoważności obu sensorów
+  ani identycznej skali `%` w czasie.
 
 7. **Firmware wewnętrzny PbHUB v1.1** — STM32F030F4P6, I2C slave @0x61, FW version 2.
    ADC: 22 próbki, odrzuca min/max, uśrednia 20, sampling time = `LL_ADC_SAMPLINGTIME_1CYCLE_5`.
@@ -3157,10 +3196,63 @@ interface SoilMoistureSensor : Sensor {
 }
 
 normalizeSoil(raw):
-  // Stała mapa dla Watering Unit 0-3.3V, bez per-pot kalibracji.
-  // Zmierzono suchy na biurku: ~2230 ADC = ~1.8V
-  pct = mapClamp(raw -> 0..100)
+  // Stała mapa referencyjna dla Watering Unit 0-3.3V, bez per-pot kalibracji użytkownika.
+  // Do obliczenia krzywej bierzemy tylko dwa punkty krańcowe zmierzone na stanowisku:
+  // - dryRaw = 2230  -> 0%
+  // - wetRaw = 1752  -> 100%
+  // Nie ustawiamy pośrednich kotwic. Cały zakres jest liczony z funkcji ciągłej.
+  //
+  // Krok 1: normalizacja raw do zakresu 0..1
+  //   t = clamp((dryRaw - raw) / (dryRaw - wetRaw), 0, 1)
+  //
+  // Krok 2: nieliniowa krzywa jednostronna opóźniająca dojście do 100%:
+  //   curve(t) = t^5
+  //
+  // Krok 3: przeskalowanie do procentów:
+  //   pct = 100 * curve(t)
+  //
+  // Efekt praktyczny:
+  // - blisko dry reakcja jest spokojna i nie przeszacowuje małych zmian,
+  // - środek zakresu nadal rośnie monotonicznie,
+  // - blisko wet wynik dochodzi do 100% dużo później niż w poprzednim modelu.
+  //
+  // Dlaczego nie używamy tu symetrycznej krzywej S:
+  // - przy raw bardzo bliskim wetRaw, ale jeszcze nie równym wetRaw,
+  //   funkcja typu smootherstep dawała już niemal 100%,
+  // - w praktyce powodowało to przedwczesną saturację wskazania.
+  t = clamp((2230 - raw) / (2230 - 1752), 0, 1)
+  pct = 100 * t^5
   return pct
+
+Źródła i uzasadnienie modelu:
+- Dla dokładnie tego sensora, czyli M5Stack Watering Unit / M5 Watering, nie znaleziono
+  oficjalnej krzywej producenta `raw -> %` ani oficjalnej biblioteki M5, która zwracałaby
+  gotową wilgotność w procentach dla tego modułu.
+- To oznacza, że obecny wzór nie jest "tajnym wzorem M5", tylko świadomie przyjętym
+  modelem lokalnym dla tego konkretnego układu AutoGarden.
+- Nie przepisujemy wprost jednego równania z publikacji do firmware, bo te prace dotyczyły innych sensorów,
+  innych gleb i innych warunków laboratoryjnych.
+- Bierzemy z literatury założenia jakościowe, które są spójne z obserwacjami na stanowisku:
+  - charakterystyka czujników pojemnościowych jest nieliniowa,
+  - prosta mapa liniowa `raw -> %` jest zbyt słaba fizycznie,
+  - okolice skrajów suchy/mokry mają tendencję do spłaszczenia,
+  - kalibracja powinna być lokalna i oparta na punktach końcowych z własnego układu.
+- Na tej podstawie przyjęto w AutoGarden prosty model inżynierski: kalibracja dwupunktowa
+  (`dryRaw`, `wetRaw`) + jednostronna krzywa potęgowa `pct = 100 * t^5` na całym zakresie.
+
+Źródła, z których bierzemy te założenia:
+- Hydronix, "Are All Moisture Sensors Equal?" — opisuje nieliniowość, wpływ materiału,
+  temperatury i ograniczenia prostych kalibracji między różnymi sensorami.
+  URL: https://www.hydronix.com/resources/blogs/are-all-moisture-sensors-equal/
+- MDPI Sensors 2024, 24(9):2725 — pokazuje, że dla czujnika pojemnościowego najlepszy model
+  w badanym układzie był nieliniowy i zależny od konkretnej gleby.
+  URL: https://www.mdpi.com/1424-8220/24/9/2725
+- MDPI Micromachines 2019, 10(12):878 — pokazuje, że kompensacja wilgotności ma charakter
+  nieliniowy i że modele liniowe są zbyt uproszczone.
+  URL: https://www.mdpi.com/2072-666X/10/12/878
+- SciELO: "Nonlinear models for soil moisture sensor calibration in tropical mountainous soils" —
+  wskazuje, że modele nieliniowe/asymptotyczne lepiej opisują zachowanie sensora niż prosta linia.
+  URL: https://www.scielo.br/j/sa/a/DbC6KbDgg5TV4yn9BRVZznj/?format=html&lang=en
 ```
 
 #### 2) Poziom wody: MAX w doniczce + MIN w rezerwuarze
