@@ -603,7 +603,13 @@ template class RingBuffer<SensorSample, 720>;
 template class RingBuffer<WateringRecord, 100>;
 
 namespace {
-static constexpr uint16_t kHistorySchema = 1;
+static constexpr uint16_t kHistorySchema = 2;
+static constexpr uint16_t kLevel2ChunkItems = 96;
+static constexpr uint16_t kLevel3ChunkItems = 96;
+static constexpr uint16_t kWateringChunkItems = 50;
+static constexpr uint8_t kLevel2ChunkCount = 3;
+static constexpr uint8_t kLevel3ChunkCount = 8;
+static constexpr uint8_t kWateringChunkCount = 2;
 
 struct PersistSensorSample {
     uint32_t ageSec = 0;
@@ -634,6 +640,75 @@ struct HistoryMeta {
     uint32_t secsSinceLastLevel2Flush = 0;
     uint32_t secsSinceLastLevel3Flush = 0;
 };
+
+template <typename T>
+static size_t writeChunkedBytes(Preferences& prefs,
+                                const char* prefix,
+                                const T* data,
+                                uint16_t count,
+                                uint16_t itemsPerChunk,
+                                uint8_t maxChunks) {
+    size_t totalWritten = 0;
+    uint16_t offset = 0;
+
+    for (uint8_t chunk = 0; chunk < maxChunks; ++chunk) {
+        char key[12] = {};
+        snprintf(key, sizeof(key), "%s%u", prefix, static_cast<unsigned>(chunk));
+
+        if (offset < count) {
+            uint16_t items = std::min<uint16_t>(itemsPerChunk, count - offset);
+            size_t expected = static_cast<size_t>(items) * sizeof(T);
+            size_t written = prefs.putBytes(key, data + offset, expected);
+            totalWritten += written;
+            if (written != expected) {
+                return totalWritten;
+            }
+            offset += items;
+        } else {
+            prefs.remove(key);
+        }
+    }
+
+    return totalWritten;
+}
+
+template <typename T>
+static bool readChunkedBytes(Preferences& prefs,
+                             const char* prefix,
+                             const char* legacyKey,
+                             T* data,
+                             uint16_t count,
+                             uint16_t itemsPerChunk,
+                             uint8_t maxChunks) {
+    if (count == 0) {
+        return true;
+    }
+
+    char firstKey[12] = {};
+    snprintf(firstKey, sizeof(firstKey), "%s%u", prefix, 0U);
+
+    if (!prefs.isKey(firstKey)) {
+        if (!legacyKey) {
+            return false;
+        }
+        size_t expected = static_cast<size_t>(count) * sizeof(T);
+        return prefs.getBytes(legacyKey, data, expected) == expected;
+    }
+
+    uint16_t offset = 0;
+    for (uint8_t chunk = 0; chunk < maxChunks && offset < count; ++chunk) {
+        char key[12] = {};
+        snprintf(key, sizeof(key), "%s%u", prefix, static_cast<unsigned>(chunk));
+        uint16_t items = std::min<uint16_t>(itemsPerChunk, count - offset);
+        size_t expected = static_cast<size_t>(items) * sizeof(T);
+        if (prefs.getBytes(key, data + offset, expected) != expected) {
+            return false;
+        }
+        offset += items;
+    }
+
+    return offset == count;
+}
 
 static PersistSensorSample toPersistSample(uint32_t nowMs, const SensorSample& src) {
     PersistSensorSample out{};
@@ -827,15 +902,36 @@ bool historyStateSave(uint32_t nowMs, const SensorHistory& hist) {
     const size_t lvl3Expected = meta.level3Count * sizeof(PersistSensorSample);
     const size_t wlogExpected = meta.wateringCount * sizeof(PersistWateringRecord);
 
-    const size_t metaWritten = prefs.putBytes("meta", &meta, metaExpected);
-    const size_t lvl2Written = prefs.putBytes("lvl2", s_level2, lvl2Expected);
-    const size_t lvl3Written = prefs.putBytes("lvl3", s_level3, lvl3Expected);
-    const size_t wlogWritten = prefs.putBytes("wlog", s_watering, wlogExpected);
+    const size_t lvl2Written = writeChunkedBytes(prefs, "l2_", s_level2,
+                                                 meta.level2Count,
+                                                 kLevel2ChunkItems,
+                                                 kLevel2ChunkCount);
+    const size_t lvl3Written = writeChunkedBytes(prefs, "l3_", s_level3,
+                                                 meta.level3Count,
+                                                 kLevel3ChunkItems,
+                                                 kLevel3ChunkCount);
+    const size_t wlogWritten = writeChunkedBytes(prefs, "wl_", s_watering,
+                                                 meta.wateringCount,
+                                                 kWateringChunkItems,
+                                                 kWateringChunkCount);
+    const size_t metaWritten = (lvl2Written == lvl2Expected
+                             && lvl3Written == lvl3Expected
+                             && wlogWritten == wlogExpected)
+        ? prefs.putBytes("meta", &meta, metaExpected)
+        : 0;
 
     bool ok = metaWritten == metaExpected
            && lvl2Written == lvl2Expected
            && lvl3Written == lvl3Expected
            && wlogWritten == wlogExpected;
+
+    if (ok) {
+        // Legacy single-blob keys from schema 1 can be removed after the
+        // chunked schema 2 write succeeds.
+        prefs.remove("lvl2");
+        prefs.remove("lvl3");
+        prefs.remove("wlog");
+    }
     prefs.end();
 
     if (!ok) {
@@ -870,7 +966,8 @@ bool historyStateLoad(uint32_t nowMs, SensorHistory& hist) {
     }
 
     HistoryMeta meta{};
-    if (prefs.getBytes("meta", &meta, sizeof(meta)) != sizeof(meta) || meta.schema != kHistorySchema) {
+    if (prefs.getBytes("meta", &meta, sizeof(meta)) != sizeof(meta)
+        || (meta.schema != 1 && meta.schema != kHistorySchema)) {
         prefs.end();
         Serial.println("[HIST] event=nvs_load_failed reason=meta_invalid");
         return false;
@@ -886,17 +983,32 @@ bool historyStateLoad(uint32_t nowMs, SensorHistory& hist) {
     static PersistWateringRecord s_watering[100];
 
     bool ok = true;
-    if (meta.level2Count > 0) {
-        ok = ok && (prefs.getBytes("lvl2", s_level2, meta.level2Count * sizeof(PersistSensorSample))
-                    == meta.level2Count * sizeof(PersistSensorSample));
-    }
-    if (meta.level3Count > 0) {
-        ok = ok && (prefs.getBytes("lvl3", s_level3, meta.level3Count * sizeof(PersistSensorSample))
-                    == meta.level3Count * sizeof(PersistSensorSample));
-    }
-    if (meta.wateringCount > 0) {
-        ok = ok && (prefs.getBytes("wlog", s_watering, meta.wateringCount * sizeof(PersistWateringRecord))
-                    == meta.wateringCount * sizeof(PersistWateringRecord));
+    if (meta.schema == 1) {
+        if (meta.level2Count > 0) {
+            ok = ok && (prefs.getBytes("lvl2", s_level2, meta.level2Count * sizeof(PersistSensorSample))
+                        == meta.level2Count * sizeof(PersistSensorSample));
+        }
+        if (meta.level3Count > 0) {
+            ok = ok && (prefs.getBytes("lvl3", s_level3, meta.level3Count * sizeof(PersistSensorSample))
+                        == meta.level3Count * sizeof(PersistSensorSample));
+        }
+        if (meta.wateringCount > 0) {
+            ok = ok && (prefs.getBytes("wlog", s_watering, meta.wateringCount * sizeof(PersistWateringRecord))
+                        == meta.wateringCount * sizeof(PersistWateringRecord));
+        }
+    } else {
+        ok = ok && readChunkedBytes(prefs, "l2_", "lvl2", s_level2,
+                                    meta.level2Count,
+                                    kLevel2ChunkItems,
+                                    kLevel2ChunkCount);
+        ok = ok && readChunkedBytes(prefs, "l3_", "lvl3", s_level3,
+                                    meta.level3Count,
+                                    kLevel3ChunkItems,
+                                    kLevel3ChunkCount);
+        ok = ok && readChunkedBytes(prefs, "wl_", "wlog", s_watering,
+                                    meta.wateringCount,
+                                    kWateringChunkItems,
+                                    kWateringChunkCount);
     }
     prefs.end();
 

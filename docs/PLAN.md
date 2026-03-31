@@ -2108,6 +2108,8 @@ fn handleVacationToggle(enable: bool, cfg: &mut Config):
 Odczyty co 1s = 86400/dzień = za dużo.
 
 **Rozwiązanie**: trzypoziomowy ring buffer w RAM z periodycznym flush do NVS.
+Przy zapisie do namespace `ag_hist` nie zakładaj pojedynczych dużych blobów dla całego `level2`/`level3`.
+W praktyce zapis `level2` jako jeden blob zaczął zawodzić przy większym zapełnieniu historii, więc format trwały powinien dzielić dane na małe chunky (`l2_0..`, `l3_0..`, `wl_0..`) i zostawić kompatybilny odczyt starego schematu.
 
 ```
 // Poziom 1: RAM — gęsty (co 10s), ostatnie 30 minut
