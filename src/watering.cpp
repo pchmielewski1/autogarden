@@ -56,7 +56,7 @@ static WateringFeedbackCode feedbackCodeFromSafetyReason(const char* reason) {
     if (strcmp(reason, "OVERFLOW_SENSOR_UNKNOWN") == 0) return WateringFeedbackCode::SAFETY_BLOCK_OVERFLOW_SENSOR_UNKNOWN;
     if (strcmp(reason, "TANK_SENSOR_UNKNOWN") == 0) return WateringFeedbackCode::SAFETY_BLOCK_TANK_SENSOR_UNKNOWN;
     if (strcmp(reason, "RESERVOIR_EMPTY") == 0) return WateringFeedbackCode::SAFETY_BLOCK_RESERVOIR_EMPTY;
-    if (strcmp(reason, "PUMP_NOT_CALIBRATED") == 0) return WateringFeedbackCode::SAFETY_BLOCK_PUMP_NOT_CALIBRATED;
+    if (strcmp(reason, "PUMP_CONFIG_INVALID") == 0) return WateringFeedbackCode::SAFETY_BLOCK_PUMP_CONFIG_INVALID;
     return WateringFeedbackCode::NONE;
 }
 
@@ -93,6 +93,10 @@ static float moistureForScheduleDecision(const PotSensorSnapshot& potSens) {
 
 static float moistureForCycleControl(const PotSensorSnapshot& potSens) {
     return potSens.moisturePct;
+}
+
+static bool moistureLooksOutOfSoil(float moisturePct) {
+    return !std::isnan(moisturePct) && moisturePct >= 0.0f && moisturePct <= 5.0f;
 }
 
 // ===========================================================================
@@ -164,11 +168,6 @@ SafetyResult evaluateExtendedSafety(uint32_t nowMs,
         return { true, "RESERVOIR_EMPTY" };
     }
 
-    // Pompa nie skalibrowana → blokuj AUTO
-    if (potCfg.pumpMlPerSec <= 0.0f) {
-        return { true, "PUMP_NOT_CALIBRATED" };
-    }
-
     return { false, nullptr };
 }
 
@@ -226,6 +225,13 @@ ScheduleResult evaluateSchedule(uint32_t nowMs,
     }
 
     // == 1. RESCUE — krytycznie sucha gleba ==
+    if (moistureLooksOutOfSoil(moisture)) {
+        throttledSchedBlockLog("PROBE_NOT_IN_SOIL",
+                               "[POT%d] SCHEDULE_BLOCK reason=probe_not_in_soil moisture=%.1f%%\n",
+                               moisture);
+        return { ScheduleDecision::NO_ACTION, "PROBE_NOT_IN_SOIL" };
+    }
+
     if (moisture < prof.criticalLowPct) {
         Serial.printf("[POT%d] SCHEDULE_RESCUE moisture=%.1f%% critical=%.1f%%\n",
                       potIdx, moisture, prof.criticalLowPct);
@@ -400,6 +406,17 @@ void wateringTick(uint32_t nowMs,
             if (sched.decision == ScheduleDecision::START_CYCLE ||
                 sched.decision == ScheduleDecision::RESCUE_WATER)
             {
+                if (potCfg.pumpMlPerSec <= 0.0f) {
+                    static uint32_t s_lastPumpBlockLogMs[kMaxPots] = {};
+                    if ((nowMs - s_lastPumpBlockLogMs[potIdx]) >= 5000) {
+                        s_lastPumpBlockLogMs[potIdx] = nowMs;
+                        Serial.printf("[POT%d] SCHEDULE_BLOCK reason=pump_config_invalid moisture=%.1f%%\n",
+                                      potIdx, moistureForScheduleDecision(potSens));
+                    }
+                    publishFeedback(actuator, potIdx, WateringFeedbackCode::SAFETY_BLOCK_PUMP_CONFIG_INVALID);
+                    break;
+                }
+
                 cycle = newCycle(prof, potCfg, potIdx);
                 cycle.moistureBeforeCycle = moistureForScheduleDecision(potSens);
                 cycle.phaseStartMs = nowMs;

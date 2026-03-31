@@ -54,6 +54,7 @@ struct UiSnap {
     WaterBudget     budget;
     Config          config;
     NetConfig       netConfig;
+    uint32_t        lastCycleDoneMs[kMaxPots] = {};
     DuskPhase       duskPhase;
     bool            wifiConnected;
 };

@@ -12,6 +12,289 @@
 
 #define Serial AGSerial
 
+namespace {
+constexpr uint16_t kMoistureRawMinGap = 32;
+constexpr float kMoistureCurveExponentMin = 0.1f;
+constexpr float kMoistureCurveExponentMax = 12.0f;
+constexpr float kFixedPumpMlPerSec = 5.17f;
+
+uint16_t defaultPotDryRaw(uint8_t potIdx) {
+    switch (potIdx) {
+        case 0: return 2228;
+        case 1: return 2229;
+        default: return 2230;
+    }
+}
+
+uint16_t defaultPotWetRaw(uint8_t potIdx) {
+    switch (potIdx) {
+        case 0: return 1766;
+        case 1: return 1786;
+        default: return 1752;
+    }
+}
+
+float defaultPotCurveExponent(uint8_t potIdx) {
+    switch (potIdx) {
+        case 0: return 0.63f;
+        case 1: return 0.65f;
+        default: return 5.0f;
+    }
+}
+
+void applyPotMoistureDefaults(PotConfig& pot, uint8_t potIdx) {
+    pot.moistureDryRaw = defaultPotDryRaw(potIdx);
+    pot.moistureWetRaw = defaultPotWetRaw(potIdx);
+    pot.moistureCurveExponent = defaultPotCurveExponent(potIdx);
+}
+
+void applyFixedPumpParameters(Config& cfg) {
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        cfg.pots[i].pumpMlPerSec = kFixedPumpMlPerSec;
+        cfg.pots[i].pumpCalibrated = true;
+    }
+}
+
+bool normalizeFixedPumpParameters(Config& cfg) {
+    bool changed = false;
+
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        if (!cfg.pots[i].pumpCalibrated ||
+            cfg.pots[i].pumpMlPerSec < (kFixedPumpMlPerSec - 0.01f) ||
+            cfg.pots[i].pumpMlPerSec > (kFixedPumpMlPerSec + 0.01f)) {
+            cfg.pots[i].pumpMlPerSec = kFixedPumpMlPerSec;
+            cfg.pots[i].pumpCalibrated = true;
+            changed = true;
+        }
+    }
+
+    return changed;
+}
+
+bool moistureEndpointsValid(uint16_t dryRaw, uint16_t wetRaw) {
+    if (dryRaw > 4095 || wetRaw > 4095) {
+        return false;
+    }
+    if (wetRaw >= dryRaw) {
+        return false;
+    }
+    return (dryRaw - wetRaw) >= kMoistureRawMinGap;
+}
+
+bool moistureCurveExponentValid(float exponent) {
+    return exponent >= kMoistureCurveExponentMin
+        && exponent <= kMoistureCurveExponentMax;
+}
+
+struct LegacyPotConfigV4 {
+    bool     enabled = false;
+    uint8_t  plantProfileIndex = 0;
+    float    customTargetPct = 60.0f;
+    float    customCriticalLowPct = 30.0f;
+    float    customMaxMoisturePct = 80.0f;
+    float    customHysteresisPct = 3.0f;
+    uint32_t customSoakTimeMs = 35000;
+    uint16_t customPulseWaterMl = 40;
+    uint8_t  customMaxPulsesPerCycle = 5;
+    float    pumpMlPerSec = 0.0f;
+    bool     pumpCalibrated = false;
+    bool     potMaxActiveLow = true;
+    float    moistureEmaAlpha = 0.1f;
+    uint16_t pulseWaterMl = 25;
+};
+
+struct LegacyConfigV4 {
+    uint16_t schemaVersion = 4;
+    Mode mode = Mode::AUTO;
+    uint8_t numPots = 1;
+    LegacyPotConfigV4 pots[kMaxPots];
+    uint32_t pumpOnMsMax = 30000;
+    uint32_t cooldownMs = 60000;
+    bool antiOverflowEnabled = true;
+    uint32_t overflowMaxWaitMs = 600000;
+    UnknownPolicy waterLevelUnknownPolicy = UnknownPolicy::BLOCK;
+    float heatBlockTempC = 35.0f;
+    float directSunLuxThreshold = 40000.0f;
+    bool morningWateringEnabled = false;
+    uint32_t duskWateringWindowMs = 7200000;
+    float duskScoreEnterThreshold = 0.55f;
+    float duskScoreConfirmThreshold = 0.65f;
+    float duskScoreCancelThreshold = 0.30f;
+    uint32_t transitionConfirmMs = 900000;
+    uint32_t fallbackIntervalMs = 6UL * 3600 * 1000;
+    float latitude = 52.23f;
+    float longitude = 21.01f;
+    int8_t utcOffsetHours = 1;
+    float reservoirCapacityMl = 1500.0f;
+    float reservoirLowThresholdMl = 400.0f;
+    uint32_t manualMaxHoldMs = 30000;
+    uint32_t manualCooldownMs = 60000;
+    float anomalyDryingRateThreshold = 5.0f;
+    float anomalyDryingRateMultiplier = 3.0f;
+    bool vacationMode = false;
+    float vacationTargetReductionPct = 10.0f;
+    uint8_t vacationMaxPulsesOverride = 2;
+    float vacationCooldownMultiplier = 2.0f;
+};
+
+struct LegacyPotConfigV5 {
+    bool     enabled = false;
+    uint8_t  plantProfileIndex = 0;
+    float    customTargetPct = 60.0f;
+    float    customCriticalLowPct = 30.0f;
+    float    customMaxMoisturePct = 80.0f;
+    float    customHysteresisPct = 3.0f;
+    uint32_t customSoakTimeMs = 35000;
+    uint16_t customPulseWaterMl = 40;
+    uint8_t  customMaxPulsesPerCycle = 5;
+    float    pumpMlPerSec = 0.0f;
+    bool     pumpCalibrated = false;
+    bool     potMaxActiveLow = true;
+    float    moistureEmaAlpha = 0.1f;
+    uint16_t moistureDryRaw = 2230;
+    uint16_t moistureWetRaw = 1752;
+    uint16_t pulseWaterMl = 25;
+};
+
+struct LegacyConfigV5 {
+    uint16_t schemaVersion = 5;
+    Mode mode = Mode::AUTO;
+    uint8_t numPots = 1;
+    LegacyPotConfigV5 pots[kMaxPots];
+    uint32_t pumpOnMsMax = 30000;
+    uint32_t cooldownMs = 60000;
+    bool antiOverflowEnabled = true;
+    uint32_t overflowMaxWaitMs = 600000;
+    UnknownPolicy waterLevelUnknownPolicy = UnknownPolicy::BLOCK;
+    float heatBlockTempC = 35.0f;
+    float directSunLuxThreshold = 40000.0f;
+    bool morningWateringEnabled = false;
+    uint32_t duskWateringWindowMs = 7200000;
+    float duskScoreEnterThreshold = 0.55f;
+    float duskScoreConfirmThreshold = 0.65f;
+    float duskScoreCancelThreshold = 0.30f;
+    uint32_t transitionConfirmMs = 900000;
+    uint32_t fallbackIntervalMs = 6UL * 3600 * 1000;
+    float latitude = 52.23f;
+    float longitude = 21.01f;
+    int8_t utcOffsetHours = 1;
+    float reservoirCapacityMl = 1500.0f;
+    float reservoirLowThresholdMl = 400.0f;
+    uint32_t manualMaxHoldMs = 30000;
+    uint32_t manualCooldownMs = 60000;
+    float anomalyDryingRateThreshold = 5.0f;
+    float anomalyDryingRateMultiplier = 3.0f;
+    bool vacationMode = false;
+    float vacationTargetReductionPct = 10.0f;
+    uint8_t vacationMaxPulsesOverride = 2;
+    float vacationCooldownMultiplier = 2.0f;
+};
+
+void migrateConfigV4ToV5(const LegacyConfigV4& legacy, Config& cfg) {
+    cfg = Config{};
+    cfg.mode = legacy.mode;
+    cfg.numPots = legacy.numPots;
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        cfg.pots[i].enabled = legacy.pots[i].enabled;
+        cfg.pots[i].plantProfileIndex = legacy.pots[i].plantProfileIndex;
+        cfg.pots[i].customTargetPct = legacy.pots[i].customTargetPct;
+        cfg.pots[i].customCriticalLowPct = legacy.pots[i].customCriticalLowPct;
+        cfg.pots[i].customMaxMoisturePct = legacy.pots[i].customMaxMoisturePct;
+        cfg.pots[i].customHysteresisPct = legacy.pots[i].customHysteresisPct;
+        cfg.pots[i].customSoakTimeMs = legacy.pots[i].customSoakTimeMs;
+        cfg.pots[i].customPulseWaterMl = legacy.pots[i].customPulseWaterMl;
+        cfg.pots[i].customMaxPulsesPerCycle = legacy.pots[i].customMaxPulsesPerCycle;
+        cfg.pots[i].pumpMlPerSec = legacy.pots[i].pumpMlPerSec;
+        cfg.pots[i].pumpCalibrated = legacy.pots[i].pumpCalibrated;
+        cfg.pots[i].potMaxActiveLow = legacy.pots[i].potMaxActiveLow;
+        cfg.pots[i].moistureEmaAlpha = legacy.pots[i].moistureEmaAlpha;
+        cfg.pots[i].pulseWaterMl = legacy.pots[i].pulseWaterMl;
+        applyPotMoistureDefaults(cfg.pots[i], i);
+    }
+    cfg.pumpOnMsMax = legacy.pumpOnMsMax;
+    cfg.cooldownMs = legacy.cooldownMs;
+    cfg.antiOverflowEnabled = legacy.antiOverflowEnabled;
+    cfg.overflowMaxWaitMs = legacy.overflowMaxWaitMs;
+    cfg.waterLevelUnknownPolicy = legacy.waterLevelUnknownPolicy;
+    cfg.heatBlockTempC = legacy.heatBlockTempC;
+    cfg.directSunLuxThreshold = legacy.directSunLuxThreshold;
+    cfg.morningWateringEnabled = legacy.morningWateringEnabled;
+    cfg.duskWateringWindowMs = legacy.duskWateringWindowMs;
+    cfg.duskScoreEnterThreshold = legacy.duskScoreEnterThreshold;
+    cfg.duskScoreConfirmThreshold = legacy.duskScoreConfirmThreshold;
+    cfg.duskScoreCancelThreshold = legacy.duskScoreCancelThreshold;
+    cfg.transitionConfirmMs = legacy.transitionConfirmMs;
+    cfg.fallbackIntervalMs = legacy.fallbackIntervalMs;
+    cfg.latitude = legacy.latitude;
+    cfg.longitude = legacy.longitude;
+    cfg.utcOffsetHours = legacy.utcOffsetHours;
+    cfg.reservoirCapacityMl = legacy.reservoirCapacityMl;
+    cfg.reservoirLowThresholdMl = legacy.reservoirLowThresholdMl;
+    cfg.manualMaxHoldMs = legacy.manualMaxHoldMs;
+    cfg.manualCooldownMs = legacy.manualCooldownMs;
+    cfg.anomalyDryingRateThreshold = legacy.anomalyDryingRateThreshold;
+    cfg.anomalyDryingRateMultiplier = legacy.anomalyDryingRateMultiplier;
+    cfg.vacationMode = legacy.vacationMode;
+    cfg.vacationTargetReductionPct = legacy.vacationTargetReductionPct;
+    cfg.vacationMaxPulsesOverride = legacy.vacationMaxPulsesOverride;
+    cfg.vacationCooldownMultiplier = legacy.vacationCooldownMultiplier;
+    cfg.schemaVersion = kConfigSchema;
+}
+
+void migrateConfigV5ToV6(const LegacyConfigV5& legacy, Config& cfg) {
+    cfg = Config{};
+    cfg.mode = legacy.mode;
+    cfg.numPots = legacy.numPots;
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        cfg.pots[i].enabled = legacy.pots[i].enabled;
+        cfg.pots[i].plantProfileIndex = legacy.pots[i].plantProfileIndex;
+        cfg.pots[i].customTargetPct = legacy.pots[i].customTargetPct;
+        cfg.pots[i].customCriticalLowPct = legacy.pots[i].customCriticalLowPct;
+        cfg.pots[i].customMaxMoisturePct = legacy.pots[i].customMaxMoisturePct;
+        cfg.pots[i].customHysteresisPct = legacy.pots[i].customHysteresisPct;
+        cfg.pots[i].customSoakTimeMs = legacy.pots[i].customSoakTimeMs;
+        cfg.pots[i].customPulseWaterMl = legacy.pots[i].customPulseWaterMl;
+        cfg.pots[i].customMaxPulsesPerCycle = legacy.pots[i].customMaxPulsesPerCycle;
+        cfg.pots[i].pumpMlPerSec = legacy.pots[i].pumpMlPerSec;
+        cfg.pots[i].pumpCalibrated = legacy.pots[i].pumpCalibrated;
+        cfg.pots[i].potMaxActiveLow = legacy.pots[i].potMaxActiveLow;
+        cfg.pots[i].moistureEmaAlpha = legacy.pots[i].moistureEmaAlpha;
+        cfg.pots[i].moistureDryRaw = legacy.pots[i].moistureDryRaw;
+        cfg.pots[i].moistureWetRaw = legacy.pots[i].moistureWetRaw;
+        cfg.pots[i].pulseWaterMl = legacy.pots[i].pulseWaterMl;
+        cfg.pots[i].moistureCurveExponent = defaultPotCurveExponent(i);
+    }
+    cfg.pumpOnMsMax = legacy.pumpOnMsMax;
+    cfg.cooldownMs = legacy.cooldownMs;
+    cfg.antiOverflowEnabled = legacy.antiOverflowEnabled;
+    cfg.overflowMaxWaitMs = legacy.overflowMaxWaitMs;
+    cfg.waterLevelUnknownPolicy = legacy.waterLevelUnknownPolicy;
+    cfg.heatBlockTempC = legacy.heatBlockTempC;
+    cfg.directSunLuxThreshold = legacy.directSunLuxThreshold;
+    cfg.morningWateringEnabled = legacy.morningWateringEnabled;
+    cfg.duskWateringWindowMs = legacy.duskWateringWindowMs;
+    cfg.duskScoreEnterThreshold = legacy.duskScoreEnterThreshold;
+    cfg.duskScoreConfirmThreshold = legacy.duskScoreConfirmThreshold;
+    cfg.duskScoreCancelThreshold = legacy.duskScoreCancelThreshold;
+    cfg.transitionConfirmMs = legacy.transitionConfirmMs;
+    cfg.fallbackIntervalMs = legacy.fallbackIntervalMs;
+    cfg.latitude = legacy.latitude;
+    cfg.longitude = legacy.longitude;
+    cfg.utcOffsetHours = legacy.utcOffsetHours;
+    cfg.reservoirCapacityMl = legacy.reservoirCapacityMl;
+    cfg.reservoirLowThresholdMl = legacy.reservoirLowThresholdMl;
+    cfg.manualMaxHoldMs = legacy.manualMaxHoldMs;
+    cfg.manualCooldownMs = legacy.manualCooldownMs;
+    cfg.anomalyDryingRateThreshold = legacy.anomalyDryingRateThreshold;
+    cfg.anomalyDryingRateMultiplier = legacy.anomalyDryingRateMultiplier;
+    cfg.vacationMode = legacy.vacationMode;
+    cfg.vacationTargetReductionPct = legacy.vacationTargetReductionPct;
+    cfg.vacationMaxPulsesOverride = legacy.vacationMaxPulsesOverride;
+    cfg.vacationCooldownMultiplier = legacy.vacationCooldownMultiplier;
+    cfg.schemaVersion = kConfigSchema;
+}
+}
+
 // ---------------------------------------------------------------------------
 // Profile roślin — stała tablica (PLAN.md → "Profile roślin")
 // ---------------------------------------------------------------------------
@@ -59,6 +342,18 @@ bool configValidate(const Config& cfg) {
             Serial.printf("[CONFIG] FAIL: pots[%d].moistureEmaAlpha=%.2f\n", i, pot.moistureEmaAlpha);
             ok = false;
         }
+        if (!moistureEndpointsValid(pot.moistureDryRaw, pot.moistureWetRaw)) {
+            Serial.printf("[CONFIG] FAIL: pots[%d].moistureDryRaw=%u moistureWetRaw=%u\n",
+                          i,
+                          static_cast<unsigned>(pot.moistureDryRaw),
+                          static_cast<unsigned>(pot.moistureWetRaw));
+            ok = false;
+        }
+        if (!moistureCurveExponentValid(pot.moistureCurveExponent)) {
+            Serial.printf("[CONFIG] FAIL: pots[%d].moistureCurveExponent=%.2f\n",
+                          i, pot.moistureCurveExponent);
+            ok = false;
+        }
     }
 
     if (cfg.pumpOnMsMax == 0) { Serial.println("[CONFIG] FAIL: pumpOnMsMax=0"); ok = false; }
@@ -89,8 +384,10 @@ bool configValidate(const Config& cfg) {
 void configLoadDefaults(Config& cfg) {
     cfg = Config{};                  // struct defaults
     cfg.pots[0].enabled = true;      // pot 0 zawsze aktywna
-    cfg.pots[0].pumpMlPerSec = 5.17f; // zmierzone 2026-03-01
-    cfg.pots[0].pumpCalibrated = true;
+    applyFixedPumpParameters(cfg);
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        applyPotMoistureDefaults(cfg.pots[i], i);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -127,28 +424,75 @@ bool configLoad(Config& cfg) {
     }
 
     uint16_t schema = prefs.getUShort("schema", 0);
-    if (schema != kConfigSchema) {
-        Serial.printf("[CONFIG] Schema mismatch (nvs=%d, expected=%d) — using defaults\n",
-                      schema, kConfigSchema);
+    size_t storedLen = prefs.getBytesLength("cfg");
+
+    if (schema == kConfigSchema && storedLen == sizeof(Config)) {
+        size_t len = prefs.getBytes("cfg", &cfg, sizeof(Config));
+        prefs.end();
+
+        if (len != sizeof(Config)) {
+            Serial.printf("[CONFIG] NVS read size mismatch (%d vs %d) — defaults\n",
+                          (int)len, (int)sizeof(Config));
+            configLoadDefaults(cfg);
+            return false;
+        }
+    } else if (schema == 4 && storedLen == sizeof(LegacyConfigV4)) {
+        LegacyConfigV4 legacy{};
+        size_t len = prefs.getBytes("cfg", &legacy, sizeof(legacy));
+        prefs.end();
+        if (len != sizeof(legacy)) {
+            Serial.printf("[CONFIG] Legacy NVS read size mismatch (%d vs %d) — defaults\n",
+                          (int)len, (int)sizeof(legacy));
+            configLoadDefaults(cfg);
+            return false;
+        }
+        migrateConfigV4ToV5(legacy, cfg);
+        if (!configValidate(cfg)) {
+            Serial.println("[CONFIG] Migrated config failed validation — using defaults");
+            configLoadDefaults(cfg);
+            return false;
+        }
+        configSave(cfg);
+        Serial.println("[CONFIG] Migrated config v4 -> v5");
+        return true;
+    } else if (schema == 5 && storedLen == sizeof(LegacyConfigV5)) {
+        LegacyConfigV5 legacy{};
+        size_t len = prefs.getBytes("cfg", &legacy, sizeof(legacy));
+        prefs.end();
+        if (len != sizeof(legacy)) {
+            Serial.printf("[CONFIG] Legacy v5 NVS read size mismatch (%d vs %d) — defaults\n",
+                          (int)len, (int)sizeof(legacy));
+            configLoadDefaults(cfg);
+            return false;
+        }
+        migrateConfigV5ToV6(legacy, cfg);
+        if (!configValidate(cfg)) {
+            Serial.println("[CONFIG] Migrated v5 config failed validation — using defaults");
+            configLoadDefaults(cfg);
+            return false;
+        }
+        configSave(cfg);
+        Serial.println("[CONFIG] Migrated config v5 -> v6");
+        return true;
+    } else {
+        Serial.printf("[CONFIG] Schema mismatch (nvs=%d len=%d, expected=%d len=%d) — using defaults\n",
+                      schema, (int)storedLen, kConfigSchema, (int)sizeof(Config));
         prefs.end();
         configLoadDefaults(cfg);
         return false;
     }
 
-    size_t len = prefs.getBytes("cfg", &cfg, sizeof(Config));
-    prefs.end();
-
-    if (len != sizeof(Config)) {
-        Serial.printf("[CONFIG] NVS read size mismatch (%d vs %d) — defaults\n",
-                      (int)len, (int)sizeof(Config));
-        configLoadDefaults(cfg);
-        return false;
-    }
+    bool fixedPumpParamsChanged = normalizeFixedPumpParameters(cfg);
 
     if (!configValidate(cfg)) {
         Serial.println("[CONFIG] Loaded config failed validation — using defaults");
         configLoadDefaults(cfg);
         return false;
+    }
+
+    if (fixedPumpParamsChanged) {
+        configSave(cfg);
+        Serial.println("[CONFIG] Applied fixed M5 Watering pump parameters");
     }
 
     Serial.printf("[CONFIG] Loaded OK: numPots=%d, mode=%s, reservoir=%.0fml\n",

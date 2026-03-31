@@ -12,6 +12,7 @@
 #include "events.h"
 #include "network.h"
 #include <M5Unified.h>
+#include <cstring>
 #include "log_serial.h"
 
 #define Serial AGSerial
@@ -168,6 +169,160 @@ static void formatUptimeCompact(uint32_t nowMs, char* out, size_t outSize) {
 
     uint32_t weeks = days / 7;
     snprintf(out, outSize, "UP %luw", (unsigned long)weeks);
+}
+
+static bool uiMoistureLooksOutOfSoil(float moisturePct) {
+    return moisturePct >= 0.0f && moisturePct <= 5.0f;
+}
+
+static void copyFittedText(const char* src, char* out, size_t outSize, int16_t maxWidth) {
+    if (!out || outSize == 0) {
+        return;
+    }
+    if (!src) {
+        out[0] = '\0';
+        return;
+    }
+
+    snprintf(out, outSize, "%s", src);
+    if (C.textWidth(out) <= maxWidth) {
+        return;
+    }
+
+    const char* ellipsis = "...";
+    size_t srcLen = strlen(src);
+    for (size_t keep = srcLen; keep > 0; --keep) {
+        snprintf(out, outSize, "%.*s%s", static_cast<int>(keep), src, ellipsis);
+        if (C.textWidth(out) <= maxWidth) {
+            return;
+        }
+    }
+
+    snprintf(out, outSize, "%s", ellipsis);
+}
+
+static void drawCompactChip(int16_t x, int16_t y, int16_t w, const char* text,
+                            uint16_t bgColor, uint16_t textColor = COL_TEXT) {
+    C.fillRoundRect(x, y, w, 14, 3, bgColor);
+    C.drawRoundRect(x, y, w, 14, 3, COL_SEP);
+    C.setTextSize(1);
+    C.setTextDatum(textdatum_t::middle_center);
+    C.setTextColor(textColor);
+    C.drawString(text ? text : "", x + (w / 2), y + 7);
+    C.setTextDatum(textdatum_t::top_left);
+}
+
+static void formatDualPotStatus(uint32_t nowMs,
+                                const UiSnap& snap,
+                                uint8_t potIdx,
+                                float moisturePct,
+                                char* out,
+                                size_t outSize,
+                                uint16_t& color) {
+    const PotSensorSnapshot& ps = snap.sensors.pots[potIdx];
+    const WateringCycle& cyc = snap.cycles[potIdx];
+    const PotConfig& potCfg = snap.config.pots[potIdx];
+    const PlantProfile& prof = getActiveProfile(snap.config, potIdx);
+
+    if (cyc.phase == WateringPhase::PULSE) {
+        snprintf(out, outSize, "%u/%u",
+                 static_cast<unsigned>(cyc.pulseCount + 1),
+                 static_cast<unsigned>(cyc.maxPulses));
+        color = COL_BLUE;
+        return;
+    }
+    if (cyc.phase == WateringPhase::SOAK) {
+        snprintf(out, outSize, "%s", "SOAK");
+        color = COL_CYAN;
+        return;
+    }
+    if (cyc.phase == WateringPhase::MEASURING) {
+        snprintf(out, outSize, "%s", "MEAS");
+        color = COL_CYAN;
+        return;
+    }
+    if (cyc.phase == WateringPhase::OVERFLOW_WAIT) {
+        snprintf(out, outSize, "%s", "OVFL");
+        color = COL_ORANGE;
+        return;
+    }
+    if (cyc.phase == WateringPhase::DONE) {
+        snprintf(out, outSize, "%s", "DONE");
+        color = COL_GREEN;
+        return;
+    }
+    if (cyc.phase == WateringPhase::BLOCKED) {
+        if (ps.waterGuards.potMax == WaterLevelState::TRIGGERED) {
+            snprintf(out, outSize, "%s", "OVF");
+        } else if (ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ||
+                   (snap.budget.reservoirLow && snap.budget.reservoirCurrentMl <= 0.0f)) {
+            snprintf(out, outSize, "%s", "TANK");
+        } else if ((snap.config.waterLevelUnknownPolicy == UnknownPolicy::BLOCK) &&
+                   (ps.waterGuards.potMax == WaterLevelState::UNKNOWN ||
+                    ps.waterGuards.reservoirMin == WaterLevelState::UNKNOWN)) {
+            snprintf(out, outSize, "%s", "SNS?");
+        } else if (potCfg.pumpMlPerSec <= 0.0f) {
+            snprintf(out, outSize, "%s", "CFG?");
+        } else {
+            snprintf(out, outSize, "%s", "BLOCK");
+        }
+        color = COL_RED;
+        return;
+    }
+
+    uint32_t effCooldown = snap.config.cooldownMs;
+    if (snap.config.vacationMode) {
+        effCooldown = static_cast<uint32_t>(effCooldown * snap.config.vacationCooldownMultiplier);
+    }
+    bool cooling = snap.lastCycleDoneMs[potIdx] != 0
+        && (nowMs - snap.lastCycleDoneMs[potIdx]) < effCooldown;
+
+    float targetPct = effectiveTargetPct(prof, snap.config);
+    float triggerPct = targetPct - prof.hysteresisPct;
+
+    if (snap.config.mode != Mode::AUTO) {
+        snprintf(out, outSize, "%s", "MAN");
+        color = COL_YELLOW;
+    } else if (ps.waterGuards.potMax == WaterLevelState::TRIGGERED) {
+        snprintf(out, outSize, "%s", "OVF");
+        color = COL_RED;
+    } else if (ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ||
+               (snap.budget.reservoirLow && snap.budget.reservoirCurrentMl <= 0.0f)) {
+        snprintf(out, outSize, "%s", "TANK");
+        color = COL_RED;
+    } else if ((snap.config.waterLevelUnknownPolicy == UnknownPolicy::BLOCK) &&
+               (ps.waterGuards.potMax == WaterLevelState::UNKNOWN ||
+                ps.waterGuards.reservoirMin == WaterLevelState::UNKNOWN)) {
+        snprintf(out, outSize, "%s", "SNS?");
+        color = COL_ORANGE;
+    } else if (uiMoistureLooksOutOfSoil(moisturePct)) {
+        snprintf(out, outSize, "%s", "PROBE");
+        color = COL_ORANGE;
+    } else if (moisturePct >= prof.maxMoisturePct) {
+        snprintf(out, outSize, "%s", "WET");
+        color = COL_GREEN;
+    } else if (moisturePct >= triggerPct) {
+        snprintf(out, outSize, "%s", "OK");
+        color = COL_GREEN;
+    } else if (cooling) {
+        snprintf(out, outSize, "%s", "COOL");
+        color = COL_BLUE;
+    } else if (potCfg.pumpMlPerSec <= 0.0f) {
+        snprintf(out, outSize, "%s", "CFG?");
+        color = COL_ORANGE;
+    } else if (snap.sensors.env.tempC > snap.config.heatBlockTempC) {
+        snprintf(out, outSize, "%s", "HEAT");
+        color = COL_ORANGE;
+    } else if (snap.sensors.env.lux > snap.config.directSunLuxThreshold) {
+        snprintf(out, outSize, "%s", "SUN");
+        color = COL_YELLOW;
+    } else if (snap.duskPhase == DuskPhase::DAY || snap.duskPhase == DuskPhase::DAWN_TRANSITION) {
+        snprintf(out, outSize, "%s", "WAIT");
+        color = COL_DIM;
+    } else {
+        snprintf(out, outSize, "%s", "ARM");
+        color = COL_CYAN;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +551,7 @@ void uiTick(uint32_t nowMs, UiState& state, const UiSnap& snap) {
     case UiScreen::MAIN:
     default:
         if (snap.config.numPots == 1) {
-            renderSinglePotScreen(nowMs, snap, 0);
+            renderDualPotScreen(nowMs, snap, state);
         } else {
             switch (state.dualViewMode) {
             case DualViewMode::DETAIL_POT0:
@@ -626,150 +781,104 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
 }
 
 // ===========================================================================
-// renderDualPotScreen — kompaktowy widok 2 doniczek (135×240)
-// Wypełnia cały ekran: pot1 → pot2 → reservoir → env → mode → dusk → raw → alerts
+// renderDualPotScreen — kompaktowy widok główny (135×240)
+// Dla 2 potów: pot1 → pot2 → shared info.
+// Dla 1 pota: pierwszy kafelek aktywny, drugi slot pozostaje pusty.
 // ===========================================================================
 void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& state) {
     char buf[48];
+    char labelBuf[24];
 
-    // Każda doniczka: 46px (0-45, 48-93)
+    // Każda doniczka: 50px (0-49, 52-101)
     for (uint8_t i = 0; i < 2; ++i) {
         if (!snap.config.pots[i].enabled) continue;
         const PotSensorSnapshot& ps = snap.sensors.pots[i];
         const PlantProfile& prof    = getActiveProfile(snap.config, i);
-        const WateringCycle& cyc    = snap.cycles[i];
-
-        int16_t baseY = i * 48;  // pot0: 0, pot1: 48
+        int16_t baseY = i * 52;  // pot0: 0, pot1: 52
         float moist = (ps.moistureEma > 0) ? ps.moistureEma : ps.moisturePct;
         float targetPct = effectiveTargetPct(prof, snap.config);
         TargetState targetState = targetStateForMoisture(moist, prof, snap.config);
         uint16_t mColor = moistureColor(moist, prof);
+        uint16_t statusColor = COL_GRAY;
+        char statusBuf[16];
+        formatDualPotStatus(nowMs, snap, i, moist, statusBuf, sizeof(statusBuf), statusColor);
 
         // Selected pot highlight
         if (i == state.selectedPot) {
-            C.fillRoundRect(0, baseY, SCR_W, 46, 3, COL_PANEL);
+            C.fillRoundRect(0, baseY, SCR_W, 50, 3, COL_PANEL);
         }
 
-        // Wiersz 1: ikona + numer + wilgotność duża + target
+        // Wiersz 1: ikona + wilgotność duża + target
         iconSeedling(4, baseY + 2, mColor);  // 🌱
         C.setTextSize(2);
         C.setTextColor(mColor);
         snprintf(buf, sizeof(buf), "%.0f %%", moist);
         C.drawString(buf, TXI, baseY + 2);
 
-        C.setTextColor(COL_DIM);
-        snprintf(buf, sizeof(buf), "P%d", i + 1);
-        C.drawString(buf, 2, baseY + 0);
-
         C.setTextSize(1);
-        iconTarget(88, baseY + 2, targetState);     // 🎯 target dynamic
+        iconTarget(92, baseY + 2, targetState);     // 🎯 target dynamic
         C.setTextColor(COL_DIM);
         snprintf(buf, sizeof(buf), "%.0f %%", targetPct);
-        C.drawString(buf, 102, baseY + 4);
+        C.drawString(buf, 106, baseY + 4);
 
-        // Wiersz 2: profil ikona + nazwa + faza podlewania
+        // Wiersz 2: profil ikona + nazwa + logiczny status po prawej
         drawPlantIcon(4, baseY + 18, snap.config.pots[i].plantProfileIndex);
         C.setTextColor(COL_CYAN);
-        snprintf(buf, sizeof(buf), "%s", prof.name ? prof.name : "?");
-        C.drawString(buf, TXI, baseY + 20);
+        copyFittedText(prof.name ? prof.name : "?", labelBuf, sizeof(labelBuf), 64);
+        C.drawString(labelBuf, TXI, baseY + 20);
+        drawCompactChip(90, baseY + 19, 41, statusBuf, statusColor == COL_RED ? 0x7800 : COL_PANEL, statusColor);
 
-        // Faza podlewania — kolorowa, prawo
-        uint16_t phColor = COL_GRAY;
-        switch (cyc.phase) {
-            case WateringPhase::IDLE:     phColor = COL_GRAY; break;
-            case WateringPhase::PULSE:    phColor = COL_BLUE; break;
-            case WateringPhase::SOAK:     phColor = COL_CYAN; break;
-            case WateringPhase::DONE:     phColor = COL_GREEN; break;
-            default:                      phColor = COL_YELLOW; break;
-        }
-        C.setTextColor(phColor);
-        const char* phStr = phaseStr(cyc.phase);
-        if (cyc.phase == WateringPhase::PULSE) {
-            snprintf(buf, sizeof(buf), "%s%d/%d", phStr, cyc.pulseCount + 1, cyc.maxPulses);
-            C.drawString(buf, 72, baseY + 20);
-        } else {
-            C.drawString(phStr, 86, baseY + 20);
-        }
-
-        // Wiersz 3: pasek wilgotności + totalPumped jeśli aktywne
-        drawProgressBar(4, baseY + 32, SCR_W - 8, 8, moist / 100.0f, mColor);
-
-        if (cyc.totalPumpedMl > 0 && cyc.phase != WateringPhase::IDLE) {
-            C.setTextColor(COL_DIM);
-            snprintf(buf, sizeof(buf), "%.0f ml", cyc.totalPumpedMl);
-            int16_t tw = C.textWidth(buf);
-            C.drawString(buf, SCR_W - 4 - tw, baseY + 42);
-        }
+        // Wiersz 3: pasek wilgotności
+        drawProgressBar(4, baseY + 36, SCR_W - 8, 10, moist / 100.0f, mColor);
 
         // Separator między doniczkami
-        if (i == 0) drawSep(46);
+        if (i == 0) drawSep(50);
     }
 
-    drawSep(96);
+    drawSep(104);
 
-    // ── Shared info (y 98-230) ────────────────────────────────
+    // ── Shared info compact (y 108-214) ───────────────────────
     const WaterBudget& bud = snap.budget;
     const EnvSnapshot& env = snap.sensors.env;
 
-    // Reservoir (y 98-112)
+    // Reservoir — pełna szerokość
     uint16_t rColor = (bud.daysRemaining > 3) ? COL_GREEN :
                       (bud.daysRemaining > 1) ? COL_YELLOW : COL_RED;
     C.setTextSize(1);
-    iconDrop(4, 98);                 // 💧
-    C.setTextColor(rColor);
-    snprintf(buf, sizeof(buf), "%.0f ml", bud.reservoirCurrentMl);
-    C.drawString(buf, TXI, 101);
-    C.setTextColor(COL_DIM);
-    snprintf(buf, sizeof(buf), "~%dd", (int)bud.daysRemaining);
-    C.drawString(buf, 60, 101);
+    snprintf(buf, sizeof(buf), "RES %.0fml  ~%dd", bud.reservoirCurrentMl, (int)bud.daysRemaining);
+    drawCompactChip(4, 108, 127, buf, bud.reservoirLow ? 0x7800 : COL_DKBLUE, rColor);
 
-    // Guards
+    // Guards per pot — połowa szerokości każdy
     bool res0Ovf = (snap.sensors.pots[0].waterGuards.potMax == WaterLevelState::TRIGGERED);
     bool res1Ovf = (snap.sensors.pots[1].waterGuards.potMax == WaterLevelState::TRIGGERED);
-    bool resLow  = bud.reservoirLow;
-    iconPot(80, 98);                 // 🪴
-    C.setTextColor(resLow ? COL_RED : COL_GREEN);
-    C.drawString(resLow ? "LOW" : "OK", 94, 101);
+    snprintf(buf, sizeof(buf), "OVF1 %s", res0Ovf ? "HIT" : "OK");
+    drawCompactChip(4, 126, 61, buf, res0Ovf ? 0x7800 : COL_PANEL, res0Ovf ? COL_RED : COL_GREEN);
+    snprintf(buf, sizeof(buf), "OVF2 %s", res1Ovf ? "HIT" : "OK");
+    drawCompactChip(70, 126, 61, buf, res1Ovf ? 0x7800 : COL_PANEL, res1Ovf ? COL_RED : COL_GREEN);
 
-    // Environment: temp + humidity (y 114-126)
-    iconThermo(4, 114);              // 🌡
-    C.setTextColor(COL_TEXT);
-    snprintf(buf, sizeof(buf), "%.1f C", env.tempC);
-    C.drawString(buf, TXI, 117);
+    // Env + humidity
+    snprintf(buf, sizeof(buf), "T %.1fC", env.tempC);
+    drawCompactChip(4, 144, 61, buf, COL_PANEL, COL_TEXT);
+    snprintf(buf, sizeof(buf), "H %.0f%%", env.humidityPct);
+    drawCompactChip(70, 144, 61, buf, COL_PANEL, COL_CYAN);
 
-    iconDrop(60, 114);               // 💧 humidity
-    C.setTextColor(COL_CYAN);
-    snprintf(buf, sizeof(buf), "%.0f %%", env.humidityPct);
-    C.drawString(buf, 74, 117);
+    // Lux + pressure
+    snprintf(buf, sizeof(buf), "L %.0flx", env.lux);
+    drawCompactChip(4, 162, 61, buf, COL_PANEL, COL_YELLOW);
+    snprintf(buf, sizeof(buf), "P %.0f", env.pressureHpa);
+    drawCompactChip(70, 162, 61, buf, COL_PANEL, COL_TEXT);
 
-    // Lux + pressure (y 128-140)
-    iconSun(4, 128);                 // ☀
-    C.setTextColor(COL_YELLOW);
-    snprintf(buf, sizeof(buf), "%.0f lx", env.lux);
-    C.drawString(buf, TXI, 131);
-
-    iconBarometer(60, 128, COL_TEXT);
-    C.setTextColor(COL_TEXT);
-    snprintf(buf, sizeof(buf), "%.0f hPa", env.pressureHpa);
-    C.drawString(buf, 74, 131);
-
-    drawSep(144);
-
-    // Mode + WiFi (y 146-158)
-    iconGear(4, 146);                // ⚙
-    C.setTextColor(snap.config.mode == Mode::AUTO ? COL_GREEN : COL_YELLOW);
+    // Mode + WiFi
     snprintf(buf, sizeof(buf), "%s%s",
              snap.config.mode == Mode::AUTO ? "AUTO" : "MAN",
-             snap.config.vacationMode ? " VAC" : "");
-    C.drawString(buf, TXI, 149);
+             snap.config.vacationMode ? "/VAC" : "");
+    drawCompactChip(4, 180, 61, buf, COL_PANEL,
+                    snap.config.mode == Mode::AUTO ? COL_GREEN : COL_YELLOW);
+    drawCompactChip(70, 180, 61, snap.wifiConnected ? "WIFI OK" : "WIFI --",
+                    COL_PANEL,
+                    snap.wifiConnected ? COL_GREEN : COL_GRAY);
 
-    iconWifi(80, 146, snap.wifiConnected ? COL_GREEN : COL_GRAY); // 📶
-    C.setTextColor(snap.wifiConnected ? COL_GREEN : COL_GRAY);
-    C.drawString(snap.wifiConnected ? "OK" : "--", 94, 149);
-
-    // Dusk + uptime (y 160-174)
-    iconSun(4, 162, snap.duskPhase == DuskPhase::DAY ? COL_YELLOW : COL_GRAY);
-    C.setTextColor(COL_DIM);
+    // Dusk + uptime
     const char* duskStr2 = "?";
     switch (snap.duskPhase) {
         case DuskPhase::DAY:             duskStr2 = "DAY"; break;
@@ -777,38 +886,15 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
         case DuskPhase::DUSK_TRANSITION: duskStr2 = "DUSK"; break;
         case DuskPhase::DAWN_TRANSITION: duskStr2 = "DAWN"; break;
     }
-    C.drawString(duskStr2, TXI, 164);
-
-    iconClock(66, 162);              // ⏰
+    drawCompactChip(4, 198, 61, duskStr2, COL_PANEL, COL_DIM);
     formatUptimeCompact(nowMs, buf, sizeof(buf));
-    C.drawString(buf, 80, 164);
+    drawCompactChip(70, 198, 61, buf, COL_PANEL, COL_DIM);
 
-    drawSep(178);
-
-    // Raw data per pot (y 180-204)
-    C.setTextColor(COL_DIM);
-    for (uint8_t i = 0; i < 2; ++i) {
-        if (!snap.config.pots[i].enabled) continue;
-        const PotSensorSnapshot& ps2 = snap.sensors.pots[i];
-        int16_t ry = 180 + i * 12;
-        snprintf(buf, sizeof(buf), "%d:RAWf:%d E:%.1f %%",
-             i + 1, ps2.moistureRawFiltered, ps2.moistureEma);
-        C.drawString(buf, 4, ry);
-    }
-
-    // Alert banners (y 210+)
-    int16_t alertY = 212;
-    if (resLow) {
-        drawAlertBanner(alertY, "! RESERVOIR LOW", COL_RED);
-        alertY += 24;
-    }
-    if (res0Ovf) {
-        drawAlertBanner(alertY, "! POT1 OVERFLOW", COL_RED);
-        alertY += 24;
-    }
-    if (res1Ovf) {
-        drawAlertBanner(alertY, "! POT2 OVERFLOW", COL_RED);
-    }
+    // RAWf per pot — dwa pola, bez pełnej szerokości
+    snprintf(buf, sizeof(buf), "P1 %u", static_cast<unsigned>(snap.sensors.pots[0].moistureRawFiltered));
+    drawCompactChip(4, 216, 61, buf, COL_PANEL, COL_DIM);
+    snprintf(buf, sizeof(buf), "P2 %u", static_cast<unsigned>(snap.sensors.pots[1].moistureRawFiltered));
+    drawCompactChip(70, 216, 61, buf, COL_PANEL, COL_DIM);
 }
 
 // ===========================================================================
@@ -825,10 +911,40 @@ static constexpr float kResLowStepMl = 100.0f;
 static constexpr uint16_t kPulseMinMl  = 10;
 static constexpr uint16_t kPulseMaxMl  = 100;
 static constexpr uint16_t kPulseStepMl = 5;
+static constexpr uint16_t kMoistureRawMin = 0;
+static constexpr uint16_t kMoistureRawMax = 4095;
+static constexpr uint16_t kMoistureRawStep = 4;
+static constexpr uint16_t kMoistureRawMinGap = 32;
+static constexpr float kMoistureCurveExpMin = 0.10f;
+static constexpr float kMoistureCurveExpMax = 12.00f;
+static constexpr float kMoistureCurveExpStep = 0.01f;
+static constexpr uint8_t kSettingsVisibleRows = 8;
+static constexpr uint8_t kSettingsActionCountMax = 17;
+
+static uint8_t uiSettingsVisibleCount(const Config& cfg) {
+    uint8_t count = 13;  // base items for 1-pot layout
+    if (cfg.numPots >= 2) {
+        count += 4;      // Profil 2 + P2 Dry/Wet/Exp
+    }
+    return count;
+}
+
+static void uiClampSettingsIndex(UiState& state, const Config& cfg) {
+    uint8_t visibleCount = uiSettingsVisibleCount(cfg);
+    if (visibleCount == 0) {
+        state.settingsIndex = 0;
+        return;
+    }
+    if (state.settingsIndex >= visibleCount) {
+        state.settingsIndex = visibleCount - 1;
+    }
+}
 
 void renderSettingsScreen(const UiSnap& snap, const UiState& state) {
     const Config& cfg = snap.config;
     char buf[48];
+    UiState clampedState = state;
+    uiClampSettingsIndex(clampedState, cfg);
 
     // Header
     C.setTextSize(2);
@@ -839,12 +955,18 @@ void renderSettingsScreen(const UiSnap& snap, const UiState& state) {
 
     // Items
     struct MenuItem { const char* label; char value[20]; bool visible; };
-    MenuItem items[12];
+    MenuItem items[20];
     uint8_t itemCount = 0;
 
     { auto& m = items[itemCount++]; m.label = "Pompy";     snprintf(m.value, 20, "%d", cfg.numPots); m.visible = true; }
     { auto& m = items[itemCount++]; m.label = "Profil 1";  snprintf(m.value, 20, "%s", getActiveProfile(cfg, 0).name); m.visible = true; }
     { auto& m = items[itemCount++]; m.label = "Profil 2";  snprintf(m.value, 20, "%s", getActiveProfile(cfg, 1).name); m.visible = (cfg.numPots >= 2); }
+    { auto& m = items[itemCount++]; m.label = "P1 Dry";    snprintf(m.value, 20, "%u", cfg.pots[0].moistureDryRaw); m.visible = true; }
+    { auto& m = items[itemCount++]; m.label = "P1 Wet";    snprintf(m.value, 20, "%u", cfg.pots[0].moistureWetRaw); m.visible = true; }
+    { auto& m = items[itemCount++]; m.label = "P1 Exp";    snprintf(m.value, 20, "%.2f", cfg.pots[0].moistureCurveExponent); m.visible = true; }
+    { auto& m = items[itemCount++]; m.label = "P2 Dry";    snprintf(m.value, 20, "%u", cfg.pots[1].moistureDryRaw); m.visible = (cfg.numPots >= 2); }
+    { auto& m = items[itemCount++]; m.label = "P2 Wet";    snprintf(m.value, 20, "%u", cfg.pots[1].moistureWetRaw); m.visible = (cfg.numPots >= 2); }
+    { auto& m = items[itemCount++]; m.label = "P2 Exp";    snprintf(m.value, 20, "%.2f", cfg.pots[1].moistureCurveExponent); m.visible = (cfg.numPots >= 2); }
 
     // Indeksy profili do rysowania ikon w Settings (oblicz po zbudowaniu items)
     uint8_t profIdx0 = cfg.pots[0].plantProfileIndex;
@@ -858,11 +980,31 @@ void renderSettingsScreen(const UiSnap& snap, const UiState& state) {
     { auto& m = items[itemCount++]; m.label = "WiFi";      snprintf(m.value, 20, "%s", snap.netConfig.provisioned ? snap.netConfig.wifiSsid : "Brak"); m.visible = true; }
     { auto& m = items[itemCount++]; m.label = "Reset";     snprintf(m.value, 20, "BtnA+B 5s"); m.visible = true; }
 
+    uint8_t visibleCount = 0;
+    for (uint8_t i = 0; i < itemCount; ++i) {
+        if (items[i].visible) visibleCount++;
+    }
+
+    uint8_t startIdx = 0;
+    if (clampedState.settingsIndex >= kSettingsVisibleRows) {
+        startIdx = clampedState.settingsIndex - (kSettingsVisibleRows - 1);
+    }
+    if (visibleCount > kSettingsVisibleRows && startIdx > (visibleCount - kSettingsVisibleRows)) {
+        startIdx = visibleCount - kSettingsVisibleRows;
+    }
+
     uint8_t visIdx = 0;
+    uint8_t drawRow = 0;
     for (uint8_t i = 0; i < itemCount; ++i) {
         if (!items[i].visible) continue;
-        int16_t y = 28 + visIdx * 22;
-        bool sel = (visIdx == state.settingsIndex);
+        bool sel = (visIdx == clampedState.settingsIndex);
+        if (visIdx < startIdx) {
+            visIdx++;
+            continue;
+        }
+        if (drawRow >= kSettingsVisibleRows) break;
+
+        int16_t y = 28 + drawRow * 22;
 
         if (sel) C.fillRoundRect(2, y - 2, SCR_W - 4, 20, 3, COL_PANEL);
 
@@ -884,6 +1026,7 @@ void renderSettingsScreen(const UiSnap& snap, const UiState& state) {
         C.drawString(items[i].value, SCR_W - 4 - valW, y);
 
         visIdx++;
+        drawRow++;
     }
 
     // Footer hint
@@ -909,8 +1052,7 @@ void uiHandleBtnA(UiState& state, const Config& cfg) {
 
 void uiHandleBtnB(UiState& state, const Config& cfg) {
     if (state.screen == UiScreen::SETTINGS) {
-        uint8_t visCount = 10; // Pompy, Profil1, Rezerwuar, Rez.min, Puls, REFILL, Tryb, Vacation, WiFi, Reset
-        if (cfg.numPots >= 2) visCount++;  // + Profil2
+        uint8_t visCount = uiSettingsVisibleCount(cfg);
         state.settingsIndex = (state.settingsIndex + 1) % visCount;
     } else {
         if (cfg.numPots <= 1) return;
@@ -936,11 +1078,41 @@ void uiHandleBtnB(UiState& state, const Config& cfg) {
 bool uiHandleBtnBLong(UiState& state, Config& cfg, WaterBudget& budget) {
     if (state.screen != UiScreen::SETTINGS) return false;
 
-    uint8_t actionMap[12];
+    uiClampSettingsIndex(state, cfg);
+
+    auto nextDryRaw = [&](uint8_t potIdx) {
+        uint16_t minValue = cfg.pots[potIdx].moistureWetRaw + kMoistureRawMinGap;
+        uint16_t next = cfg.pots[potIdx].moistureDryRaw + kMoistureRawStep;
+        if (next > kMoistureRawMax) next = minValue;
+        if (next < minValue) next = minValue;
+        cfg.pots[potIdx].moistureDryRaw = next;
+    };
+
+    auto nextWetRaw = [&](uint8_t potIdx) {
+        uint16_t maxValue = cfg.pots[potIdx].moistureDryRaw - kMoistureRawMinGap;
+        uint16_t next = cfg.pots[potIdx].moistureWetRaw + kMoistureRawStep;
+        if (next > maxValue) next = kMoistureRawMin;
+        if (next > maxValue) next = maxValue;
+        cfg.pots[potIdx].moistureWetRaw = next;
+    };
+
+    auto nextCurveExponent = [&](uint8_t potIdx) {
+        float next = cfg.pots[potIdx].moistureCurveExponent + kMoistureCurveExpStep;
+        if (next > kMoistureCurveExpMax + 0.0001f) next = kMoistureCurveExpMin;
+        cfg.pots[potIdx].moistureCurveExponent = next;
+    };
+
+    uint8_t actionMap[kSettingsActionCountMax];
     uint8_t actionCount = 0;
     actionMap[actionCount++] = 0;   // Pompy
     actionMap[actionCount++] = 1;   // Profil 1
     if (cfg.numPots >= 2) actionMap[actionCount++] = 2; // Profil 2
+    actionMap[actionCount++] = 11;  // P1 Dry
+    actionMap[actionCount++] = 12;  // P1 Wet
+    actionMap[actionCount++] = 15;  // P1 Exp
+    if (cfg.numPots >= 2) actionMap[actionCount++] = 13; // P2 Dry
+    if (cfg.numPots >= 2) actionMap[actionCount++] = 14; // P2 Wet
+    if (cfg.numPots >= 2) actionMap[actionCount++] = 16; // P2 Exp
     actionMap[actionCount++] = 3;   // Rezerwuar
     actionMap[actionCount++] = 4;   // Rez.min
     actionMap[actionCount++] = 10;  // Puls
@@ -959,6 +1131,7 @@ bool uiHandleBtnBLong(UiState& state, Config& cfg, WaterBudget& budget) {
     case 0:
         cfg.numPots = (cfg.numPots == 1) ? 2 : 1;
         cfg.pots[1].enabled = (cfg.numPots == 2);
+        uiClampSettingsIndex(state, cfg);
         Serial.printf("[UI] event=settings_update key=num_pots value=%u\n", cfg.numPots);
         changed = true;
         break;
@@ -1023,6 +1196,30 @@ bool uiHandleBtnBLong(UiState& state, Config& cfg, WaterBudget& budget) {
         changed = true;
         break;
     }
+    case 11:
+        nextDryRaw(0);
+        changed = true;
+        break;
+    case 12:
+        nextWetRaw(0);
+        changed = true;
+        break;
+    case 13:
+        nextDryRaw(1);
+        changed = true;
+        break;
+    case 14:
+        nextWetRaw(1);
+        changed = true;
+        break;
+    case 15:
+        nextCurveExponent(0);
+        changed = true;
+        break;
+    case 16:
+        nextCurveExponent(1);
+        changed = true;
+        break;
     }
 
     state.needsRedraw = true;

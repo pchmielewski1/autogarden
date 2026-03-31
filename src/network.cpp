@@ -19,6 +19,7 @@
 #include <UniversalTelegramBot.h>
 #include <cctype>
 #include <cstdarg>
+#include <cstdlib>
 #include <memory>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -332,8 +333,8 @@ static void formatLastFeedback(const TelegramStatusData& data,
         case WateringFeedbackCode::SAFETY_BLOCK_TANK_SENSOR_UNKNOWN:
             safeCopy(buf, bufSize, "blocked reservoir_unknown");
             break;
-        case WateringFeedbackCode::SAFETY_BLOCK_PUMP_NOT_CALIBRATED:
-            safeCopy(buf, bufSize, "blocked pump_uncalibrated");
+        case WateringFeedbackCode::SAFETY_BLOCK_PUMP_CONFIG_INVALID:
+            safeCopy(buf, bufSize, "blocked pump_config_invalid");
             break;
         case WateringFeedbackCode::HARD_TIMEOUT:
             snprintf(buf, bufSize, "hard_timeout %.0fms", data.lastFeedbackValue1[potIdx]);
@@ -430,8 +431,8 @@ static bool telegramWaterBlocked(const TelegramStatusData& status,
         safeCopy(reasonBuf, reasonBufSize, "Blocked: reservoir empty.");
         return true;
     }
-    if (!potCfg.pumpCalibrated || potCfg.pumpMlPerSec <= 0.0f) {
-        safeCopy(reasonBuf, reasonBufSize, "Blocked: pump not calibrated.");
+    if (potCfg.pumpMlPerSec <= 0.0f) {
+        safeCopy(reasonBuf, reasonBufSize, "Blocked: fixed pump parameters invalid.");
         return true;
     }
 
@@ -778,6 +779,10 @@ static void formatTelegramHelpMessage(char* buf, size_t bufSize) {
     pos = appendFmt(buf, bufSize, pos,
                     "\nMain entry:\n"
                     "/ag -> interactive menu\n"
+                    "/agraw <pot> <dry> <wet> -> set per-pot RAWf endpoints\n"
+                    "/agdry <pot> <dry> -> set only RAWf DRY\n"
+                    "/agwet <pot> <wet> -> set only RAWf WET\n"
+                    "/agexp <pot> <exp> -> set per-pot curve exponent\n"
                     "\nFlow:\n"
                     "- open /ag\n"
                     "- use inline buttons for all actions\n"
@@ -859,7 +864,7 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
         pos = appendFmt(buf, bufSize, pos,
                         "\nPot %u (%s)%s\n"
                         "  moisture=%.1f%% ema=%.1f%% target=%.1f%%\n"
-                        "  raw=%u overflow=%s cycle=%d pulses=%u\n"
+                        "  rawf=%u dry=%u wet=%u exp=%.2f overflow=%s cycle=%d pulses=%u\n"
                         "  action=%s\n"
                         "  last=%s\n",
                         static_cast<unsigned>(i + 1),
@@ -869,6 +874,9 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
                         data.sensors.pots[i].moistureEma,
                         targetPct,
                         data.sensors.pots[i].moistureRawFiltered,
+                        data.config.pots[i].moistureDryRaw,
+                        data.config.pots[i].moistureWetRaw,
+                        data.config.pots[i].moistureCurveExponent,
                         data.sensors.pots[i].waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "OK",
                         static_cast<int>(data.cycles[i].phase),
                         data.cycles[i].pulseCount,
@@ -914,6 +922,45 @@ static bool parseUIntArg(const String& token, uint8_t& out) {
     if (v < 0 || v > 255) return false;
     out = static_cast<uint8_t>(v);
     return true;
+}
+
+static bool parseUInt16Arg(const String& token, uint16_t& out) {
+    if (token.length() == 0) return false;
+    for (size_t i = 0; i < token.length(); ++i) {
+        if (!isdigit(static_cast<unsigned char>(token.charAt(i)))) {
+            return false;
+        }
+    }
+    unsigned long v = token.toInt();
+    if (v > 65535UL) return false;
+    out = static_cast<uint16_t>(v);
+    return true;
+}
+
+static bool parseFloatArg(const String& token, float& out) {
+    if (token.length() == 0) return false;
+    char buf[24];
+    size_t len = token.length();
+    if (len >= sizeof(buf)) return false;
+    bool seenDigit = false;
+    for (size_t i = 0; i < len; ++i) {
+        char c = token.charAt(i);
+        if (c >= '0' && c <= '9') {
+            seenDigit = true;
+            buf[i] = c;
+            continue;
+        }
+        if (c == '.' || (c == '-' && i == 0)) {
+            buf[i] = c;
+            continue;
+        }
+        return false;
+    }
+    if (!seenDigit) return false;
+    buf[len] = '\0';
+    char* endPtr = nullptr;
+    out = strtof(buf, &endPtr);
+    return endPtr == (buf + len);
 }
 
 static bool resolvePotArgument(const String& token, const TelegramStatusData& status, uint8_t& potIdx) {
@@ -1553,6 +1600,129 @@ void telegramPollCommands(uint32_t nowMs, const NetConfig& netCfg,
 
             if (cmd == "/ag" || cmd == "/start") {
                 telegramSendAgMenu(chatId, status, netCfg);
+                continue;
+            }
+
+            if (cmd == "/agraw" || cmd == "/agdry" || cmd == "/agwet" || cmd == "/agexp") {
+                TelegramStatusData replyStatus = status;
+                String args = (firstSpace >= 0) ? lower.substring(firstSpace + 1) : "";
+                args.trim();
+
+                int sp1 = args.indexOf(' ');
+                String potTok = (sp1 >= 0) ? args.substring(0, sp1) : args;
+                String rest = (sp1 >= 0) ? args.substring(sp1 + 1) : "";
+                rest.trim();
+
+                uint8_t potIdx = 0;
+                if (!resolvePotArgument(potTok, status, potIdx)) {
+                    snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                             "Invalid pot. Use 1..%u.",
+                             static_cast<unsigned>(status.config.numPots));
+                    buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+                    telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg);
+                    continue;
+                }
+
+                bool ok = false;
+                if (cmd == "/agraw") {
+                    int sp2 = rest.indexOf(' ');
+                    String dryTok = (sp2 >= 0) ? rest.substring(0, sp2) : "";
+                    String wetTok = (sp2 >= 0) ? rest.substring(sp2 + 1) : "";
+                    dryTok.trim();
+                    wetTok.trim();
+                    uint16_t dryRaw = 0;
+                    uint16_t wetRaw = 0;
+
+                    if (!parseUInt16Arg(dryTok, dryRaw) || !parseUInt16Arg(wetTok, wetRaw)) {
+                        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                                 "Usage: /agraw <pot> <dry> <wet>");
+                    } else if (dryRaw > 4095 || wetRaw > 4095 || wetRaw + 31 >= dryRaw) {
+                        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                                 "Rejected: require 0..4095 and wet < dry by at least 32.");
+                    } else {
+                        ok = pushConfigEvent(EventType::REQUEST_SET_MOISTURE_DRY_RAW, potIdx, dryRaw)
+                          && pushConfigEvent(EventType::REQUEST_SET_MOISTURE_WET_RAW, potIdx, wetRaw);
+                        if (ok) {
+                            replyStatus.config.pots[potIdx].moistureDryRaw = dryRaw;
+                            replyStatus.config.pots[potIdx].moistureWetRaw = wetRaw;
+                            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                                     "Pot %u RAWf endpoints queued: dry=%u wet=%u.",
+                                     static_cast<unsigned>(potIdx + 1),
+                                     static_cast<unsigned>(dryRaw),
+                                     static_cast<unsigned>(wetRaw));
+                        } else {
+                            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Queue failed for /agraw.");
+                        }
+                    }
+                } else if (cmd == "/agdry" || cmd == "/agwet") {
+                    uint16_t value = 0;
+                    if (!parseUInt16Arg(rest, value)) {
+                        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                                 "Usage: %s <pot> <value>",
+                                 cmd.c_str());
+                    } else if (value > 4095) {
+                        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Rejected: value must be 0..4095.");
+                    } else if (cmd == "/agdry") {
+                        uint16_t wetRaw = status.config.pots[potIdx].moistureWetRaw;
+                        if (value <= wetRaw + 31) {
+                            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                                     "Rejected: dry must be at least 32 above wet=%u.",
+                                     static_cast<unsigned>(wetRaw));
+                        } else {
+                            ok = pushConfigEvent(EventType::REQUEST_SET_MOISTURE_DRY_RAW, potIdx, value);
+                            if (ok) {
+                                replyStatus.config.pots[potIdx].moistureDryRaw = value;
+                                snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                                         "Pot %u RAWf DRY queued: %u.",
+                                         static_cast<unsigned>(potIdx + 1),
+                                         static_cast<unsigned>(value));
+                            } else {
+                                snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Queue failed for /agdry.");
+                            }
+                        }
+                    } else {
+                        uint16_t dryRaw = status.config.pots[potIdx].moistureDryRaw;
+                        if (value + 31 >= dryRaw) {
+                            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                                     "Rejected: wet must be at least 32 below dry=%u.",
+                                     static_cast<unsigned>(dryRaw));
+                        } else {
+                            ok = pushConfigEvent(EventType::REQUEST_SET_MOISTURE_WET_RAW, potIdx, value);
+                            if (ok) {
+                                replyStatus.config.pots[potIdx].moistureWetRaw = value;
+                                snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                                         "Pot %u RAWf WET queued: %u.",
+                                         static_cast<unsigned>(potIdx + 1),
+                                         static_cast<unsigned>(value));
+                            } else {
+                                snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Queue failed for /agwet.");
+                            }
+                        }
+                    }
+                } else {
+                    float value = 0.0f;
+                    if (!parseFloatArg(rest, value)) {
+                        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                                 "Usage: /agexp <pot> <value>");
+                    } else if (value < 0.1f || value > 12.0f) {
+                        snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s",
+                                 "Rejected: exponent must be 0.10..12.00.");
+                    } else {
+                        ok = pushConfigEvent(EventType::REQUEST_SET_MOISTURE_CURVE_EXPONENT,
+                                             potIdx, 0, value);
+                        if (ok) {
+                            replyStatus.config.pots[potIdx].moistureCurveExponent = value;
+                            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                                     "Pot %u curve exponent queued: %.2f.",
+                                     static_cast<unsigned>(potIdx + 1), value);
+                        } else {
+                            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Queue failed for /agexp.");
+                        }
+                    }
+                }
+
+                buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+                telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg);
                 continue;
             }
 

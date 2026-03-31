@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 static constexpr uint8_t  kMaxPots      = 2;
 static constexpr uint8_t  kNumProfiles  = 6;  // Pomidor..Custom
-static constexpr uint16_t kConfigSchema = 4;  // wersja schematu NVS
+static constexpr uint16_t kConfigSchema = 6;  // wersja schematu NVS
 
 // NVS namespace names
 static constexpr const char* kNvsConfig  = "ag_config";
@@ -62,13 +62,17 @@ struct PotConfig {
     uint16_t customPulseWaterMl      = 40;
     uint8_t  customMaxPulsesPerCycle = 5;
 
-    // Pompa — per-pot
-    float    pumpMlPerSec       = 0.0f;    // 0 = nie skalibrowana
-    bool     pumpCalibrated     = false;
+    // Pompa — wspólne stałe parametry obsługiwanego modelu M5 Watering.
+    // Pola zostają w config/NVS dla kompatybilności ze starszymi zapisami.
+    float    pumpMlPerSec       = 5.17f;
+    bool     pumpCalibrated     = true;
 
     // Sensory — per-pot
     bool     potMaxActiveLow    = true;    // overflow sensor polaryzacja
     float    moistureEmaAlpha   = 0.1f;    // EMA smoothing
+    uint16_t moistureDryRaw     = 2230;    // endpoint 0% for this pot (RAWf)
+    uint16_t moistureWetRaw     = 1752;    // endpoint 100% for this pot (RAWf)
+    float    moistureCurveExponent = 5.0f; // per-pot nonlinear exponent for RAWf -> %
 
     // Puls — per-pot (GUI-configurable, niezależny od profilu)
     uint16_t pulseWaterMl        = 25;      // ml per puls (10–100)

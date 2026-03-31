@@ -216,7 +216,7 @@ static const char* remoteWaterRejectMessage(const char* reason) {
     if (strcmp(reason, "mode_manual") == 0) return "water request blocked: mode is MANUAL.";
     if (strcmp(reason, "cycle_active") == 0) return "water request blocked: watering is already active.";
     if (strcmp(reason, "cooldown") == 0) return "water request blocked: cooldown is still active.";
-    if (strcmp(reason, "PUMP_NOT_CALIBRATED") == 0) return "water request blocked: pump is not calibrated.";
+    if (strcmp(reason, "PUMP_CONFIG_INVALID") == 0) return "water request blocked: pump parameters are invalid.";
     if (strcmp(reason, "OVERFLOW_RISK") == 0) return "water request blocked: overflow sensor is triggered.";
     if (strcmp(reason, "TANK_EMPTY") == 0 || strcmp(reason, "RESERVOIR_EMPTY") == 0) return "water request blocked: reservoir is empty.";
     if (strcmp(reason, "OVERFLOW_SENSOR_UNKNOWN") == 0) return "water request blocked: overflow sensor state is unknown.";
@@ -304,8 +304,8 @@ static void publishWateringFeedback(const uint32_t* prevFeedbackSeq) {
                 queueTelegramFeedbackFmt("Pot %u: blocked by safety, reservoir sensor state unknown.",
                                          static_cast<unsigned>(i + 1));
                 break;
-            case WateringFeedbackCode::SAFETY_BLOCK_PUMP_NOT_CALIBRATED:
-                queueTelegramFeedbackFmt("Pot %u: blocked by safety, pump not calibrated.",
+            case WateringFeedbackCode::SAFETY_BLOCK_PUMP_CONFIG_INVALID:
+                queueTelegramFeedbackFmt("Pot %u: blocked by safety, fixed pump parameters are invalid.",
                                          static_cast<unsigned>(i + 1));
                 break;
             case WateringFeedbackCode::HARD_TIMEOUT:
@@ -576,9 +576,9 @@ static bool startRemoteWateringPulse(uint32_t nowMs,
         if (rejectReason) *rejectReason = "cooldown";
         return false;
     }
-    if (!potCfg.pumpCalibrated || potCfg.pumpMlPerSec <= 0.0f) {
-        Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=pump_not_calibrated\n", potIdx);
-        if (rejectReason) *rejectReason = "PUMP_NOT_CALIBRATED";
+    if (potCfg.pumpMlPerSec <= 0.0f) {
+        Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=pump_config_invalid\n", potIdx);
+        if (rejectReason) *rejectReason = "PUMP_CONFIG_INVALID";
         return false;
     }
 
@@ -768,7 +768,10 @@ static void controlTaskFn(void* /*param*/) {
                 if (!g_config.pots[i].enabled) continue;
                 float rawEma = g_emaFilters[i].update(static_cast<float>(snap.pots[i].moistureRawFiltered), now);
                 uint16_t rawEmaRounded = static_cast<uint16_t>(std::lround(rawEma));
-                snap.pots[i].moistureEma = normalizeMoistureRaw(rawEmaRounded);
+                snap.pots[i].moistureEma = normalizeMoistureRaw(rawEmaRounded,
+                                                                g_config.pots[i].moistureDryRaw,
+                                                                g_config.pots[i].moistureWetRaw,
+                                                                g_config.pots[i].moistureCurveExponent);
             }
 
             // Publikuj snapshot (thread-safe)
@@ -1102,11 +1105,24 @@ static void controlTaskFn(void* /*param*/) {
                 case EventType::REQUEST_SET_NUM_POTS: {
                     uint8_t n = evt.payload.config.valueU16;
                     if (n >= 1 && n <= kMaxPots) {
+                        uint8_t prevNumPots = g_config.numPots;
                         g_config.numPots = n;
                         for (uint8_t i = 0; i < n; ++i)
                             g_config.pots[i].enabled = true;
                         for (uint8_t i = n; i < kMaxPots; ++i)
                             g_config.pots[i].enabled = false;
+
+                        // If the operator enables additional pots at runtime, initialize
+                        // their hardware immediately; waiting for CONFIG_SAVE_REQUEST is
+                        // ineffective because that event is not emitted by the UI path.
+                        if (n > prevNumPots) {
+                            for (uint8_t i = prevNumPots; i < n; ++i) {
+                                g_hardware.initPot(i, g_hwConfig, g_config);
+                                g_emaFilters[i].alpha = g_config.pots[i].moistureEmaAlpha;
+                                g_emaFilters[i].reset();
+                            }
+                        }
+
                         requestConfigSave(g_config);
                         Serial.printf("[CTRL] numPots=%d\n", n);
                         publishSharedStateFromControl();
@@ -1146,6 +1162,49 @@ static void controlTaskFn(void* /*param*/) {
                         }
                         requestConfigSave(g_config);
                         Serial.printf("[CTRL] pulse=%uml\n", pulseMl);
+                        publishSharedStateFromControl();
+                    }
+                    break;
+                }
+
+                case EventType::REQUEST_SET_MOISTURE_DRY_RAW: {
+                    uint8_t pot = evt.payload.config.key;
+                    uint16_t dryRaw = evt.payload.config.valueU16;
+                    if (pot < kMaxPots && dryRaw <= 4095
+                        && dryRaw > g_config.pots[pot].moistureWetRaw + 31) {
+                        g_config.pots[pot].moistureDryRaw = dryRaw;
+                        requestConfigSave(g_config);
+                        Serial.printf("[CTRL] pot%u moisture_dry_raw=%u\n",
+                                      static_cast<unsigned>(pot),
+                                      static_cast<unsigned>(dryRaw));
+                        publishSharedStateFromControl();
+                    }
+                    break;
+                }
+
+                case EventType::REQUEST_SET_MOISTURE_WET_RAW: {
+                    uint8_t pot = evt.payload.config.key;
+                    uint16_t wetRaw = evt.payload.config.valueU16;
+                    if (pot < kMaxPots && wetRaw <= 4095
+                        && wetRaw + 31 < g_config.pots[pot].moistureDryRaw) {
+                        g_config.pots[pot].moistureWetRaw = wetRaw;
+                        requestConfigSave(g_config);
+                        Serial.printf("[CTRL] pot%u moisture_wet_raw=%u\n",
+                                      static_cast<unsigned>(pot),
+                                      static_cast<unsigned>(wetRaw));
+                        publishSharedStateFromControl();
+                    }
+                    break;
+                }
+
+                case EventType::REQUEST_SET_MOISTURE_CURVE_EXPONENT: {
+                    uint8_t pot = evt.payload.config.key;
+                    float exponent = evt.payload.config.valueF;
+                    if (pot < kMaxPots && exponent >= 0.1f && exponent <= 12.0f) {
+                        g_config.pots[pot].moistureCurveExponent = exponent;
+                        requestConfigSave(g_config);
+                        Serial.printf("[CTRL] pot%u moisture_curve_exp=%.2f\n",
+                                      static_cast<unsigned>(pot), exponent);
                         publishSharedStateFromControl();
                     }
                     break;
@@ -1384,6 +1443,33 @@ static void dispatchUiSettingsChanges(const Config& beforeCfg,
         anyRequest = true;
     }
 
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        if (beforeCfg.pots[i].moistureDryRaw != afterCfg.pots[i].moistureDryRaw) {
+            evt = Event{};
+            evt.type = EventType::REQUEST_SET_MOISTURE_DRY_RAW;
+            evt.payload.config.key = i;
+            evt.payload.config.valueU16 = afterCfg.pots[i].moistureDryRaw;
+            g_eventQueue.push(evt);
+            anyRequest = true;
+        }
+        if (beforeCfg.pots[i].moistureWetRaw != afterCfg.pots[i].moistureWetRaw) {
+            evt = Event{};
+            evt.type = EventType::REQUEST_SET_MOISTURE_WET_RAW;
+            evt.payload.config.key = i;
+            evt.payload.config.valueU16 = afterCfg.pots[i].moistureWetRaw;
+            g_eventQueue.push(evt);
+            anyRequest = true;
+        }
+        if (beforeCfg.pots[i].moistureCurveExponent != afterCfg.pots[i].moistureCurveExponent) {
+            evt = Event{};
+            evt.type = EventType::REQUEST_SET_MOISTURE_CURVE_EXPONENT;
+            evt.payload.config.key = i;
+            evt.payload.config.valueF = afterCfg.pots[i].moistureCurveExponent;
+            g_eventQueue.push(evt);
+            anyRequest = true;
+        }
+    }
+
     if (beforeCfg.mode != afterCfg.mode) {
         evt = Event{};
         evt.type = EventType::REQUEST_SET_MODE;
@@ -1495,6 +1581,7 @@ static void uiTaskFn(void* /*param*/) {
             uSnap.budget        = shared.budget;
             uSnap.config        = shared.config;
             uSnap.netConfig     = shared.netConfig;
+            memcpy(uSnap.lastCycleDoneMs, shared.lastCycleDoneMs, sizeof(shared.lastCycleDoneMs));
             uSnap.duskPhase     = shared.duskPhase;
             uSnap.wifiConnected = shared.wifiConnected;
 

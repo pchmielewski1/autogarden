@@ -69,7 +69,7 @@ Konceptualne struktury danych (pseudotypy):
   - `mode` (AUTO/MANUAL)
   - `plantProfileIndex` (indeks profilu rośliny → targetMoisturePct, criticalLowPct, itd.)
   - `pumpOnMsMax`, `cooldownMs`
-  - `pumpMlPerSec` (z kalibracji pompy)
+  - `pumpMlPerSec` (stały parametr obsługiwanej pompy M5 Watering)
   - `antiOverflowEnabled` + progi
   - `potMaxActiveLow` (bool, domyślnie true), `reservoirMinActiveLow` (bool, domyślnie false)
   - pełna lista pól → sekcja „Zaktualizowana struktura Config (pełna)"
@@ -251,8 +251,8 @@ const MAX_POTS = 2  // skalowalne do 2 doniczek (PbHUB ma 6 kanałów)
 struct PotConfig {
   bool   enabled = false            // czy ta doniczka jest aktywna (pot[0] zawsze true)
   uint8  plantProfileIndex = 0      // profil rośliny (0=Pomidor, ..., 5=Custom)
-  float  pumpMlPerSec = 0           // z kalibracji pompy (0 = nie skalibrowana)
-  bool   pumpCalibrated = false
+  float  pumpMlPerSec = 5.17        // stały parametr obsługiwanej pompy M5 Watering
+  bool   pumpCalibrated = true      // legacy flag utrzymywana dla kompatybilności NVS
   bool   potMaxActiveLow = true     // per-pot — overflow sensor polaryzacja
   float  moistureEmaAlpha = 0.1     // per-pot — EMA alpha
 }
@@ -313,6 +313,12 @@ struct Config {
 
 Uwaga: dokładny zestaw pól można minimalizować, ale **timeout/cooldown/anti-overflow**, profil rośliny oraz `pumpMlPerSec` są obowiązkowe.
 
+Aktualne założenie wdrożeniowe dla pomp:
+- wspieramy jeden model pompy: M5 Watering,
+- firmware wymusza te same stałe parametry przepływu dla POT1 i POT2,
+- firmware nie prowadzi już procedury kalibracji pompy w UI ani przez Telegram,
+- stare pola `pumpMlPerSec` i `pumpCalibrated` zostają tylko dla kompatybilności z zapisami NVS i są normalizowane przy starcie.
+
 ### Walidacja (kontrakt)
 Walidacja ma być deterministyczna i szybka.
 ```
@@ -323,8 +329,11 @@ validate(config):
     pot = config.pots[i]
     assert pot.enabled == true          // aktywna doniczka musi być enabled
     assert pot.plantProfileIndex < NUM_PROFILES
-    assert pot.pumpMlPerSec >= 0        // 0 = nie skalibrowana (blokuje AUTO)
+    assert pot.pumpMlPerSec > 0         // stały dodatni przepływ obsługiwanej pompy
     assert pot.moistureEmaAlpha > 0 and <= 1.0
+    assert pot.moistureWetRaw < pot.moistureDryRaw
+    assert (pot.moistureDryRaw - pot.moistureWetRaw) >= 32
+    assert pot.moistureCurveExponent >= 0.1 and <= 12.0
   // Globalne
   assert pumpOnMsMax > 0
   assert cooldownMs >= 0
@@ -915,53 +924,24 @@ na ręczne ustawienie wszystkich parametrów. Wybrany profil jest persisted w Co
 
 ---
 
-### Kalibracja pompy — objętość na czas
+### Stałe parametry pompy — objętość na czas
 
-Pompa M5Stack Watering Unit ma stały przepływ zależny od napięcia zasilania (5V).
-Przed użyciem musimy zmierzyć wydajność.
+AutoGarden wspiera jeden model pompy: M5Stack Watering Unit.
+Firmware używa jednej znanej stałej wydajności dla wszystkich doniczek i nie prowadzi już
+procedury kalibracji per-pot.
 
-```
-// Procedura kalibracji (jednorazowa, na stanowisku, per-pot):
-calibratePump(potIdx):
-  display.print("Pump calibration — pot %d", potIdx)
-  display.print("Place tube in measuring cup")
-  display.print("Press button to start 30s pump run")
-
-  waitForButtonPress()
-
-  startMs = millis()
-  pump[potIdx].on()
-  while millis() - startMs < 30000:   // 30 sekund
-    M5.update()
-    // safety: przerwij jeśli water level TRIGGERED
-    if waterGuards.reservoirMin == TRIGGERED:
-      pump[potIdx].off()
-      display.print("ABORT: reservoir empty!")
-      return ERROR
-
-  pump[potIdx].off()
-
-  display.print("Enter pumped volume (ml):")
-  volumeMl = readUserInput()           // z UI lub Telegram
-
-  pumpMlPerSec = volumeMl / 30.0
-  config.pots[potIdx].pumpMlPerSec = pumpMlPerSec   // per-pot
-  config.pots[potIdx].pumpCalibrated = true
-  saveConfig()
-
-  log("PUMP_CALIB ml_per_sec=%.2f volume_30s=%d", pumpMlPerSec, volumeMl)
-  display.print("Calibrated: %.1f ml/s", pumpMlPerSec)
-```
-
-Typowa wydajność M5Stack Watering Unit: **~5-15 ml/s** (zależy od długości węża i wysokości).
-
-**Zmierzona wydajność (test 2026-03-01):**
+**Stała wydajność runtime:**
 - **155 ml / 30 s = 5.17 ml/s = 310 ml/min**
-- Pompa: M5Stack Watering Unit, zasilanie 5V przez PbHUB CH0 pin1
+- Pompa: M5Stack Watering Unit, zasilanie 5V przez PbHUB CH0/CH1 pin1
 
 Wartość `pumpMlPerSec` pozwala przeliczyć czas pompowania na objętość i odwrotnie:
 - `pumpDurationMs = (targetMl / pumpMlPerSec) * 1000`
 - `pumpedMl = pumpDurationMs / 1000.0 * pumpMlPerSec`
+
+Uwagi implementacyjne:
+- `pumpMlPerSec` jest utrzymywane w `PotConfig` wyłącznie dla kompatybilności ze starszym NVS,
+- przy starcie firmware nadpisuje oba kanały jedną stałą wartością 5.17 ml/s,
+- UI/Telegram nie udostępniają już żadnej akcji kalibracji pompy.
 
 ---
 
@@ -1074,7 +1054,7 @@ wateringTick(nowMs, sensors, config, profile, waterBudget, actuatorState):
             potIdx, potSens.moisturePct)
         continue
 
-      // Oblicz czas pulsu na podstawie profilu i kalibracji pompy (per-pot)
+      // Oblicz czas pulsu na podstawie profilu i stałych parametrów pompy M5 Watering
       cycle.pulseDurationMs = (profile.pulseWaterMl / potCfg.pumpMlPerSec) * 1000
 
       // Jeśli reservoir LOW → zredukuj puls do 1/3
@@ -1239,6 +1219,9 @@ evaluateSchedule(nowMs, potSens, envSens, config, potIdx):
         return { shouldWater: false, reason: "VACATION_ANOMALY_BLOCK" }
 
   // === 1. RESCUE MODE — ratunkowe podlewanie w krytycznej suszy ===
+  if moisture <= 5:
+    return { shouldWater: false, reason: "PROBE_NOT_IN_SOIL" }
+
   if moisture < profile.criticalLowPct:
     return { shouldWater: true, reason: "RESCUE_CRITICAL_LOW" }
 
@@ -1895,7 +1878,7 @@ manualPumpTick(nowMs, dualBtn, snapshot, config, selectedPot):
   float reservoirCurrentMl        // estymata aktualnego poziomu
   float totalPumpedMl = 0         // suma od ostatniego refill (OBE POMPY!)
   float totalPumpedMlPerPot[MAX_POTS] = {0}  // per-pot tracking
-  float pumpMlPerSec[MAX_POTS]    // per-pot z kalibracji (z PotConfig)
+  float pumpMlPerSec[MAX_POTS]    // per-pot mirror stałej wydajności pompy (z PotConfig)
   bool  reservoirLow = false      // stan czujnika MIN w rezerwuarze
   uint32 reservoirLowSinceMs = 0  // kiedy czujnik przeszedł w LOW
   float reservoirLowThresholdMl   // ile wody zostaje gdy czujnik = LOW (do kalibracji)
@@ -2268,6 +2251,12 @@ Surowy ADC ma szum ±20-50 jednostek. Zamiast reagować na pojedyncze szpilki, p
 2. szybki tor sterowania: `median(raw) -> normalize -> moisturePct`
 3. stabilny tor prezentacji/startu: `EMA(raw) -> normalize -> moistureEma`
 
+Ważne doprecyzowanie implementacyjne:
+- endpointy wejściowe `RAWf DRY` i `RAWf WET` są osobne dla każdego POT,
+- wykładnik krzywej `t^p` też jest osobny dla każdego POT,
+- `moisturePct` nadal jest liczone z `moistureRawFiltered` (`RAWf`), nie z pojedynczego surowego `RAW`,
+- aktywny pulse watering ma dalej korzystać z tego szybkiego `moisturePct`, a nie z wolniejszego EMA.
+
 W runtime rozróżniamy też dwa warianty sygnału RAW:
 - `moistureRaw` = ostatni surowy odczyt ADC, zostaje do diagnostyki i historii.
 - `moistureRawFiltered` = przefiltrowany sygnał po medianie, używany do sterowania,
@@ -2335,6 +2324,8 @@ Podział ról sygnałów w runtime:
 - `moisturePct` = szybki tor sterowania po `median(raw) -> normalize`.
   Tę wartość wykorzystuje aktywny cykl podlewania po `SOAK`, bo nie może czekać na długi filtr
   przy decyzji `STOP/next pulse`.
+- odczyty `0-5%` traktujemy jako stan typu `probe_not_in_soil` / odczyt niewiarygodny.
+  Taki sygnał nie może uruchamiać auto/rescue, choć manualne podlewanie pozostaje dozwolone.
 - UI i raporty użytkowe pokazują `moistureRawFiltered`, a nie pojedynczy surowy strzał ADC,
   żeby to co widzi użytkownik odpowiadało rzeczywistemu torowi sterowania.
 - `moistureEma` = spokojniejszy tor do UI, Telegram, trendów i decyzji o starcie cyklu.
@@ -2508,7 +2499,7 @@ handleTelegramCallback(cmd):
 - działa per doniczka (`potIdx` z callbacku), nie jako jedna globalna komenda,
 - uruchamia tylko jeden bezpieczny pulse przez istniejący FSM,
 - przed wrzuceniem eventu przechodzi preflight: tryb AUTO, brak aktywnego cyklu,
-  cooldown, kalibracja pompy, overflow, stan rezerwuaru i stany `UNKNOWN` sensorów,
+  cooldown, poprawność stałych parametrów pompy, overflow, stan rezerwuaru i stany `UNKNOWN` sensorów,
 - przy błędzie użytkownik dostaje od razu tekstowy powód blokady zamiast ślepego enqueue.
 
 ---
@@ -2521,61 +2512,43 @@ Podzielony na strefy informacyjne, bez menu — wszystko na jednym widoku.
 ```
 // Layout (portrait 135×240) — pełne wykorzystanie ekranu:
 //
-// === Tryb 1 doniczka (numPots==1): ===
+// === Główny widok kompaktowy (numPots==1 lub numPots==2): ===
+// Ten sam layout bazowy dla obu przypadków.
+// Gdy numPots==1, drugi slot/kafelek pozostaje pusty.
 // ┌──────────────────────────┐
-// │  🌱 65%     ⬆ 70%        │  ← wilgotność (size3) + target       (y 0-30)
-// │             🍅 Pomidor    │  ← profil ikona + nazwa              (y 17-30)
-// │  ████████████░░░░░░░░░░  │  ← pasek wilgotności                 (y 34-46)
+// │ 🌱 65%         ⬆ 70%     │  ← pot1: wilgotność + target         (y 0-14)
+// │ 🍅 Pomidor      OK       │  ← pot1: profil + status chip        (y 18-30)
+// │ ██████████░░░░░░░░░░░░   │  ← pot1: moisture bar                (y 32-46)
 // ├──────────────────────────┤
-// │  💧 1.4L         ~4d     │  ← rezerwuar + estymata              (y 52-64)
-// │  🪴 OK       TANK:OK     │  ← overflow + tank guard             (y 66-78)
+// │ 🌱 48%         ⬆ 60%     │  ← pot2: wilgotność + target         (y 52-66)
+// │ 🌶 Papryka     2/4       │  ← pot2: profil + status chip        (y 70-82)
+// │ ████░░░░░░░░░░░░░░░░░░   │  ← pot2: moisture bar                (y 84-98)
 // ├──────────────────────────┤
-// │  🌡 24.1C    💧 52%      │  ← temperatura + wilgotność powietrza (y 84-96)
-// │  ☀ 1200lx   1013hPa     │  ← lux + ciśnienie atmosferyczne     (y 98-112)
+// │ RES 1400ml  ~3d         │  ← rezerwuar na pełną szerokość      (y 108-122)
+// │ OVF1 OK      OVF2 HIT   │  ← overflow sensors per pot          (y 126-140)
 // ├──────────────────────────┤
-// │  ⚙ AUTO  VAC  📶 OK     │  ← tryb + wifi                       (y 116-130)
-// ├──────────────────────────┤
-// │  PULSE 3/6  150ml        │  ← faza podlewania                   (y 134-148)
-// │  ░░░░████░░░░░░░░░░░    │  ← progress bar                      (y 150-160)
-// ├──────────────────────────┤
-// │  ☀ DAY       ⏰ 01:23:45 │  ← dusk phase + uptime               (y 166-178)
-// ├──────────────────────────┤
-// │  RAW:2048 EMA:65.2%      │  ← dane surowe czujnika              (y 184-196)
-// ├──────────────────────────┤
-// │  ! RESERVOIR LOW         │  ← alert banner (opcjonalnie)        (y 212-234)
+// │ T 24.1C      H 52%      │  ← temperatura + wilgotność powietrza (y 144-158)
+// │ L 1200lx     P 1013     │  ← lux + ciśnienie                   (y 162-176)
+// │ AUTO/VAC   WIFI OK      │  ← tryb + sieć                       (y 180-194)
+// │ DAY        UP 01:23     │  ← dusk + uptime                     (y 198-212)
+// │ P1 2048     P2 1840     │  ← RAWf per pot                      (y 216-230)
 // └──────────────────────────┘
 //
-// === Tryb 2 doniczki (numPots==2): ===
-// Pełnoekranowy kompaktowy widok — obie doniczki + pełne info:
-// ┌──────────────────────────┐
-// │ 🌱 1:65%    ⬆ 70%       │  ← pot1: wilgotność + target         (y 0-14)
-// │ 🍅 Pomidor   PULSE 2/4  │  ← pot1: profil + faza               (y 18-30)
-// │ ██████████░░░░░░  150ml  │  ← pot1: moisture bar + pumped       (y 32-44)
-// ├──────────────────────────┤
-// │ 🌱 2:48%    ⬆ 60%       │  ← pot2: wilgotność + target         (y 48-62)
-// │ 🌶 Papryka      SOAK    │  ← pot2: profil + faza               (y 66-78)
-// │ ████░░░░░░░░░░░░        │  ← pot2: moisture bar                (y 80-92)
-// ├──────────────────────────┤
-// │ 💧 1.4L  ~3d    🪴 OK   │  ← rezerwuar + tank guard            (y 98-112)
-// ├──────────────────────────┤
-// │ 🌡 24.1C    💧 52%      │  ← temp + wilgotność powietrza       (y 114-126)
-// │ ☀ 1200lx   1013hPa      │  ← lux + ciśnienie atmosferyczne    (y 128-140)
-// ├──────────────────────────┤
-// │ ⚙ AUTO VAC    📶 OK     │  ← tryb + wifi                       (y 146-158)
-// │ ☀ DAY      ⏰ 01:23:45  │  ← dusk + uptime                     (y 162-174)
-// ├──────────────────────────┤
-// │ 1:RAW:2048 E:65.2% C:64 │  ← raw data pot1                     (y 180-192)
-// │ 2:RAW:1840 E:48.1% C:47 │  ← raw data pot2                     (y 192-204)
-// ├──────────────────────────┤
-// │ ! RESERVOIR LOW          │  ← alert banner (opcjonalnie)        (y 212-234)
-// │ ! POT1 OVERFLOW          │  ← per-pot overflow alert            (y 236+...)
-// └──────────────────────────┘
+// Status chip na kafelku POT pokazuje stan logiczny i/lub aktywną fazę:
+// - OK / WET / WAIT / ARM / COOL
+// - PROBE / HEAT / SUN / OVF / TANK / SNS? / CFG?
+// - podczas aktywnego podlewania: 1/4, 2/4, SOAK, MEAS, DONE
 //
 // BtnA click: MAIN → Settings wejście; Settings → zmień wartość
 // BtnA long:  Settings → wróć do MAIN
 // BtnB click: MAIN (2 pots) → przełączanie: kompakt ↔ detail pot1 ↔ detail pot2
 //             Settings → nawigacja po opcjach
 // BtnB long:  Settings → alternatywna zmiana wartości
+//
+// Uwaga praktyczna:
+// - widok główny zawsze używa layoutu kompaktowego,
+// - pełny render jednej doniczki jest teraz widokiem detail tylko dla konfiguracji 2-POT,
+// - przy numPots==1 drugi slot zostaje celowo pusty, zamiast przełączać cały ekran na inny layout.
 
 // === Nawigacja ekranów ===
 enum UiScreen { MAIN, SETTINGS }
@@ -2605,7 +2578,7 @@ renderMainScreen(snapshot, budget, cycles, config):
     renderSettingsScreen(config)
     return
   if config.numPots == 1:
-    renderSinglePotScreen(snapshot, budget, cycles[0], config)
+    renderDualPotScreen(snapshot, budget, cycles, config)  // ten sam layout co 2 pots; slot POT2 pusty
   else:
     if uiState.dualViewMode == COMPACT:
       renderDualPotScreen(snapshot, budget, cycles, config)
@@ -2615,93 +2588,62 @@ renderMainScreen(snapshot, budget, cycles, config):
       renderSinglePotScreen(snapshot, budget, cycles[1], config)  // pot 1 pełny widok
 
 renderSinglePotScreen(snapshot, budget, cycle, config):
-  potSnap = snapshot.pots[0]
-  potCfg  = config.pots[0]
-  profile = PROFILES[potCfg.plantProfileIndex]
-
-  // 1. Wilgotność — duża cyfra, zielona/żółta/czerwona wg progu
-  color = GREEN if potSnap.moisturePct >= profile.targetMoisturePct
-          YELLOW if potSnap.moisturePct >= profile.criticalLowPct
-          RED
-  drawBigText(0, 0, "%.0f%%", potSnap.moisturePct, color)
-  drawSmallText(80, 5, "⬆%.0f%%", profile.targetMoisturePct)
-
-  // 2. Pasek wilgotności
-  drawProgressBar(0, 31, 135, 14, potSnap.moisturePct / 100.0, color)
-
-  // 3. Rezerwuar (wspólny)
-  resColor = GREEN if budget.daysRemaining > 3
-             YELLOW if budget.daysRemaining > 1
-             RED
-  drawText(0, 48, "💧 %.0fml  ~%dd", budget.reservoirCurrentMl, budget.daysRemaining, resColor)
-
-  // 4. Doniczka overflow
-  potColor = GREEN if potSnap.waterGuards.potMax != TRIGGERED else RED
-  drawText(0, 68, "🪴 %s", potColor == GREEN ? "OK" : "OVERFLOW!")
-
-  // 5. Env
-  drawText(0, 83, "🌡%.0f°C  ☀%dlx", snapshot.env.tempC, snapshot.env.lux)
-
-  // 6. Tryb + roślina
-  drawText(0, 103, "⚙ %s  %s %s",
-    config.mode == AUTO ? "AUTO" : "MANUAL",
-    profile.icon,
-    profile.name)
-
-  // 7. Faza podlewania (pot 0)
-  cycle = cycles[0]
-  if cycle.phase == IDLE:
-    drawText(0, 123, "IDLE", GRAY)
-  elif cycle.phase == PULSE:
-    drawText(0, 123, "PULSE %d/%d  %.0fml", cycle.pulseCount, cycle.maxPulses, cycle.totalPumpedMl, BLUE)
-    drawProgressBar(0, 151, 135, 14, pulseProgress, BLUE)
-  elif cycle.phase == SOAK:
-    remaining = cycle.soakTimeMs - (nowMs - cycle.phaseStartMs)
-    drawText(0, 123, "SOAK %ds", remaining/1000, CYAN)
-  elif cycle.phase == OVERFLOW_WAIT:
-    drawText(0, 123, "OVERFLOW WAIT", RED)
-  elif cycle.phase == BLOCKED:
-    drawText(0, 123, "BLOCKED: %s", blockReason, RED)
-
-  // 8-10: bez zmian (next watering, wifi, alert)
-  drawText(0, 168, "⏰ Next: %s", formatNextWatering())
-  wifiIcon = snapshot.netStatus == UP ? "📶" : "📵"
-  drawText(0, 188, "%s WiFi %s", wifiIcon, snapshot.netStatus)
-  if budget.reservoirLow:
-    drawBanner(0, 203, "! RESERVOIR LOW — ~%dd", budget.daysRemaining, RED)
+  // Widok detail dla konkretnego POT w konfiguracji 2-doniczkowej.
+  // Pokazuje więcej informacji tekstowych niż kompaktowy main screen,
+  // ale nie jest już domyślnym układem dla numPots==1.
+  // Zawiera:
+  // - duży odczyt wilgotności i target,
+  // - profil rośliny,
+  // - rezerwuar + guards,
+  // - env + lux + ciśnienie,
+  // - tryb + WiFi,
+  // - pełny stan cyklu: PULSE / SOAK / MEASURING / OVERFLOW_WAIT / DONE / BLOCKED,
+  // - uptime + RAWf/EMA,
+  // - bannery alarmowe na dole.
 
 renderDualPotScreen(snapshot, budget, cycles, config):
-  // Kompaktowy widok obu doniczek
+  // Kompaktowy widok główny.
+  // Jeśli pot[1] jest wyłączony, drugi slot pozostaje pusty i nic tam nie rysujemy.
   for potIdx in [0, 1]:
     potSnap = snapshot.pots[potIdx]
     potCfg  = config.pots[potIdx]
     if not potCfg.enabled: continue
     profile = PROFILES[potCfg.plantProfileIndex]
     cycle   = cycles[potIdx]
-    y = potIdx * 19   // wiersz startowy
+    y = potIdx * 52   // slot/kafelek startowy
 
     color = GREEN if potSnap.moisturePct >= profile.targetMoisturePct
             YELLOW if potSnap.moisturePct >= profile.criticalLowPct
             RED
 
-    phaseStr = cycle.phase.name[:5]  // "IDLE", "PULSE", "SOAK", etc.
-    drawText(0, y, "%s%d: %.0f%% ⬆%.0f %s",
-             profile.icon, potIdx+1,
-             potSnap.moisturePct, profile.targetMoisturePct,
-             phaseStr, color)
+    status = deriveCompactStatus(potSnap, cycle, config, budget, nowMs)
+    drawPotCard(y, profile.icon, profile.name,
+                potSnap.moisturePct,
+                effectiveTargetPct(profile, config),
+                status, color)
 
-  // Wskaźnik wybranej doniczki (Dual Button steruje tą)
-  drawText(120, uiState.selectedPot * 19, "◀", WHITE)
+  drawChipFullWidth(108, "RES %.0fml  ~%dd", budget.reservoirCurrentMl, budget.daysRemaining)
+  drawChipHalf(126, 0,  "OVF1 %s", snapshot.pots[0].waterGuards.potMax == TRIGGERED ? "HIT" : "OK")
+  drawChipHalf(126, 68, "OVF2 %s", snapshot.pots[1].waterGuards.potMax == TRIGGERED ? "HIT" : "OK")
+  drawChipHalf(144, 0,  "T %.1fC", snapshot.env.tempC)
+  drawChipHalf(144, 68, "H %.0f%%", snapshot.env.humidityPct)
+  drawChipHalf(162, 0,  "L %.0flx", snapshot.env.lux)
+  drawChipHalf(162, 68, "P %.0f", snapshot.env.pressureHpa)
+  drawChipHalf(180, 0,  modeWifiLeft(config), modeWifiLeftColor(config))
+  drawChipHalf(180, 68, wifiText(snapshot.netStatus), wifiColor(snapshot.netStatus))
+  drawChipHalf(198, 0,  duskText(snapshot.duskPhase), GRAY)
+  drawChipHalf(198, 68, uptimeCompact(nowMs), GRAY)
+  drawChipHalf(216, 0,  "P1 %d", snapshot.pots[0].moistureRawFiltered)
+  drawChipHalf(216, 68, "P2 %d", snapshot.pots[1].moistureRawFiltered)
 
-  // Wspólne info
-  drawText(0, 40, "💧 %.0fml  ~%dd", budget.reservoirCurrentMl, budget.daysRemaining)
-  drawText(0, 58, "🌡%.0f°C  ☀%dlx", snapshot.env.tempC, snapshot.env.lux)
-  modeStr = config.mode == AUTO ? "AUTO" : "MANUAL"
-  vacStr  = config.vacationMode ? "🏖 VAC" : ""
-  drawText(0, 76, "⚙ %s  %s", modeStr, vacStr)
-  drawText(0, 93, "%s WiFi", snapshot.netStatus == UP ? "📶" : "📵")
-  if budget.reservoirLow:
-    drawBanner(0, 111, "! RESERVOIR LOW", RED)
+deriveCompactStatus(potSnap, cycle, config, budget, nowMs):
+  // Zwraca krótki status logiczny na kafelku POT.
+  // Kolejność priorytetów:
+  // 1. aktywna faza cyklu: 1/4, SOAK, MEAS, DONE
+  // 2. twarde safety: OVF, TANK, SNS?
+  // 3. stany runtime: MAN, COOL, PROBE, HEAT, SUN
+  // 4. stany wilgotnościowe: WET, OK, WAIT, ARM
+  // 5. CFG? tylko wtedy, gdy runtime wykryje uszkodzone / nienormalizowane parametry pompy.
 ```
 
 ### Ekran Settings (BtnA → wejście/wyjście)
@@ -2716,6 +2658,12 @@ Długie przytrzymanie BtnB na opcji → zmień wartość (cykl).
 // │ ▶ Pompy: 1          │  ← numPots (1 / 2), zmień = BtnB long press
 // │   Profil 🌱1: 🍅   │  ← plantProfile pot0
 // │   Profil 🌱2: 🌶   │  ← plantProfile pot1 (tylko gdy numPots==2)
+// │   P1 Dry: 2224      │  ← per-pot RAWf DRY
+// │   P1 Wet: 1792      │  ← per-pot RAWf WET
+// │   P1 Exp: 9.10      │  ← per-pot wykładnik krzywej `t^p`
+// │   P2 Dry: 2228      │  ← per-pot RAWf DRY (gdy numPots==2)
+// │   P2 Wet: 1814      │  ← per-pot RAWf WET (gdy numPots==2)
+// │   P2 Exp: 1.24      │  ← per-pot wykładnik krzywej `t^p` (gdy numPots==2)
 // │   Rezerwuar: 10.0L  │  ← reservoirCapacityMl (edytowalne)
 // │   [REFILL 💧]       │  ← resetuj budżet wody (nalałem do pełna)
 // │   Tryb: AUTO        │  ← AUTO / MANUAL
@@ -2734,6 +2682,15 @@ renderSettingsScreen(config):
     // widoczne tylko gdy numPots==2:
     { label: "Profil 🌱2",     value: PROFILES[config.pots[1].plantProfileIndex].name,
       visible: config.numPots >= 2 },
+    { label: "P1 Dry",         value: config.pots[0].moistureDryRaw },
+    { label: "P1 Wet",         value: config.pots[0].moistureWetRaw },
+    { label: "P1 Exp",         value: "%.2f", config.pots[0].moistureCurveExponent },
+    { label: "P2 Dry",         value: config.pots[1].moistureDryRaw,
+      visible: config.numPots >= 2 },
+    { label: "P2 Wet",         value: config.pots[1].moistureWetRaw,
+      visible: config.numPots >= 2 },
+    { label: "P2 Exp",         value: "%.2f", config.pots[1].moistureCurveExponent,
+      visible: config.numPots >= 2 },
     { label: "Rezerwuar",      value: "%.1fL", config.reservoirCapacityMl / 1000 },
     { label: "REFILL 💧",      value: "(naciśnij)",  action: handleRefill },
     { label: "Tryb",           value: config.mode == AUTO ? "AUTO" : "MANUAL" },
@@ -2743,10 +2700,12 @@ renderSettingsScreen(config):
   ]
 
   visibleItems = items.filter(i => i.visible != false)
-  for idx, item in visibleItems:
+  visibleStart = clamp(uiState.settingsIndex - 7, 0, max(0, visibleItems.count - 8))
+  for idx, item in visibleItems[visibleStart : visibleStart + 8]:
     y = 20 + idx * 18
-    prefix = "▶" if idx == uiState.settingsIndex else " "
-    color = CYAN if idx == uiState.settingsIndex else WHITE
+    logicalIdx = visibleStart + idx
+    prefix = "▶" if logicalIdx == uiState.settingsIndex else " "
+    color = CYAN if logicalIdx == uiState.settingsIndex else WHITE
     drawText(0, y, "%s %s: %s", prefix, item.label, item.value, color)
 
 // BtnB long press na opcji → zmień wartość:
@@ -2762,6 +2721,18 @@ onBtnB_LongPress:
       config.pots[0].plantProfileIndex = (config.pots[0].plantProfileIndex + 1) % NUM_PROFILES
     "Profil 🌱2":
       config.pots[1].plantProfileIndex = (config.pots[1].plantProfileIndex + 1) % NUM_PROFILES
+    "P1 Dry":
+      config.pots[0].moistureDryRaw = nextRawAbove(config.pots[0].moistureWetRaw + 32)
+    "P1 Wet":
+      config.pots[0].moistureWetRaw = nextRawBelow(config.pots[0].moistureDryRaw - 32)
+    "P1 Exp":
+      config.pots[0].moistureCurveExponent = nextFloatInRange(config.pots[0].moistureCurveExponent, 0.10, 12.00, 0.01)
+    "P2 Dry":
+      config.pots[1].moistureDryRaw = nextRawAbove(config.pots[1].moistureWetRaw + 32)
+    "P2 Wet":
+      config.pots[1].moistureWetRaw = nextRawBelow(config.pots[1].moistureDryRaw - 32)
+    "P2 Exp":
+      config.pots[1].moistureCurveExponent = nextFloatInRange(config.pots[1].moistureCurveExponent, 0.10, 12.00, 0.01)
     "Rezerwuar":
       // Cykl: 5L → 10L → 15L → 20L → 5L
       config.reservoirCapacityMl = nextInCycle([5000, 10000, 15000, 20000], config.reservoirCapacityMl)
@@ -2838,11 +2809,14 @@ struct PotConfig {
   uint16 customPulseWaterMl                     // NEW
   uint8  customMaxPulsesPerCycle                // NEW
   // Pompa per-pot
-  float  pumpMlPerSec = 0                       // z kalibracji pompy (0 = nie skalibrowana)
-  bool   pumpCalibrated = false
+  float  pumpMlPerSec = 5.17                    // stały parametr obsługiwanej pompy M5 Watering
+  bool   pumpCalibrated = true                  // legacy flag dla kompatybilności NVS
   // Sensory per-pot
   bool   potMaxActiveLow = true                 // per-pot overflow sensor polaryzacja
   float  moistureEmaAlpha = 0.1                 // per-pot EMA alpha
+  uint16 moistureDryRaw = 2230                  // per-pot RAWf endpoint dla 0%
+  uint16 moistureWetRaw = 1752                  // per-pot RAWf endpoint dla 100%
+  float  moistureCurveExponent = 5.0            // per-pot wykładnik krzywej t^p
 }
 
 struct Config {
@@ -2855,6 +2829,9 @@ struct Config {
   // Multi-pot
   uint8  numPots = 1                            // 1 lub 2 (domyślnie 1)
   PotConfig pots[MAX_POTS]                      // pots[0] = główna, pots[1] = opcjonalna
+
+  // Implementacyjnie: firmware przy boot normalizuje oba POT do tej samej stałej
+  // wydajności pompy M5 Watering; brak procedury dziedziczenia ani kalibracji runtime.
 
   // Pompa — globalne safety
   uint32 pumpOnMsMax = 30000                     // hard timeout per puls (obie pompy)
@@ -2941,7 +2918,6 @@ DUSK_DRIFT_WARNING(deltaMinutes)
 
 // Requests (UI/NET → ControlTask)
 REQUEST_SET_PLANT(potIndex, profileIndex)     // per-pot profil
-REQUEST_PUMP_CALIBRATE(potIndex)              // per-pot kalibracja
 REQUEST_RESERVOIR_REFILL
 REQUEST_MANUAL_WATER(potIndex)                // /water [1|2]
 REQUEST_SET_VACATION(bool)
@@ -2958,7 +2934,6 @@ SENSOR_ANOMALY(potIndex, sensorId, description)
 ### Zaktualizowana checklista
 
 - [ ] **Per-pot (powtórz dla każdej aktywnej doniczki)**:
-  - [ ] Kalibracja pompy: `pots[i].pumpMlPerSec` — zmierzyć na stanowisku (30s test).
   - [ ] Weryfikacja czujnika doniczki: czy TRIGGERED = woda na dnie podwójnego dna.
   - [ ] EMA alpha: dostroić per-pot — mniejsze α = wolniejsza reakcja, mniej szumu.
   - [ ] Profile roślin: sprawdzić czy domyślne wartości pasują do konkretnych sadzonek.
@@ -3197,18 +3172,17 @@ interface SoilMoistureSensor : Sensor {
   readPct(nowMs) -> ReadResult<float>
 }
 
-normalizeSoil(raw):
-  // Stała mapa referencyjna dla Watering Unit 0-3.3V, bez per-pot kalibracji użytkownika.
-  // Do obliczenia krzywej bierzemy tylko dwa punkty krańcowe zmierzone na stanowisku:
-  // - dryRaw = 2230  -> 0%
-  // - wetRaw = 1752  -> 100%
-  // Nie ustawiamy pośrednich kotwic. Cały zakres jest liczony z funkcji ciągłej.
+normalizeSoil(raw, dryRaw, wetRaw, curveExponent):
+  // Referencyjny model dla Watering Unit 0-3.3V,
+  // ale z osobnymi endpointami RAWf DRY/WET i osobnym wykładnikiem `p`
+  // dla każdego POT. Firmware nie prowadzi procedury kalibracji;
+  // użytkownik zmienia trzy parametry na kanał z UI lub Telegrama.
   //
   // Krok 1: normalizacja raw do zakresu 0..1
   //   t = clamp((dryRaw - raw) / (dryRaw - wetRaw), 0, 1)
   //
   // Krok 2: nieliniowa krzywa jednostronna opóźniająca dojście do 100%:
-  //   curve(t) = t^5
+  //   curve(t) = t^p
   //
   // Krok 3: przeskalowanie do procentów:
   //   pct = 100 * curve(t)
@@ -3216,15 +3190,27 @@ normalizeSoil(raw):
   // Efekt praktyczny:
   // - blisko dry reakcja jest spokojna i nie przeszacowuje małych zmian,
   // - środek zakresu nadal rośnie monotonicznie,
-  // - blisko wet wynik dochodzi do 100% dużo później niż w poprzednim modelu.
+  // - dynamika w środku zakresu może być dopasowana osobno dla każdej sondy,
+  // - blisko wet wynik dochodzi do 100% później lub szybciej zależnie od `p`.
   //
-  // Dlaczego nie używamy tu symetrycznej krzywej S:
-  // - przy raw bardzo bliskim wetRaw, ale jeszcze nie równym wetRaw,
-  //   funkcja typu smootherstep dawała już niemal 100%,
-  // - w praktyce powodowało to przedwczesną saturację wskazania.
-  t = clamp((2230 - raw) / (2230 - 1752), 0, 1)
-  pct = 100 * t^5
+  // Im większe `p`, tym wskazanie wolniej rośnie w środku zakresu.
+  // Im mniejsze `p`, tym wskazanie szybciej dochodzi do wyższych procentów.
+  // To pozwala zgrać różne sondy osadzone nawet w tej samej doniczce.
+  t = clamp((dryRaw - raw) / (dryRaw - wetRaw), 0, 1)
+  pct = 100 * t^p
   return pct
+
+Domyślne endpointy po wdrożeniu:
+- POT1: `RAWf DRY = 2224`, `RAWf WET = 1792`
+- POT2: `RAWf DRY = 2228`, `RAWf WET = 1814`
+
+Domyślne wykładniki po wdrożeniu:
+- POT1: `p = 9.10`
+- POT2: `p = 1.24`
+
+Ostrzeżenie eksploatacyjne:
+- jeśli elektronika sondy nie jest zaizolowana, np. bezbarwnym lakierem,
+  woda może dostać się do płytki i spowodować korozję oraz przesunięcie punktów `RAWf DRY/WET`.
 
 Źródła i uzasadnienie modelu:
 - Dla dokładnie tego sensora, czyli M5Stack Watering Unit / M5 Watering, nie znaleziono
@@ -3238,9 +3224,10 @@ normalizeSoil(raw):
   - charakterystyka czujników pojemnościowych jest nieliniowa,
   - prosta mapa liniowa `raw -> %` jest zbyt słaba fizycznie,
   - okolice skrajów suchy/mokry mają tendencję do spłaszczenia,
-  - kalibracja powinna być lokalna i oparta na punktach końcowych z własnego układu.
+  - kalibracja powinna być lokalna i oparta na punktach końcowych z własnego układu,
+  - różne egzemplarze sond mogą wymagać innej dynamiki krzywej nawet przy podobnych endpointach.
 - Na tej podstawie przyjęto w AutoGarden prosty model inżynierski: kalibracja dwupunktowa
-  (`dryRaw`, `wetRaw`) + jednostronna krzywa potęgowa `pct = 100 * t^5` na całym zakresie.
+  (`dryRaw`, `wetRaw`) + jednostronna krzywa potęgowa `pct = 100 * t^p`, gdzie `p` jest ustawiane per POT.
 
 Źródła, z których bierzemy te założenia:
 - Hydronix, "Are All Moisture Sensors Equal?" — opisuje nieliniowość, wpływ materiału,

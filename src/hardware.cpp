@@ -17,6 +17,7 @@
 #include "hardware.h"
 #include <Wire.h>
 #include <Arduino.h>
+#include <cmath>
 #include <cstring>
 #include "log_serial.h"
 
@@ -27,9 +28,7 @@ constexpr uint8_t PbHubBus::kChBase[6];
 
 namespace {
 constexpr uint16_t kMaxPbHubAdcRaw = 4095;
-constexpr uint16_t kMoistureDryRaw = 2230;
-constexpr uint16_t kMoistureWetRaw = 1752;
-constexpr uint16_t kMoistureFallbackDryRaw = kMoistureDryRaw;
+constexpr uint16_t kMoistureFallbackDryRaw = 2230;
 constexpr uint8_t kMoistureMedianWindow = 10;
 
 float clamp01(float value) {
@@ -38,12 +37,11 @@ float clamp01(float value) {
     return value;
 }
 
-float moistureCurve(float t) {
+float moistureCurve(float t, float curveExponent) {
     t = clamp01(t);
-    // A symmetric S-curve saturates too early near the wet endpoint.
-    // Use a one-sided convex curve so 100% is reached only very close to wetRaw.
-    const float t2 = t * t;
-    return t2 * t2 * t;
+    if (curveExponent < 0.1f) curveExponent = 0.1f;
+    if (curveExponent > 12.0f) curveExponent = 12.0f;
+    return powf(t, curveExponent);
 }
 
 uint16_t medianOfUint16(const uint16_t* samples, uint8_t count) {
@@ -71,17 +69,23 @@ uint16_t medianOfUint16(const uint16_t* samples, uint8_t count) {
 }
 }
 
-float normalizeMoistureRaw(uint16_t raw) {
-    if (raw >= kMoistureDryRaw) return 0.0f;
-    if (raw <= kMoistureWetRaw) return 100.0f;
+float normalizeMoistureRaw(uint16_t raw, uint16_t dryRaw, uint16_t wetRaw,
+                           float curveExponent) {
+    if (wetRaw >= dryRaw) {
+        dryRaw = kMoistureFallbackDryRaw;
+        wetRaw = 1752;
+    }
+
+    if (raw >= dryRaw) return 0.0f;
+    if (raw <= wetRaw) return 100.0f;
 
     // Two-point nonlinear mapping based only on measured dry and wet endpoints.
     // We normalize raw ADC to 0..1 and then apply a convex curve that delays
     // saturation near wetRaw, so values close to the wet endpoint do not jump
     // to 100% too early.
-    const float span = (float)(kMoistureDryRaw - kMoistureWetRaw);
-    const float normalizedWetness = clamp01(((float)kMoistureDryRaw - (float)raw) / span);
-    return 100.0f * moistureCurve(normalizedWetness);
+    const float span = static_cast<float>(dryRaw - wetRaw);
+    const float normalizedWetness = clamp01((static_cast<float>(dryRaw) - static_cast<float>(raw)) / span);
+    return 100.0f * moistureCurve(normalizedWetness, curveExponent);
 }
 
 // ===== PbHubBus =============================================================
@@ -894,11 +898,15 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
         uint16_t filteredMoistureRaw = medianOfUint16(s_soilMedianSamples[i], s_soilMedianCount[i]);
         snap.pots[i].moistureRawFiltered = filteredMoistureRaw;
 
-        // Median on raw ADC rejects short spikes; EMA still runs later on moisturePct.
-        snap.pots[i].moisturePct = normalizeMoistureRaw(filteredMoistureRaw);
+        // Median on raw ADC rejects short spikes; both fast control and the later
+        // EMA path stay aligned because percent is still derived from RAWf.
+        snap.pots[i].moisturePct = normalizeMoistureRaw(filteredMoistureRaw,
+                                cfg.pots[i].moistureDryRaw,
+                                cfg.pots[i].moistureWetRaw,
+                                cfg.pots[i].moistureCurveExponent);
 
         // Mapping diagnostic for Watering Unit on PbHUB channel:
-        // M5Stack Watering Unit U101: pin0=PUMP_EN, pin1=AOUT
+        // M5Stack Watering Unit U101: pin0=AOUT, pin1=PUMP_EN
         // If raw stays at fallback for long, print a clear hint.
         static uint16_t s_rawFallbackCount[kMaxPots] = {};
         if (!rawResult.ok() || rawResult.value == 0 || rawResult.value > kMaxPbHubAdcRaw) {

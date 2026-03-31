@@ -77,8 +77,10 @@ struct SensorSnapshot {
 };
 
 // Normalize M5 Watering Unit raw ADC to moisture percent using the current
-// installation-specific two-point nonlinear model.
-float normalizeMoistureRaw(uint16_t raw);
+// installation-specific two-point nonlinear model with per-pot RAWf endpoints
+// and per-pot curve exponent.
+float normalizeMoistureRaw(uint16_t raw, uint16_t dryRaw, uint16_t wetRaw,
+                           float curveExponent);
 
 // ---------------------------------------------------------------------------
 // PbHubBus — jedyny punkt dostępu do PbHUB v1.1
