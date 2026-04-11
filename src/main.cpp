@@ -98,6 +98,7 @@ struct TelegramFeedbackMessage {
 };
 
 static QueueHandle_t     s_tgFeedbackQueue = nullptr;
+static constexpr UBaseType_t kTelegramFeedbackDrainPerTick = 2;
 
 // ============================================================================
 // Helpers — snapshot (thread-safe r/w)
@@ -1085,8 +1086,6 @@ static void controlTaskFn(void* /*param*/) {
                     g_config.mode = static_cast<Mode>(evt.payload.config.valueU16);
                     requestConfigSave(g_config);
                     Serial.printf("[CTRL] mode=%d\n", (int)g_config.mode);
-                    queueTelegramFeedbackFmt("Mode applied: %s.",
-                                             g_config.mode == Mode::AUTO ? "AUTO" : "MANUAL");
                     publishSharedStateFromControl();
                     break;
 
@@ -1215,8 +1214,6 @@ static void controlTaskFn(void* /*param*/) {
                     handleVacationToggle(enable, g_config);
                     requestConfigSave(g_config);
                     Serial.printf("[CTRL] vacation=%d\n", g_config.vacationMode);
-                    queueTelegramFeedbackFmt("Vacation mode applied: %s.",
-                                             g_config.vacationMode ? "ON" : "OFF");
                     publishSharedStateFromControl();
                     break;
                 }
@@ -1226,8 +1223,6 @@ static void controlTaskFn(void* /*param*/) {
                     s_runtimeDirty = true;
                     saveRuntimeNow(lastRuntimeSave);
                     Serial.println("[CTRL] event=reservoir_refill runtime_saved=yes");
-                    queueTelegramFeedbackFmt("Reservoir refill applied: %.0fml available.",
-                                             g_budget.reservoirCurrentMl);
                     publishSharedStateFromControl();
                     break;
 
@@ -1277,7 +1272,6 @@ static void controlTaskFn(void* /*param*/) {
                         saveRuntimeNow(lastRuntimeSave);
                     }
                     Serial.printf("[CTRL] event=remote_stop any=%s\n", any ? "yes" : "no");
-                    queueTelegramFeedbackFmt("Stop applied: %s.", any ? "watering stopped" : "nothing was active");
                     publishSharedStateFromControl();
                     break;
                 }
@@ -1292,10 +1286,7 @@ static void controlTaskFn(void* /*param*/) {
                 case EventType::REQUEST_START_WIFI_SETUP:
                     if (!g_netState.apActive) {
                         startApNonBlocking(g_netConfig, g_netState);
-                        queueTelegramFeedbackFmt("WiFi portal active: open autogarden or 192.168.4.1.");
                         publishSharedNetStatus(g_netState.wifiConnected);
-                    } else {
-                        queueTelegramFeedbackFmt("WiFi portal already active: autogarden / 192.168.4.1.");
                     }
                     break;
 
@@ -1606,6 +1597,8 @@ static void netTaskFn(void* /*param*/) {
     static DailyReportData rptData{};
     static TelegramStatusData tgData{};
     static char heartbeatBuf[512];
+    static uint32_t s_lastFeedbackBacklogLogMs = 0;
+    static uint32_t s_lastFeedbackDeferredLogMs = 0;
 
     for (;;) {
         uint32_t now = millis();
@@ -1613,32 +1606,10 @@ static void netTaskFn(void* /*param*/) {
         netTaskTick(now, g_netState, g_netConfig);
         publishSharedNetStatus(g_netState.wifiConnected);
 
-        if (g_netState.wifiConnected && g_netState.telegramEnabled && s_tgFeedbackQueue) {
-            TelegramFeedbackMessage note{};
-            while (xQueueReceive(s_tgFeedbackQueue, &note, 0) == pdTRUE) {
-                telegramSend(note.text, g_netConfig, 2, 250);
-                Serial.printf("[TG] event=feedback_sent len=%u\n",
-                              static_cast<unsigned>(strlen(note.text)));
-            }
-        }
-
         // Heartbeat check
         if (g_netState.wifiConnected && g_netState.telegramEnabled) {
             shared = readSharedState();
             latestSnap = readSnapshot();
-            if (isDailyHeartbeatTime(now, g_solarClock, g_duskDetector,
-                                     g_netState)) {
-                rptData.sensors  = latestSnap;
-                rptData.budget   = shared.budget;
-                memcpy(rptData.trends, shared.trends, sizeof(shared.trends));
-                rptData.config   = shared.config;
-                rptData.uptimeMs = now;
-
-                formatDailyReport(rptData, heartbeatBuf, sizeof(heartbeatBuf));
-                telegramSend(heartbeatBuf, g_netConfig);
-                g_netState.heartbeatSentToday = true;
-                Serial.println("[NET] event=heartbeat_sent");
-            }
 
             tgData.sensors = latestSnap;
             tgData.budget = shared.budget;
@@ -1656,7 +1627,83 @@ static void netTaskFn(void* /*param*/) {
             tgData.apActive = g_netState.apActive;
             tgData.selectedPot = shared.selectedPot;
             tgData.uptimeMs = now;
+
+            // Najpierw odbierz i obsłuż komendy/callbacki użytkownika,
+            // żeby backlog feedbacku nie opóźniał odpowiedzi inline.
             telegramPollCommands(now, g_netConfig, tgData);
+
+            uint32_t prevLastHeartbeatMs = g_netState.lastHeartbeatMs;
+            bool prevHeartbeatSentToday = g_netState.heartbeatSentToday;
+            if (isDailyHeartbeatTime(now, g_solarClock, g_duskDetector,
+                                     g_netState)) {
+                rptData.sensors  = latestSnap;
+                rptData.budget   = shared.budget;
+                memcpy(rptData.trends, shared.trends, sizeof(shared.trends));
+                rptData.config   = shared.config;
+                rptData.uptimeMs = now;
+
+                formatDailyReport(rptData, heartbeatBuf, sizeof(heartbeatBuf));
+                bool sent = false;
+                if (telegramHasActivePanel()) {
+                    sent = telegramSendToActivePanel(heartbeatBuf, tgData, g_netConfig);
+                    if (sent) {
+                        Serial.println("[NET] event=heartbeat_sent mode=inline_panel");
+                    } else {
+                        Serial.println("[NET] event=heartbeat_deferred reason=panel_send_failed");
+                    }
+                } else {
+                    Serial.println("[NET] event=heartbeat_deferred reason=no_active_panel");
+                }
+
+                if (sent) {
+                    g_netState.heartbeatSentToday = true;
+                } else {
+                    g_netState.lastHeartbeatMs = prevLastHeartbeatMs;
+                    g_netState.heartbeatSentToday = prevHeartbeatSentToday;
+                }
+            }
+
+            if (s_tgFeedbackQueue) {
+                UBaseType_t queueBefore = uxQueueMessagesWaiting(s_tgFeedbackQueue);
+                UBaseType_t processedCount = 0;
+                TelegramFeedbackMessage note{};
+                while (processedCount < kTelegramFeedbackDrainPerTick &&
+                       xQueuePeek(s_tgFeedbackQueue, &note, 0) == pdTRUE) {
+                    if (!telegramHasActivePanel()) {
+                        if ((now - s_lastFeedbackDeferredLogMs) >= 5000) {
+                            s_lastFeedbackDeferredLogMs = now;
+                            Serial.printf("[TG] event=feedback_deferred reason=no_active_panel waiting=%u\n",
+                                          static_cast<unsigned>(queueBefore));
+                        }
+                        break;
+                    }
+
+                    bool sent = telegramSendToActivePanel(note.text, tgData, g_netConfig);
+                    if (!sent) {
+                        if ((now - s_lastFeedbackDeferredLogMs) >= 5000) {
+                            s_lastFeedbackDeferredLogMs = now;
+                            Serial.printf("[TG] event=feedback_deferred reason=panel_send_failed waiting=%u\n",
+                                          static_cast<unsigned>(queueBefore));
+                        }
+                        break;
+                    }
+
+                    xQueueReceive(s_tgFeedbackQueue, &note, 0);
+                    ++processedCount;
+                    Serial.printf("[TG] event=feedback_sent idx=%u len=%u mode=inline_panel ok=yes\n",
+                                  static_cast<unsigned>(processedCount),
+                                  static_cast<unsigned>(strlen(note.text)));
+                }
+
+                UBaseType_t queueAfter = uxQueueMessagesWaiting(s_tgFeedbackQueue);
+                if (queueAfter > 0 && (now - s_lastFeedbackBacklogLogMs) >= 5000) {
+                    s_lastFeedbackBacklogLogMs = now;
+                    Serial.printf("[TG] event=feedback_backlog before=%u drained=%u after=%u\n",
+                                  static_cast<unsigned>(queueBefore),
+                                  static_cast<unsigned>(processedCount),
+                                  static_cast<unsigned>(queueAfter));
+                }
+            }
         }
 
         // AP mode i aktywny Telegram korzystają z krótszego ticka,

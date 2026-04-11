@@ -65,18 +65,119 @@ static WiFiClientSecure g_tgClient;
 static std::unique_ptr<UniversalTelegramBot> g_tgBot;
 static char g_tgTokenCache[64] = {};
 static char g_tgConfiguredBotName[64] = {};
-static char g_tgReplyBuf[1024] = {};
+static char g_tgReplyBuf[2048] = {};
 static char g_tgKeyboardBuf[768] = {};
+
+enum class TelegramPanelView : uint8_t {
+    MENU = 0,
+    PROFILES = 1,
+    REFILL = 2,
+};
+
+static char g_tgActivePanelChatId[24] = {};
+static int g_tgActivePanelMessageId = 0;
+static TelegramPanelView g_tgActivePanelView = TelegramPanelView::MENU;
+static uint8_t g_tgActiveProfilePot = 0;
+static uint16_t g_tgActiveRefillCapacityMl = 0;
 static uint32_t g_tgLastIdleLogMs = 0;
 static uint32_t g_tgLastPollMs = 0;
 static uint32_t g_tgFastPollUntilMs = 0;
+static uint32_t g_tgLastPollFailMs = 0;
+static uint32_t g_tgLastPollCooldownLogMs = 0;
+static uint32_t g_tgLastStatsLogMs = 0;
+static char g_tgLastMenuChatId[24] = {};
+static uint32_t g_tgLastMenuMs = 0;
 static constexpr uint32_t kTelegramPollIntervalIdleMs = 2000;
-static constexpr uint32_t kTelegramPollIntervalActiveMs = 400;
+static constexpr uint32_t kTelegramPollIntervalActiveMs = 1200;
 static constexpr uint32_t kTelegramFastPollWindowMs = 120000;
-static constexpr uint32_t kTelegramRequestTimeoutMs = 8000;
-static constexpr uint8_t kTelegramMaxBatchFetches = 10;
+static constexpr uint32_t kTelegramRequestTimeoutMs = 3500;
+static constexpr uint8_t kTelegramMaxBatchFetches = 3;
+static constexpr uint32_t kTelegramPollFailCooldownMs = 800;
+static constexpr uint32_t kTelegramPollWorkBudgetMs = 1200;
+static constexpr uint32_t kTelegramPollSlowLogMs = 2500;
+static constexpr uint32_t kTelegramMenuDedupMs = 6000;
+
+struct TelegramRuntimeStats {
+    uint32_t fetchCalls = 0;
+    uint32_t fetchFailures = 0;
+    uint32_t fetchTimeoutLike = 0;
+    uint32_t fetchMaxMs = 0;
+    uint32_t pollCycles = 0;
+    uint32_t pollBudgetBreaks = 0;
+    uint32_t sendAttempts = 0;
+    uint32_t sendRetries = 0;
+};
+
+static TelegramRuntimeStats g_tgStats;
 
 static uint8_t countChatIds(const char* chatIds);
+static void safeCopy(char* dst, size_t dstSize, const char* src);
+static void formatDurationCompact(uint32_t durationMs, char* buf, size_t bufSize);
+static void formatDaysRemainingShort(float daysRemaining, char* buf, size_t bufSize);
+static void formatElapsedShort(uint32_t nowMs, uint32_t sinceMs, char* buf, size_t bufSize);
+static float trendRecentAverage(const TrendState& ts, uint8_t windowSamples);
+static void trendRecentMinMax(const TrendState& ts, float& minValue, float& maxValue);
+static const char* classifyTrendPace(float lastRate, float baselineRate);
+static const char* telegramWaterLevelStateShort(WaterLevelState state);
+static const char* telegramCyclePhaseShort(WateringPhase phase);
+static const char* telegramTrendArrow(float rate);
+static const char* telegramTrendClassLabel(const char* pace);
+static const char* telegramDuskPhasePretty(DuskPhase phase);
+static void formatPotActionLine(const TelegramStatusData& status,
+                                uint8_t potIdx,
+                                char* buf,
+                                size_t bufSize);
+static void buildTelegramInlineMenuKeyboard(const TelegramStatusData& status,
+                                            char* buf, size_t bufSize);
+static void buildTelegramProfilesKeyboard(const TelegramStatusData& status,
+                                          uint8_t activePot,
+                                          char* buf,
+                                          size_t bufSize);
+static void buildTelegramRefillKeyboard(char* buf, size_t bufSize);
+static void buildTelegramPanelKeyboard(const TelegramStatusData& status,
+                                       TelegramPanelView panelView,
+                                       uint8_t activePot,
+                                       char* buf,
+                                       size_t bufSize);
+static bool telegramSendInlineKeyboardToChat(const String& chatId,
+                                             const char* msg,
+                                             const char* keyboardJson,
+                                             const NetConfig& netCfg,
+                                             int messageId,
+                                             uint8_t maxRetries,
+                                             uint32_t retryDelayMs,
+                                             TelegramPanelView panelView,
+                                             uint8_t panelPot,
+                                             bool allowNewMessageFallback);
+
+static void telegramRememberActivePanel(const String& chatId,
+                                        int messageId,
+                                        TelegramPanelView panelView,
+                                        uint8_t panelPot) {
+    if (messageId <= 0) {
+        return;
+    }
+    safeCopy(g_tgActivePanelChatId, sizeof(g_tgActivePanelChatId), chatId.c_str());
+    g_tgActivePanelMessageId = messageId;
+    g_tgActivePanelView = panelView;
+    g_tgActiveProfilePot = panelPot;
+}
+
+static void telegramLogStatsIfDue(uint32_t nowMs) {
+    if (g_tgLastStatsLogMs != 0 && (nowMs - g_tgLastStatsLogMs) < 60000) {
+        return;
+    }
+    g_tgLastStatsLogMs = nowMs;
+    Serial.printf("[TG] event=stats fetch_calls=%lu fetch_fail=%lu fetch_timeout_like=%lu fetch_max_ms=%lu poll_cycles=%lu budget_breaks=%lu send_attempts=%lu send_retries=%lu\n",
+                  static_cast<unsigned long>(g_tgStats.fetchCalls),
+                  static_cast<unsigned long>(g_tgStats.fetchFailures),
+                  static_cast<unsigned long>(g_tgStats.fetchTimeoutLike),
+                  static_cast<unsigned long>(g_tgStats.fetchMaxMs),
+                  static_cast<unsigned long>(g_tgStats.pollCycles),
+                  static_cast<unsigned long>(g_tgStats.pollBudgetBreaks),
+                  static_cast<unsigned long>(g_tgStats.sendAttempts),
+                  static_cast<unsigned long>(g_tgStats.sendRetries));
+}
 
 static void telegramBumpFastPollWindow(uint32_t nowMs) {
     g_tgFastPollUntilMs = nowMs + kTelegramFastPollWindowMs;
@@ -137,6 +238,40 @@ const char* telegramConfiguredBotName() {
 
 uint8_t telegramConfiguredTargetCount(const NetConfig& netCfg) {
     return countChatIds(netCfg.telegramChatIds);
+}
+
+bool telegramInteractionActive(uint32_t nowMs) {
+    return nowMs < g_tgFastPollUntilMs;
+}
+
+bool telegramHasActivePanel() {
+    return g_tgActivePanelChatId[0] != '\0' && g_tgActivePanelMessageId > 0;
+}
+
+bool telegramSendToActivePanel(const char* msg,
+                               const TelegramStatusData& status,
+                               const NetConfig& netCfg) {
+    if (!msg || msg[0] == '\0') {
+        return false;
+    }
+    if (!telegramHasActivePanel()) {
+        return false;
+    }
+    buildTelegramPanelKeyboard(status,
+                               g_tgActivePanelView,
+                               g_tgActiveProfilePot,
+                               g_tgKeyboardBuf,
+                               sizeof(g_tgKeyboardBuf));
+    return telegramSendInlineKeyboardToChat(g_tgActivePanelChatId,
+                                            msg,
+                                            g_tgKeyboardBuf,
+                                            netCfg,
+                                            g_tgActivePanelMessageId,
+                                            1,
+                                            0,
+                                            g_tgActivePanelView,
+                                            g_tgActiveProfilePot,
+                                            false);
 }
 
 static bool isChatListSeparator(char c) {
@@ -527,15 +662,21 @@ static bool telegramEnsureReady(const NetConfig& netCfg) {
         g_tgClient.setInsecure();
         g_tgClient.setTimeout(kTelegramRequestTimeoutMs);
         g_tgBot.reset(new UniversalTelegramBot(netCfg.telegramBotToken, g_tgClient));
+        g_tgBot->maxMessageLength = 4096;
         g_tgBot->longPoll = 0;
         g_tgBot->waitForResponse = 1500;
         safeCopy(g_tgTokenCache, sizeof(g_tgTokenCache), netCfg.telegramBotToken);
         g_tgLastPollMs = 0;
         g_tgFastPollUntilMs = 0;
+        g_tgLastPollFailMs = 0;
         Serial.printf("[TG] event=client_ready poll_idle_ms=%lu poll_active_ms=%lu timeout_ms=%lu\n",
                       static_cast<unsigned long>(kTelegramPollIntervalIdleMs),
                       static_cast<unsigned long>(kTelegramPollIntervalActiveMs),
                       static_cast<unsigned long>(kTelegramRequestTimeoutMs));
+        Serial.printf("[TG] event=client_cfg max_msg_len=%d long_poll_s=%d wait_resp_ms=%u\n",
+                  g_tgBot->maxMessageLength,
+                  g_tgBot->longPoll,
+                  static_cast<unsigned>(g_tgBot->waitForResponse));
     }
     return g_tgBot != nullptr;
 }
@@ -554,40 +695,69 @@ static int telegramFetchUpdates(const NetConfig& netCfg) {
     if (!telegramEnsureReady(netCfg)) {
         return -999;
     }
+    uint32_t startedMs = millis();
     int count = g_tgBot->getUpdates(g_tgBot->last_message_received + 1);
+    uint32_t durationMs = millis() - startedMs;
+    ++g_tgStats.fetchCalls;
+    if (durationMs > g_tgStats.fetchMaxMs) {
+        g_tgStats.fetchMaxMs = durationMs;
+    }
+
+    if (count < 0) {
+        g_tgLastPollFailMs = millis();
+        ++g_tgStats.fetchFailures;
+        if (durationMs + 50 >= kTelegramRequestTimeoutMs) {
+            ++g_tgStats.fetchTimeoutLike;
+        }
+        const int botErrCode = g_tgBot ? g_tgBot->_lastError : 0;
+        const char* botErrMsg = (g_tgBot && g_tgBot->lastErrorMessage.length() > 0)
+            ? g_tgBot->lastErrorMessage.c_str()
+            : "-";
+        Serial.printf("[TG] event=updates_fail count=%d dur_ms=%lu timeout_like=%s bot_err=%d bot_msg=%s\n",
+                      count,
+                      static_cast<unsigned long>(durationMs),
+                      (durationMs + 50 >= kTelegramRequestTimeoutMs) ? "yes" : "no",
+                      botErrCode,
+                      botErrMsg);
+        return count;
+    }
+
     if (count > 0) {
-        Serial.printf("[TG] event=updates count=%d last=%ld\n",
-                      count, static_cast<long>(g_tgBot->last_message_received));
+        Serial.printf("[TG] event=updates count=%d dur_ms=%lu last=%ld\n",
+                      count,
+                      static_cast<unsigned long>(durationMs),
+                      static_cast<long>(g_tgBot->last_message_received));
     }
     return count;
 }
 
 static bool telegramReplyToChat(const String& chatId, const String& msg,
-                                const NetConfig& netCfg,
-                                uint8_t maxRetries = 2,
-                                uint32_t retryDelayMs = 150) {
+                                const NetConfig& netCfg) {
     if (!telegramEnsureReady(netCfg)) {
         Serial.println("[TG] event=reply_fail reason=client_not_ready");
         return false;
     }
 
-    for (uint8_t attempt = 0; attempt < maxRetries; ++attempt) {
-        if (g_tgBot->sendMessage(chatId, msg, "")) {
-            telegramCloseTransport("after_send_message");
-            telegramBumpFastPollWindow(millis());
-            Serial.printf("[TG] event=reply_ok len=%u attempt=%u\n",
-                          static_cast<unsigned>(msg.length()),
-                          static_cast<unsigned>(attempt + 1));
-            return true;
-        }
-        telegramCloseTransport("send_message_fail", attempt == 0);
-        Serial.printf("[TG] event=reply_fail len=%u attempt=%u\n",
+    uint32_t startedMs = millis();
+    if (g_tgBot->sendMessage(chatId, msg, "")) {
+        uint32_t durationMs = millis() - startedMs;
+        telegramBumpFastPollWindow(millis());
+        Serial.printf("[TG] event=reply_ok len=%u dur_ms=%lu\n",
                       static_cast<unsigned>(msg.length()),
-                      static_cast<unsigned>(attempt + 1));
-        if (attempt + 1 < maxRetries) {
-            vTaskDelay(pdMS_TO_TICKS(retryDelayMs));
-        }
+                      static_cast<unsigned long>(durationMs));
+        return true;
     }
+
+    uint32_t durationMs = millis() - startedMs;
+    const int botErrCode = g_tgBot ? g_tgBot->_lastError : 0;
+    const char* botErrMsg = (g_tgBot && g_tgBot->lastErrorMessage.length() > 0)
+        ? g_tgBot->lastErrorMessage.c_str()
+        : "-";
+    Serial.printf("[TG] event=reply_fail len=%u dur_ms=%lu bot_err=%d bot_msg=%s\n",
+                  static_cast<unsigned>(msg.length()),
+                  static_cast<unsigned long>(durationMs),
+                  botErrCode,
+                  botErrMsg);
     return false;
 }
 
@@ -611,8 +781,11 @@ static bool telegramSendInlineKeyboardToChat(const String& chatId,
                                              const char* keyboardJson,
                                              const NetConfig& netCfg,
                                              int messageId = 0,
-                                             uint8_t maxRetries = 2,
-                                             uint32_t retryDelayMs = 150) {
+                                             uint8_t maxRetries = 1,
+                                             uint32_t retryDelayMs = 150,
+                                             TelegramPanelView panelView = TelegramPanelView::MENU,
+                                             uint8_t panelPot = 0,
+                                             bool allowNewMessageFallback = true) {
     if (!telegramEnsureReady(netCfg) || !msg || !keyboardJson) {
         return false;
     }
@@ -620,33 +793,51 @@ static bool telegramSendInlineKeyboardToChat(const String& chatId,
     for (uint8_t attempt = 0; attempt < maxRetries; ++attempt) {
         int targetMessageId = messageId;
         if (g_tgBot->sendMessageWithInlineKeyboard(chatId, msg, "", keyboardJson, targetMessageId)) {
-            telegramCloseTransport("after_send_inline_keyboard");
+            int actualMessageId = targetMessageId;
+            if (actualMessageId == 0 && g_tgBot) {
+                actualMessageId = g_tgBot->last_sent_message_id;
+            }
+            telegramRememberActivePanel(chatId, actualMessageId, panelView, panelPot);
             telegramBumpFastPollWindow(millis());
             Serial.printf("[TG] event=inline_ok len=%u attempt=%u message_id=%d\n",
                           static_cast<unsigned>(strlen(msg)),
-                          static_cast<unsigned>(attempt + 1), targetMessageId);
+                          static_cast<unsigned>(attempt + 1), actualMessageId);
             return true;
         }
-        telegramCloseTransport("send_inline_fail", attempt == 0);
-        Serial.printf("[TG] event=inline_fail len=%u attempt=%u message_id=%d\n",
+        const int botErrCode = g_tgBot ? g_tgBot->_lastError : 0;
+        const char* botErrMsg = (g_tgBot && g_tgBot->lastErrorMessage.length() > 0)
+            ? g_tgBot->lastErrorMessage.c_str()
+            : "-";
+        Serial.printf("[TG] event=inline_fail len=%u attempt=%u message_id=%d bot_err=%d bot_msg=%s\n",
                       static_cast<unsigned>(strlen(msg)),
-                      static_cast<unsigned>(attempt + 1), targetMessageId);
+                      static_cast<unsigned>(attempt + 1), targetMessageId,
+                      botErrCode,
+                      botErrMsg);
 
-        if (targetMessageId != 0) {
+        if (allowNewMessageFallback && targetMessageId != 0) {
             Serial.printf("[TG] event=inline_fallback_new_message old_message_id=%d\n",
                           targetMessageId);
             if (g_tgBot->sendMessageWithInlineKeyboard(chatId, msg, "", keyboardJson, 0)) {
-                telegramCloseTransport("after_inline_fallback_new_message");
+                int actualMessageId = g_tgBot ? g_tgBot->last_sent_message_id : 0;
+                telegramRememberActivePanel(chatId, actualMessageId, panelView, panelPot);
                 telegramBumpFastPollWindow(millis());
                 Serial.printf("[TG] event=inline_ok len=%u attempt=%u message_id=0 fallback=yes\n",
                               static_cast<unsigned>(strlen(msg)),
                               static_cast<unsigned>(attempt + 1));
                 return true;
             }
-            telegramCloseTransport("inline_fallback_new_message_fail", attempt == 0);
-            Serial.printf("[TG] event=inline_fallback_fail len=%u attempt=%u old_message_id=%d\n",
+            const int fbErrCode = g_tgBot ? g_tgBot->_lastError : 0;
+            const char* fbErrMsg = (g_tgBot && g_tgBot->lastErrorMessage.length() > 0)
+                ? g_tgBot->lastErrorMessage.c_str()
+                : "-";
+            Serial.printf("[TG] event=inline_fallback_fail len=%u attempt=%u old_message_id=%d bot_err=%d bot_msg=%s\n",
                           static_cast<unsigned>(strlen(msg)),
-                          static_cast<unsigned>(attempt + 1), targetMessageId);
+                          static_cast<unsigned>(attempt + 1), targetMessageId,
+                          fbErrCode,
+                          fbErrMsg);
+        } else if (!allowNewMessageFallback && targetMessageId != 0) {
+            Serial.printf("[TG] event=inline_no_fallback old_message_id=%d\n",
+                          targetMessageId);
         }
 
         if (attempt + 1 < maxRetries) {
@@ -658,31 +849,59 @@ static bool telegramSendInlineKeyboardToChat(const String& chatId,
 
 static void formatTelegramMenuSummary(const TelegramStatusData& data, char* buf, size_t bufSize) {
     int pos = 0;
-    pos = appendFmt(buf, bufSize, pos, "autogarden menu\n");
-    pos = appendFmt(buf, bufSize, pos, "Mode: %s | Vac: %s | WiFi: %s | AP: %s\n",
+    char uptimeBuf[24] = {};
+    char daysBuf[16] = {};
+    formatDurationCompact(data.uptimeMs, uptimeBuf, sizeof(uptimeBuf));
+    formatDaysRemainingShort(data.budget.daysRemaining, daysBuf, sizeof(daysBuf));
+
+    pos = appendFmt(buf, bufSize, pos, "▣ AUTOGARDEN\n");
+    pos = appendFmt(buf, bufSize, pos, "━━━━━━━━━━━━━━━━━━━━\n");
+    pos = appendFmt(buf, bufSize, pos, "🧠 %s | 🏖 %s | 📶 %s | AP %s\n",
                     modeStr(data.config.mode),
                     data.config.vacationMode ? "ON" : "OFF",
                     data.wifiConnected ? "UP" : "DOWN",
                     data.apActive ? "ON" : "OFF");
-    pos = appendFmt(buf, bufSize, pos, "Reservoir: %.0fml (~%.1fd)%s\n",
+    pos = appendFmt(buf, bufSize, pos, "⏱ %s | 🌗 %s\n",
+                    uptimeBuf,
+                    telegramDuskPhasePretty(data.duskPhase));
+    pos = appendFmt(buf, bufSize, pos, "🪣 %.0f / %.0f ml | left %s%s\n",
                     data.budget.reservoirCurrentMl,
-                    data.budget.daysRemaining,
-                    data.budget.reservoirLow ? " LOW" : "");
+                    data.budget.reservoirCapacityMl,
+                    daysBuf,
+                    data.budget.reservoirLow ? " | LOW" : "");
+    pos = appendFmt(buf, bufSize, pos, "🌡 %.1fC | 💧 %.0f%% | ☀ %.0f lx\n",
+                    data.sensors.env.tempC,
+                    data.sensors.env.humidityPct,
+                    data.sensors.env.lux);
 
     for (uint8_t i = 0; i < data.config.numPots; ++i) {
         if (!data.config.pots[i].enabled) continue;
         const PlantProfile& prof = getActiveProfile(data.config, i);
-        pos = appendFmt(buf, bufSize, pos, "Pot%u %s: %.0f%%",
+        char actionLine[96] = {};
+        char sinceBuf[24] = {};
+        formatPotActionLine(data, i, actionLine, sizeof(actionLine));
+        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
+        float last1h = trendRecentAverage(data.trends[i], 1);
+
+        pos = appendFmt(buf, bufSize, pos, "\n🪴 POT %u | %s%s\n",
                         static_cast<unsigned>(i + 1),
                         prof.name ? prof.name : "?",
-                        data.sensors.pots[i].moisturePct);
-        if (data.sensors.pots[i].waterGuards.potMax == WaterLevelState::TRIGGERED) {
-            pos = appendFmt(buf, bufSize, pos, " overflow");
-        }
-        pos = appendFmt(buf, bufSize, pos, "\n");
+                        (i == data.selectedPot) ? " [selected]" : "");
+        pos = appendFmt(buf, bufSize, pos,
+                        "  water %.1f%% | ema %.1f%% | trend %s %.2f%%/h\n",
+                        data.sensors.pots[i].moisturePct,
+                        data.sensors.pots[i].moistureEma,
+                        telegramTrendArrow(last1h),
+                        isnan(last1h) ? 0.0f : last1h);
+        pos = appendFmt(buf, bufSize, pos,
+                        "  action %s\n"
+                        "  ovf %s | last %s\n",
+                        actionLine,
+                        telegramWaterLevelStateShort(data.sensors.pots[i].waterGuards.potMax),
+                        sinceBuf);
     }
 
-    pos = appendFmt(buf, bufSize, pos, "Use the buttons below.");
+    pos = appendFmt(buf, bufSize, pos, "\nUse the buttons below.");
 }
 
 static void buildTelegramInlineMenuKeyboard(const TelegramStatusData& status,
@@ -760,6 +979,419 @@ static void buildTelegramInlineMenuKeyboard(const TelegramStatusData& status,
                     modeLabel);
 }
 
+static uint8_t telegramClampProfilePot(const TelegramStatusData& status, uint8_t activePot) {
+    if (status.config.numPots == 0) {
+        return 0;
+    }
+    if (activePot < status.config.numPots) {
+        return activePot;
+    }
+    if (status.selectedPot < status.config.numPots) {
+        return status.selectedPot;
+    }
+    return 0;
+}
+
+static uint16_t telegramClampReservoirCapacityMl(const TelegramStatusData& status,
+                                                 int32_t capacityMl) {
+    int32_t minCapacityMl = 1000;
+    int32_t requiredMinMl = static_cast<int32_t>(status.config.reservoirLowThresholdMl + 100.0f);
+    if (requiredMinMl > minCapacityMl) {
+        minCapacityMl = ((requiredMinMl + 249) / 250) * 250;
+    }
+
+    if (capacityMl < minCapacityMl) {
+        capacityMl = minCapacityMl;
+    }
+    if (capacityMl > 50000) {
+        capacityMl = 50000;
+    }
+    return static_cast<uint16_t>(capacityMl);
+}
+
+static uint16_t telegramCurrentReservoirCapacityMl(const TelegramStatusData& status) {
+    return telegramClampReservoirCapacityMl(
+        status,
+        static_cast<int32_t>(status.config.reservoirCapacityMl + 0.5f));
+}
+
+static void formatElapsedShort(uint32_t nowMs,
+                               uint32_t sinceMs,
+                               char* buf,
+                               size_t bufSize) {
+    if (!buf || bufSize == 0) {
+        return;
+    }
+    if (sinceMs == 0 || sinceMs > nowMs) {
+        safeCopy(buf, bufSize, "-");
+        return;
+    }
+
+    formatDurationCompact(nowMs - sinceMs, buf, bufSize);
+}
+
+static float trendRecentAverage(const TrendState& ts, uint8_t windowSamples) {
+    if (ts.count == 0 || windowSamples == 0) {
+        return NAN;
+    }
+
+    uint8_t samples = (ts.count < windowSamples) ? ts.count : windowSamples;
+    float sum = 0.0f;
+    for (uint8_t i = 0; i < samples; ++i) {
+        uint8_t idx = (ts.headIdx + TrendState::kHours - 1 - i) % TrendState::kHours;
+        sum += ts.hourlyDeltas[idx];
+    }
+    return sum / static_cast<float>(samples);
+}
+
+static void trendRecentMinMax(const TrendState& ts,
+                              float& minValue,
+                              float& maxValue) {
+    if (ts.count == 0) {
+        minValue = NAN;
+        maxValue = NAN;
+        return;
+    }
+
+    uint8_t oldestIdx = (ts.headIdx + TrendState::kHours - ts.count) % TrendState::kHours;
+    minValue = ts.hourlyDeltas[oldestIdx];
+    maxValue = minValue;
+    for (uint8_t i = 1; i < ts.count; ++i) {
+        uint8_t idx = (oldestIdx + i) % TrendState::kHours;
+        float value = ts.hourlyDeltas[idx];
+        if (value < minValue) {
+            minValue = value;
+        }
+        if (value > maxValue) {
+            maxValue = value;
+        }
+    }
+}
+
+static const char* classifyTrendPace(float lastRate, float baselineRate) {
+    if (lastRate > 0.15f) {
+        return "wetting";
+    }
+    if (baselineRate >= -0.05f) {
+        return "learning";
+    }
+
+    float factor = fabsf(lastRate) / fabsf(baselineRate);
+    if (factor >= 2.0f) {
+        return "dry_fast";
+    }
+    if (factor >= 1.35f) {
+        return "dry_up";
+    }
+    if (factor <= 0.70f) {
+        return "dry_slow";
+    }
+    return "dry_ok";
+}
+
+static const char* telegramWaterLevelStateShort(WaterLevelState state) {
+    switch (state) {
+        case WaterLevelState::OK: return "ok";
+        case WaterLevelState::TRIGGERED: return "trig";
+        case WaterLevelState::UNKNOWN: return "unk";
+    }
+    return "?";
+}
+
+static const char* telegramCyclePhaseShort(WateringPhase phase) {
+    switch (phase) {
+        case WateringPhase::IDLE: return "IDLE";
+        case WateringPhase::EVALUATING: return "EVAL";
+        case WateringPhase::PULSE: return "PULSE";
+        case WateringPhase::SOAK: return "SOAK";
+        case WateringPhase::MEASURING: return "MEAS";
+        case WateringPhase::OVERFLOW_WAIT: return "OFLOW";
+        case WateringPhase::DONE: return "DONE";
+        case WateringPhase::BLOCKED: return "BLOCK";
+    }
+    return "?";
+}
+
+static const char* telegramTrendArrow(float rate) {
+    if (isnan(rate)) {
+        return "·";
+    }
+    if (rate > 0.15f) {
+        return "↑";
+    }
+    if (rate > -0.05f) {
+        return "→";
+    }
+    if (rate > -0.45f) {
+        return "↘";
+    }
+    return "↓";
+}
+
+static const char* telegramTrendClassLabel(const char* pace) {
+    if (!pace) {
+        return "learning";
+    }
+    if (strcmp(pace, "wetting") == 0) {
+        return "wetting";
+    }
+    if (strcmp(pace, "dry_fast") == 0) {
+        return "dry fast";
+    }
+    if (strcmp(pace, "dry_up") == 0) {
+        return "drying up";
+    }
+    if (strcmp(pace, "dry_slow") == 0) {
+        return "dry slow";
+    }
+    if (strcmp(pace, "dry_ok") == 0) {
+        return "dry ok";
+    }
+    return pace;
+}
+
+static const char* telegramDuskPhasePretty(DuskPhase phase) {
+    switch (phase) {
+        case DuskPhase::NIGHT: return "NIGHT";
+        case DuskPhase::DAWN_TRANSITION: return "DAWN";
+        case DuskPhase::DAY: return "DAY";
+        case DuskPhase::DUSK_TRANSITION: return "DUSK";
+    }
+    return "?";
+}
+
+static void formatDurationCompact(uint32_t durationMs, char* buf, size_t bufSize) {
+    if (!buf || bufSize == 0) {
+        return;
+    }
+
+    uint32_t totalMin = durationMs / 60000UL;
+    uint32_t days = totalMin / 1440UL;
+    uint32_t hours = (totalMin % 1440UL) / 60UL;
+    uint32_t mins = totalMin % 60UL;
+
+    if (days > 0) {
+        snprintf(buf, bufSize, "%lud %luh %lum",
+                 static_cast<unsigned long>(days),
+                 static_cast<unsigned long>(hours),
+                 static_cast<unsigned long>(mins));
+        return;
+    }
+    if (hours > 0) {
+        snprintf(buf, bufSize, "%luh %lum",
+                 static_cast<unsigned long>(hours),
+                 static_cast<unsigned long>(mins));
+        return;
+    }
+    snprintf(buf, bufSize, "%lum", static_cast<unsigned long>(mins));
+}
+
+static void formatDaysRemainingShort(float daysRemaining, char* buf, size_t bufSize) {
+    if (!buf || bufSize == 0) {
+        return;
+    }
+    if (isnan(daysRemaining) || daysRemaining >= 900.0f) {
+        safeCopy(buf, bufSize, "learn");
+        return;
+    }
+    snprintf(buf, bufSize, "%.1fd", daysRemaining);
+}
+
+static void formatPotActionLine(const TelegramStatusData& status,
+                                uint8_t potIdx,
+                                char* buf,
+                                size_t bufSize) {
+    if (!buf || bufSize == 0) {
+        return;
+    }
+    buf[0] = '\0';
+
+    char reason[96] = {};
+    uint32_t cooldownRemainingMs = 0;
+    bool blocked = telegramWaterBlocked(status, potIdx, reason, sizeof(reason), &cooldownRemainingMs);
+    if (!blocked) {
+        snprintf(buf, bufSize, "ready / pulse %u ml",
+                 static_cast<unsigned>(status.config.pots[potIdx].pulseWaterMl));
+        return;
+    }
+
+    if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
+        safeCopy(buf, bufSize, "watering active");
+    } else if (cooldownRemainingMs > 0) {
+        snprintf(buf, bufSize, "cooldown / %lus left",
+                 static_cast<unsigned long>((cooldownRemainingMs + 999) / 1000));
+    } else if (strstr(reason, "already wet") != nullptr || strstr(reason, "above max") != nullptr) {
+        safeCopy(buf, bufSize, "wet enough");
+    } else if (strstr(reason, "AUTO mode") != nullptr) {
+        safeCopy(buf, bufSize, "AUTO required");
+    } else if (strstr(reason, "overflow") != nullptr || strstr(reason, "sensor") != nullptr) {
+        safeCopy(buf, bufSize, "guard blocked");
+    } else if (strstr(reason, "reservoir empty") != nullptr) {
+        safeCopy(buf, bufSize, "reservoir empty");
+    } else if (strstr(reason, "pump") != nullptr) {
+        safeCopy(buf, bufSize, "pump config invalid");
+    } else {
+        safeCopy(buf, bufSize, "blocked");
+    }
+}
+
+static void formatTelegramProfilesMessage(const TelegramStatusData& data,
+                                          uint8_t activePot,
+                                          char* buf,
+                                          size_t bufSize) {
+    activePot = telegramClampProfilePot(data, activePot);
+    uint8_t profileIdx = data.config.pots[activePot].plantProfileIndex;
+    if (profileIdx >= kNumProfiles) {
+        profileIdx = 0;
+    }
+
+    const PlantProfile& current = getActiveProfile(data.config, activePot);
+    int pos = 0;
+    pos = appendFmt(buf, bufSize, pos, "▣ PROFILES\n");
+    pos = appendFmt(buf, bufSize, pos, "━━━━━━━━━━━━━━━━━━━━\n");
+    pos = appendFmt(buf, bufSize, pos, "🪴 POT %u%s\n",
+                    static_cast<unsigned>(activePot + 1),
+                    activePot == data.selectedPot ? " [local]" : "");
+    pos = appendFmt(buf, bufSize, pos, "🌿 NOW %s%s%s\n",
+                    current.icon ? current.icon : "",
+                    (current.icon && current.icon[0] != '\0') ? " " : "",
+                    current.name ? current.name : "?");
+
+    if (profileIdx == (kNumProfiles - 1)) {
+        pos = appendFmt(buf, bufSize, pos,
+                        "TARGET %.0f%% | MAX %.0f%% | HYST %.1f%%\n",
+                        data.config.pots[activePot].customTargetPct,
+                        data.config.pots[activePot].customMaxMoisturePct,
+                        data.config.pots[activePot].customHysteresisPct);
+        pos = appendFmt(buf, bufSize, pos,
+                        "PULSE %uml | SOAK %lus | MAX %u\n",
+                        static_cast<unsigned>(data.config.pots[activePot].pulseWaterMl),
+                        static_cast<unsigned>(data.config.pots[activePot].customSoakTimeMs / 1000UL),
+                        static_cast<unsigned>(data.config.pots[activePot].customMaxPulsesPerCycle));
+    } else {
+        pos = appendFmt(buf, bufSize, pos,
+                        "TARGET %.0f%% | MAX %.0f%% | HYST %.1f%%\n",
+                        current.targetMoisturePct,
+                        current.maxMoisturePct,
+                        current.hysteresisPct);
+        pos = appendFmt(buf, bufSize, pos,
+                        "PULSE %uml | SOAK %lus | MAX %u\n",
+                        static_cast<unsigned>(data.config.pots[activePot].pulseWaterMl),
+                        static_cast<unsigned>(current.soakTimeMs / 1000UL),
+                        static_cast<unsigned>(current.maxPulsesPerCycle));
+    }
+
+    pos = appendFmt(buf, bufSize, pos, "\nChoose a profile below.");
+}
+
+static void buildTelegramProfilesKeyboard(const TelegramStatusData& status,
+                                          uint8_t activePot,
+                                          char* buf,
+                                          size_t bufSize) {
+    activePot = telegramClampProfilePot(status, activePot);
+
+    char labels[kNumProfiles][40] = {};
+    for (uint8_t i = 0; i < kNumProfiles; ++i) {
+        const bool selected = status.config.pots[activePot].plantProfileIndex == i;
+        snprintf(labels[i],
+                 sizeof(labels[i]),
+                 "%s%s%s%s",
+                 selected ? "* " : "",
+                 kProfiles[i].icon ? kProfiles[i].icon : "",
+                 (kProfiles[i].icon && kProfiles[i].icon[0] != '\0') ? " " : "",
+                 kProfiles[i].name ? kProfiles[i].name : "?");
+    }
+
+    int pos = 0;
+    if (status.config.numPots > 1) {
+        pos = appendFmt(buf, bufSize, pos,
+                        "[[{\"text\":\"%sPot 1\",\"callback_data\":\"ag:profiles:pot:0\"},"
+                        "{\"text\":\"%sPot 2\",\"callback_data\":\"ag:profiles:pot:1\"}],",
+                        activePot == 0 ? "* " : "",
+                        activePot == 1 ? "* " : "");
+    } else {
+        pos = appendFmt(buf, bufSize, pos, "[");
+    }
+
+    pos = appendFmt(buf, bufSize, pos,
+                    "[{\"text\":\"%s\",\"callback_data\":\"ag:profiles:set:%u:0\"},"
+                    "{\"text\":\"%s\",\"callback_data\":\"ag:profiles:set:%u:1\"}],"
+                    "[{\"text\":\"%s\",\"callback_data\":\"ag:profiles:set:%u:2\"},"
+                    "{\"text\":\"%s\",\"callback_data\":\"ag:profiles:set:%u:3\"}],"
+                    "[{\"text\":\"%s\",\"callback_data\":\"ag:profiles:set:%u:4\"},"
+                    "{\"text\":\"%s\",\"callback_data\":\"ag:profiles:set:%u:5\"}],"
+                    "[{\"text\":\"\xF0\x9F\x8F\xA0 Menu\",\"callback_data\":\"ag:menu\"}]]",
+                    labels[0], static_cast<unsigned>(activePot),
+                    labels[1], static_cast<unsigned>(activePot),
+                    labels[2], static_cast<unsigned>(activePot),
+                    labels[3], static_cast<unsigned>(activePot),
+                    labels[4], static_cast<unsigned>(activePot),
+                    labels[5], static_cast<unsigned>(activePot));
+}
+
+static void formatTelegramRefillMessage(const TelegramStatusData& data,
+                                        uint16_t draftCapacityMl,
+                                        char* buf,
+                                        size_t bufSize) {
+    draftCapacityMl = telegramClampReservoirCapacityMl(data, draftCapacityMl);
+    uint16_t currentCapacityMl = telegramCurrentReservoirCapacityMl(data);
+    int32_t deltaMl = static_cast<int32_t>(draftCapacityMl) - static_cast<int32_t>(currentCapacityMl);
+    char daysBuf[16] = {};
+    formatDaysRemainingShort(data.budget.daysRemaining, daysBuf, sizeof(daysBuf));
+
+    int pos = 0;
+    pos = appendFmt(buf, bufSize, pos, "▣ RESERVOIR\n");
+    pos = appendFmt(buf, bufSize, pos, "━━━━━━━━━━━━━━━━━━━━\n");
+    pos = appendFmt(buf, bufSize, pos, "🪣 NOW %.0f / %.0f ml%s\n",
+                    data.budget.reservoirCurrentMl,
+                    data.budget.reservoirCapacityMl,
+                    data.budget.reservoirLow ? " LOW" : "");
+    pos = appendFmt(buf, bufSize, pos, "⏳ LEFT %s\n", daysBuf);
+    pos = appendFmt(buf, bufSize, pos, "⚙ DRAFT %u ml",
+                    static_cast<unsigned>(draftCapacityMl));
+    if (deltaMl != 0) {
+        pos = appendFmt(buf, bufSize, pos, " (%+ld)", static_cast<long>(deltaMl));
+    }
+    pos = appendFmt(buf, bufSize, pos, "\n");
+    pos = appendFmt(buf, bufSize, pos, "🧯 LOW %.0f ml\n",
+                    data.config.reservoirLowThresholdMl);
+    if (data.budget.reservoirCurrentMl > draftCapacityMl) {
+        pos = appendFmt(buf, bufSize, pos,
+                        "WARN  Apply clamps current fill to %u ml.\n",
+                        static_cast<unsigned>(draftCapacityMl));
+    }
+    pos = appendFmt(buf, bufSize, pos,
+                    "APPLY sets capacity and marks tank full.\n"
+                    "MENU cancels without changes.");
+}
+
+static void buildTelegramRefillKeyboard(char* buf, size_t bufSize) {
+    int pos = 0;
+    pos = appendFmt(buf, bufSize, pos,
+                    "[[{\"text\":\"-250 ml\",\"callback_data\":\"ag:refill:dec250\"},"
+                    "{\"text\":\"+250 ml\",\"callback_data\":\"ag:refill:inc250\"}],"
+                    "[{\"text\":\"-1000 ml\",\"callback_data\":\"ag:refill:dec1000\"},"
+                    "{\"text\":\"+1000 ml\",\"callback_data\":\"ag:refill:inc1000\"}],"
+                    "[{\"text\":\"\xF0\x9F\xAA\xA3 Apply refill\",\"callback_data\":\"ag:refill:apply\"},"
+                    "{\"text\":\"\xF0\x9F\x8F\xA0 Menu\",\"callback_data\":\"ag:menu\"}]]");
+}
+
+static void buildTelegramPanelKeyboard(const TelegramStatusData& status,
+                                       TelegramPanelView panelView,
+                                       uint8_t activePot,
+                                       char* buf,
+                                       size_t bufSize) {
+    if (panelView == TelegramPanelView::PROFILES) {
+        buildTelegramProfilesKeyboard(status, activePot, buf, bufSize);
+        return;
+    }
+    if (panelView == TelegramPanelView::REFILL) {
+        buildTelegramRefillKeyboard(buf, bufSize);
+        return;
+    }
+    buildTelegramInlineMenuKeyboard(status, buf, bufSize);
+}
+
 static bool telegramSendAgMenu(const String& chatId,
                                const TelegramStatusData& status,
                                const NetConfig& netCfg,
@@ -772,78 +1404,130 @@ static bool telegramSendAgMenu(const String& chatId,
 
 static void formatTelegramHelpMessage(char* buf, size_t bufSize) {
     int pos = 0;
-    pos = appendFmt(buf, bufSize, pos, "autogarden Telegram\n");
+    pos = appendFmt(buf, bufSize, pos, "▣ HELP\n");
+    pos = appendFmt(buf, bufSize, pos, "━━━━━━━━━━━━━━━━━━━━\n");
     if (telegramConfiguredBotName()[0] != '\0') {
-        pos = appendFmt(buf, bufSize, pos, "Bot: @%s\n", telegramConfiguredBotName());
+        pos = appendFmt(buf, bufSize, pos, "🤖 BOT @%s\n", telegramConfiguredBotName());
     }
     pos = appendFmt(buf, bufSize, pos,
-                    "\nMain entry:\n"
-                    "/ag -> interactive menu\n"
-                    "/agraw <pot> <dry> <wet> -> set per-pot RAWf endpoints\n"
-                    "/agdry <pot> <dry> -> set only RAWf DRY\n"
-                    "/agwet <pot> <wet> -> set only RAWf WET\n"
-                    "/agexp <pot> <exp> -> set per-pot curve exponent\n"
-                    "\nFlow:\n"
+                    "\nENTRY\n"
+                    "/ag -> main panel\n"
+                    "\nCALIBRATION\n"
+                    "/agraw <pot> <dry> <wet>\n"
+                    "/agdry <pot> <dry>\n"
+                    "/agwet <pot> <wet>\n"
+                    "/agexp <pot> <exp>\n"
+                    "\nUSE\n"
                     "- open /ag\n"
-                    "- use inline buttons for all actions\n"
-                    "- status/history/profiles are shown from the menu\n"
-                    "\nSafety:\n"
-                    "- Water triggers one safe pulse\n"
-                    "- Water requires AUTO mode\n"
+                    "- use inline buttons for actions\n"
+                    "- status/history/profiles stay in panel\n"
+                    "\nSAFETY\n"
+                    "- Water runs one safe pulse\n"
+                    "- AUTO mode required for remote water\n"
                     "- Stop forces all pumps OFF\n");
-}
-
-static void formatTelegramProfilesMessage(char* buf, size_t bufSize) {
-    int pos = 0;
-    pos = appendFmt(buf, bufSize, pos, "Profile indexes:\n");
-    for (uint8_t i = 0; i < kNumProfiles; ++i) {
-        pos = appendFmt(buf, bufSize, pos, "%u = %s\n", i,
-                        kProfiles[i].name ? kProfiles[i].name : "?");
-    }
 }
 
 static void formatTelegramHistoryReport(const TelegramStatusData& data,
                                         char* buf, size_t bufSize) {
     int pos = 0;
-    pos = appendFmt(buf, bufSize, pos, "autogarden history summary\n");
-    pos = appendFmt(buf, bufSize, pos, "Reservoir: %.0fml / %.0fml\n",
-                    data.budget.reservoirCurrentMl, data.budget.reservoirCapacityMl);
-    pos = appendFmt(buf, bufSize, pos, "Total pumped: %.1fml\n",
+    char daysBuf[16] = {};
+    char uptimeBuf[24] = {};
+    formatDaysRemainingShort(data.budget.daysRemaining, daysBuf, sizeof(daysBuf));
+    formatDurationCompact(data.uptimeMs, uptimeBuf, sizeof(uptimeBuf));
+
+    pos = appendFmt(buf, bufSize, pos, "▣ HISTORY & TRENDS\n");
+    pos = appendFmt(buf, bufSize, pos, "━━━━━━━━━━━━━━━━━━━━\n");
+    pos = appendFmt(buf, bufSize, pos,
+                    "🪣 %.0f / %.0f ml | total %.1f ml\n",
+                    data.budget.reservoirCurrentMl,
+                    data.budget.reservoirCapacityMl,
                     data.budget.totalPumpedMl);
+    pos = appendFmt(buf, bufSize, pos, "⏱ %s | left %s%s\n",
+                    uptimeBuf,
+                    daysBuf,
+                    data.budget.reservoirLow ? " | LOW" : "");
 
     for (uint8_t i = 0; i < data.config.numPots; ++i) {
         if (!data.config.pots[i].enabled) continue;
         const TrendState& ts = data.trends[i];
-        pos = appendFmt(buf, bufSize, pos, "\nPot %u:\n", static_cast<unsigned>(i + 1));
-        pos = appendFmt(buf, bufSize, pos, "  pumped=%.1fml\n",
+        const PlantProfile& prof = getActiveProfile(data.config, i);
+        char sinceBuf[24] = {};
+        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
+
+        pos = appendFmt(buf, bufSize, pos, "\n🪴 POT %u | %s\n",
+                        static_cast<unsigned>(i + 1),
+                        prof.name ? prof.name : "?");
+        pos = appendFmt(buf, bufSize, pos,
+                        "  water %.1f%% | ema %.1f%% | pumped %.1f ml\n",
+                        data.sensors.pots[i].moisturePct,
+                        data.sensors.pots[i].moistureEma,
                         data.budget.totalPumpedMlPerPot[i]);
-        if (ts.baselineCalibrated && ts.count > 0) {
-            uint8_t lastIdx = (ts.headIdx == 0) ? (TrendState::kHours - 1) : (ts.headIdx - 1);
+        pos = appendFmt(buf, bufSize, pos, "  last cycle %s\n", sinceBuf);
+
+        if (ts.count > 0) {
+            float last1h = trendRecentAverage(ts, 1);
+            float avg3h = trendRecentAverage(ts, 3);
+            float avg6h = trendRecentAverage(ts, 6);
+            float min24h = NAN;
+            float max24h = NAN;
+            trendRecentMinMax(ts, min24h, max24h);
+
             pos = appendFmt(buf, bufSize, pos,
-                            "  trend=%.2f%%/h baseline=%.2f%%/h samples=%u\n",
-                            ts.hourlyDeltas[lastIdx], ts.normalDryingRate, ts.count);
+                            "  1h %s %.2f | 3h %s %.2f | 6h %s %.2f %%/h\n",
+                            telegramTrendArrow(last1h),
+                            last1h,
+                            telegramTrendArrow(avg3h),
+                            avg3h,
+                            telegramTrendArrow(avg6h),
+                            avg6h);
+
+            if (ts.baselineCalibrated && !isnan(ts.normalDryingRate)) {
+                float factor = (fabsf(ts.normalDryingRate) > 0.05f)
+                    ? (fabsf(last1h) / fabsf(ts.normalDryingRate))
+                    : 0.0f;
+                pos = appendFmt(buf, bufSize, pos,
+                                "  base %.2f | 24h %.2f..%.2f | %s x%.1f\n",
+                                ts.normalDryingRate,
+                                min24h,
+                                max24h,
+                                telegramTrendClassLabel(classifyTrendPace(last1h, ts.normalDryingRate)),
+                                factor);
+            } else {
+                pos = appendFmt(buf, bufSize, pos,
+                                "  24h %.2f..%.2f | learning baseline (%u/24)\n",
+                                min24h,
+                                max24h,
+                                static_cast<unsigned>(ts.count));
+            }
         } else {
-            pos = appendFmt(buf, bufSize, pos, "  trend=learning baseline\n");
+            pos = appendFmt(buf, bufSize, pos, "  trend collecting first samples\n");
         }
     }
 }
 
 void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_t bufSize) {
     int pos = 0;
-    pos = appendFmt(buf, bufSize, pos, "autogarden status\n");
-    pos = appendFmt(buf, bufSize, pos, "Mode: %s | Vacation: %s | WiFi: %s | AP: %s\n",
+    char uptimeBuf[24] = {};
+    char daysBuf[16] = {};
+    formatDurationCompact(data.uptimeMs, uptimeBuf, sizeof(uptimeBuf));
+    formatDaysRemainingShort(data.budget.daysRemaining, daysBuf, sizeof(daysBuf));
+
+    pos = appendFmt(buf, bufSize, pos, "▣ STATUS\n");
+    pos = appendFmt(buf, bufSize, pos, "━━━━━━━━━━━━━━━━━━━━\n");
+    pos = appendFmt(buf, bufSize, pos, "🧠 %s | 🏖 %s | 📶 %s | AP %s\n",
                     modeStr(data.config.mode),
                     data.config.vacationMode ? "ON" : "OFF",
                     data.wifiConnected ? "UP" : "DOWN",
                     data.apActive ? "ON" : "OFF");
-    pos = appendFmt(buf, bufSize, pos, "Dusk: %s | Uptime: %lu min\n",
-                    duskPhaseStr(data.duskPhase),
-                    static_cast<unsigned long>(data.uptimeMs / 60000UL));
-    pos = appendFmt(buf, bufSize, pos, "Reservoir: %.0fml (~%.1f days)%s\n",
+    pos = appendFmt(buf, bufSize, pos, "⏱ %s | 🌗 %s\n",
+                    uptimeBuf,
+                    telegramDuskPhasePretty(data.duskPhase));
+    pos = appendFmt(buf, bufSize, pos, "🪣 %.0f / %.0f ml | left %s%s\n",
                     data.budget.reservoirCurrentMl,
-                    data.budget.daysRemaining,
+                    data.budget.reservoirCapacityMl,
+                    daysBuf,
                     data.budget.reservoirLow ? " LOW" : "");
-    pos = appendFmt(buf, bufSize, pos, "Env: %.1fC %.0f%% %.0flux %.1fhPa\n",
+    pos = appendFmt(buf, bufSize, pos, "🌡 %.1fC | 💧 %.0f%% | ☀ %.0f lx | 🧭 %.1f hPa\n",
                     data.sensors.env.tempC,
                     data.sensors.env.humidityPct,
                     data.sensors.env.lux,
@@ -853,34 +1537,42 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
         if (!data.config.pots[i].enabled) continue;
         const PlantProfile& prof = getActiveProfile(data.config, i);
         float targetPct = prof.targetMoisturePct;
-        char waterState[96] = {};
+        char actionLine[96] = {};
         char lastState[64] = {};
-        telegramWaterBlocked(data, i, waterState, sizeof(waterState));
+        char sinceBuf[24] = {};
+        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
+        formatPotActionLine(data, i, actionLine, sizeof(actionLine));
         formatLastFeedback(data, i, lastState, sizeof(lastState));
         if (data.config.vacationMode) {
             targetPct -= data.config.vacationTargetReductionPct;
             if (targetPct < 5.0f) targetPct = 5.0f;
         }
+        float last1h = trendRecentAverage(data.trends[i], 1);
         pos = appendFmt(buf, bufSize, pos,
-                        "\nPot %u (%s)%s\n"
-                        "  moisture=%.1f%% ema=%.1f%% target=%.1f%%\n"
-                        "  rawf=%u dry=%u wet=%u exp=%.2f overflow=%s cycle=%d pulses=%u\n"
-                        "  action=%s\n"
-                        "  last=%s\n",
+                "\n🪴 POT %u | %s%s\n"
+                        "  water %.1f%% | target %.1f%% | ema %.1f%%\n"
+                        "  trend %s %.2f%%/h | raw %u | exp %.2f\n"
+                        "  dry/wet %u/%u | phase %s | pulses %u\n"
+                        "  action %s\n"
+                        "  ovf %s | res %s | last %s (%s)\n",
                         static_cast<unsigned>(i + 1),
                         prof.name ? prof.name : "?",
                         (i == data.selectedPot) ? " [selected]" : "",
                         data.sensors.pots[i].moisturePct,
-                        data.sensors.pots[i].moistureEma,
                         targetPct,
+                        data.sensors.pots[i].moistureEma,
+                        telegramTrendArrow(last1h),
+                        isnan(last1h) ? 0.0f : last1h,
                         data.sensors.pots[i].moistureRawFiltered,
+                        data.config.pots[i].moistureCurveExponent,
                         data.config.pots[i].moistureDryRaw,
                         data.config.pots[i].moistureWetRaw,
-                        data.config.pots[i].moistureCurveExponent,
-                        data.sensors.pots[i].waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "OK",
-                        static_cast<int>(data.cycles[i].phase),
+                        telegramCyclePhaseShort(data.cycles[i].phase),
                         data.cycles[i].pulseCount,
-                        waterState[0] ? waterState : "Ready: one safe pulse",
+                        actionLine,
+                        telegramWaterLevelStateShort(data.sensors.pots[i].waterGuards.potMax),
+                        telegramWaterLevelStateShort(data.sensors.pots[i].waterGuards.reservoirMin),
+                        sinceBuf,
                         lastState);
     }
 }
@@ -1006,9 +1698,87 @@ static bool handleTelegramCallback(const telegramMessage& message,
     }
 
     if (data == "ag:profiles") {
-        formatTelegramProfilesMessage(g_tgReplyBuf, sizeof(g_tgReplyBuf));
-        buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
-        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+        uint8_t activePot = telegramClampProfilePot(status, status.selectedPot);
+        formatTelegramProfilesMessage(status, activePot, g_tgReplyBuf, sizeof(g_tgReplyBuf));
+        buildTelegramProfilesKeyboard(status, activePot, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId,
+                                                g_tgReplyBuf,
+                                                g_tgKeyboardBuf,
+                                                netCfg,
+                                                messageId,
+                                                1,
+                                                150,
+                                                TelegramPanelView::PROFILES,
+                                                activePot);
+    }
+
+    if (data.startsWith("ag:profiles:pot:")) {
+        String potTok = data.substring(String("ag:profiles:pot:").length());
+        uint8_t activePot = 0;
+        if (!parseUIntArg(potTok, activePot) || activePot >= status.config.numPots) {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Invalid pot in profiles.");
+            buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+            return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+        }
+
+        formatTelegramProfilesMessage(status, activePot, g_tgReplyBuf, sizeof(g_tgReplyBuf));
+        buildTelegramProfilesKeyboard(status, activePot, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId,
+                                                g_tgReplyBuf,
+                                                g_tgKeyboardBuf,
+                                                netCfg,
+                                                messageId,
+                                                1,
+                                                150,
+                                                TelegramPanelView::PROFILES,
+                                                activePot);
+    }
+
+    if (data.startsWith("ag:profiles:set:")) {
+        const size_t prefixLen = String("ag:profiles:set:").length();
+        int sep = data.indexOf(':', static_cast<int>(prefixLen));
+        uint8_t activePot = 0;
+        uint8_t profileIdx = 0;
+        bool valid = false;
+
+        if (sep > 0) {
+            String potTok = data.substring(prefixLen, sep);
+            String profileTok = data.substring(sep + 1);
+            valid = parseUIntArg(potTok, activePot)
+                && parseUIntArg(profileTok, profileIdx)
+                && activePot < status.config.numPots
+                && profileIdx < kNumProfiles;
+        }
+
+        if (!valid) {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Invalid profile selection.");
+            buildTelegramInlineMenuKeyboard(status, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+            return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+        }
+
+        bool ok = pushConfigEvent(EventType::REQUEST_SET_PLANT, activePot, profileIdx);
+        if (ok) {
+            replyStatus.config.pots[activePot].plantProfileIndex = profileIdx;
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
+                     "Pot %u profile requested: %s%s%s.",
+                     static_cast<unsigned>(activePot + 1),
+                     kProfiles[profileIdx].icon ? kProfiles[profileIdx].icon : "",
+                     (kProfiles[profileIdx].icon && kProfiles[profileIdx].icon[0] != '\0') ? " " : "",
+                     kProfiles[profileIdx].name ? kProfiles[profileIdx].name : "?");
+        } else {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Profile queue failed.");
+        }
+
+        buildTelegramProfilesKeyboard(replyStatus, activePot, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId,
+                                                g_tgReplyBuf,
+                                                g_tgKeyboardBuf,
+                                                netCfg,
+                                                messageId,
+                                                1,
+                                                150,
+                                                TelegramPanelView::PROFILES,
+                                                activePot);
     }
 
     if (data == "ag:help") {
@@ -1039,20 +1809,101 @@ static bool handleTelegramCallback(const telegramMessage& message,
     }
 
     if (data == "ag:refill") {
-        bool ok = pushEvent(Event{EventType::REQUEST_REFILL});
-        if (ok) {
-            float beforeMl = replyStatus.budget.reservoirCurrentMl;
-            replyStatus.budget.reservoirCurrentMl = replyStatus.config.reservoirCapacityMl;
+        g_tgActiveRefillCapacityMl = telegramCurrentReservoirCapacityMl(status);
+        formatTelegramRefillMessage(status,
+                                    g_tgActiveRefillCapacityMl,
+                                    g_tgReplyBuf,
+                                    sizeof(g_tgReplyBuf));
+        buildTelegramRefillKeyboard(g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId,
+                                                g_tgReplyBuf,
+                                                g_tgKeyboardBuf,
+                                                netCfg,
+                                                messageId,
+                                                1,
+                                                150,
+                                                TelegramPanelView::REFILL,
+                                                0);
+    }
+
+    if (data == "ag:refill:dec250" || data == "ag:refill:inc250"
+        || data == "ag:refill:dec1000" || data == "ag:refill:inc1000") {
+        int32_t draftCapacityMl = (g_tgActiveRefillCapacityMl > 0)
+            ? static_cast<int32_t>(g_tgActiveRefillCapacityMl)
+            : static_cast<int32_t>(telegramCurrentReservoirCapacityMl(status));
+        if (data == "ag:refill:dec250") {
+            draftCapacityMl -= 250;
+        } else if (data == "ag:refill:inc250") {
+            draftCapacityMl += 250;
+        } else if (data == "ag:refill:dec1000") {
+            draftCapacityMl -= 1000;
+        } else {
+            draftCapacityMl += 1000;
+        }
+
+        g_tgActiveRefillCapacityMl = telegramClampReservoirCapacityMl(status, draftCapacityMl);
+        formatTelegramRefillMessage(status,
+                                    g_tgActiveRefillCapacityMl,
+                                    g_tgReplyBuf,
+                                    sizeof(g_tgReplyBuf));
+        buildTelegramRefillKeyboard(g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId,
+                                                g_tgReplyBuf,
+                                                g_tgKeyboardBuf,
+                                                netCfg,
+                                                messageId,
+                                                1,
+                                                150,
+                                                TelegramPanelView::REFILL,
+                                                0);
+    }
+
+    if (data == "ag:refill:apply") {
+        uint16_t draftCapacityMl = (g_tgActiveRefillCapacityMl > 0)
+            ? g_tgActiveRefillCapacityMl
+            : telegramCurrentReservoirCapacityMl(status);
+        bool capacityChanged = fabsf(status.config.reservoirCapacityMl - draftCapacityMl) >= 0.5f;
+        bool capOk = true;
+        if (capacityChanged) {
+            capOk = pushConfigEvent(EventType::REQUEST_SET_RESERVOIR, 0, 0, draftCapacityMl);
+        }
+        bool refillOk = capOk && pushEvent(Event{EventType::REQUEST_REFILL});
+
+        if (capOk && refillOk) {
+            replyStatus.config.reservoirCapacityMl = draftCapacityMl;
+            replyStatus.budget.reservoirCapacityMl = draftCapacityMl;
+            replyStatus.budget.reservoirCurrentMl = draftCapacityMl;
             replyStatus.budget.reservoirLow = false;
+            formatTelegramMenuSummary(replyStatus, g_tgReplyBuf, sizeof(g_tgReplyBuf));
+            buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+            return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+        }
+
+        if (capOk && capacityChanged) {
+            replyStatus.config.reservoirCapacityMl = draftCapacityMl;
+            replyStatus.budget.reservoirCapacityMl = draftCapacityMl;
+            if (replyStatus.budget.reservoirCurrentMl > draftCapacityMl) {
+                replyStatus.budget.reservoirCurrentMl = draftCapacityMl;
+            }
             snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf),
-                     "Reservoir refill requested: %.0fml -> %.0fml.",
-                     beforeMl,
-                     replyStatus.config.reservoirCapacityMl);
+                     "Capacity queued: %u ml, but refill queue failed.",
+                     static_cast<unsigned>(draftCapacityMl));
+        } else if (!capOk) {
+            snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Reservoir capacity queue failed.");
         } else {
             snprintf(g_tgReplyBuf, sizeof(g_tgReplyBuf), "%s", "Refill queue failed.");
         }
-        buildTelegramInlineMenuKeyboard(replyStatus, g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
-        return telegramSendInlineKeyboardToChat(chatId, g_tgReplyBuf, g_tgKeyboardBuf, netCfg, messageId);
+
+        buildTelegramRefillKeyboard(g_tgKeyboardBuf, sizeof(g_tgKeyboardBuf));
+        return telegramSendInlineKeyboardToChat(chatId,
+                                                g_tgReplyBuf,
+                                                g_tgKeyboardBuf,
+                                                netCfg,
+                                                messageId,
+                                                1,
+                                                150,
+                                                TelegramPanelView::REFILL,
+                                                0);
     }
 
     if (data == "ag:wifi") {
@@ -1552,21 +2403,41 @@ void telegramPollCommands(uint32_t nowMs, const NetConfig& netCfg,
     if (!telegramEnsureReady(netCfg)) {
         return;
     }
+    if (g_tgLastPollFailMs != 0 && (nowMs - g_tgLastPollFailMs) < kTelegramPollFailCooldownMs) {
+        if ((nowMs - g_tgLastPollCooldownLogMs) >= 5000) {
+            g_tgLastPollCooldownLogMs = nowMs;
+            Serial.printf("[TG] event=poll_cooldown remaining_ms=%lu\n",
+                          static_cast<unsigned long>(kTelegramPollFailCooldownMs - (nowMs - g_tgLastPollFailMs)));
+        }
+        return;
+    }
 
     uint32_t pollIntervalMs = telegramCurrentPollInterval(nowMs);
     if (g_tgLastPollMs != 0 && (nowMs - g_tgLastPollMs) < pollIntervalMs) {
         return;
     }
-    g_tgLastPollMs = nowMs;
+
+    ++g_tgStats.pollCycles;
+    uint32_t pollStartedMs = millis();
 
     int numNewMessages = telegramFetchUpdates(netCfg);
+    if (numNewMessages < 0) {
+        telegramLogStatsIfDue(nowMs);
+        return;
+    }
+
+    uint16_t fetchedTotal = static_cast<uint16_t>(numNewMessages > 0 ? numNewMessages : 0);
+    uint16_t processedTotal = 0;
+
     if (numNewMessages == 0 && (nowMs - g_tgLastIdleLogMs) >= 60000) {
         g_tgLastIdleLogMs = nowMs;
         Serial.println("[TG] event=poll_idle");
     }
+
     uint8_t batchCount = 0;
     while (numNewMessages > 0 && batchCount < kTelegramMaxBatchFetches) {
         for (int i = 0; i < numNewMessages; ++i) {
+            ++processedTotal;
             const String chatId = g_tgBot->messages[i].chat_id;
             const String fromName = g_tgBot->messages[i].from_name;
             const long updateId = g_tgBot->messages[i].update_id;
@@ -1599,6 +2470,15 @@ void telegramPollCommands(uint32_t nowMs, const NetConfig& netCfg,
             g_tgReplyBuf[0] = '\0';
 
             if (cmd == "/ag" || cmd == "/start") {
+                if (chatId.equals(g_tgLastMenuChatId) && (nowMs - g_tgLastMenuMs) < kTelegramMenuDedupMs) {
+                    Serial.printf("[TG] event=menu_dedup cmd=%s age_ms=%lu chat_id=%s\n",
+                                  cmd.c_str(),
+                                  static_cast<unsigned long>(nowMs - g_tgLastMenuMs),
+                                  chatId.c_str());
+                    continue;
+                }
+                safeCopy(g_tgLastMenuChatId, sizeof(g_tgLastMenuChatId), chatId.c_str());
+                g_tgLastMenuMs = nowMs;
                 telegramSendAgMenu(chatId, status, netCfg);
                 continue;
             }
@@ -1731,13 +2611,40 @@ void telegramPollCommands(uint32_t nowMs, const NetConfig& netCfg,
             telegramSendAgMenu(chatId, status, netCfg);
         }
 
-        telegramCloseTransport("after_update_batch");
-
         ++batchCount;
+        if ((millis() - pollStartedMs) >= kTelegramPollWorkBudgetMs) {
+            ++g_tgStats.pollBudgetBreaks;
+            Serial.printf("[TG] event=poll_budget_break batches=%u fetched=%u processed=%u budget_ms=%lu\n",
+                          static_cast<unsigned>(batchCount),
+                          static_cast<unsigned>(fetchedTotal),
+                          static_cast<unsigned>(processedTotal),
+                          static_cast<unsigned long>(kTelegramPollWorkBudgetMs));
+            break;
+        }
+
         numNewMessages = telegramFetchUpdates(netCfg);
+        if (numNewMessages < 0) {
+            break;
+        }
+        if (numNewMessages > 0) {
+            fetchedTotal = static_cast<uint16_t>(fetchedTotal + numNewMessages);
+        }
     }
 
-    telegramCloseTransport("after_poll_cycle");
+    uint32_t pollDurationMs = millis() - pollStartedMs;
+    if (fetchedTotal > 0 || pollDurationMs >= kTelegramPollSlowLogMs || batchCount > 1) {
+        Serial.printf("[TG] event=poll_cycle fetched=%u processed=%u batches=%u dur_ms=%lu\n",
+                      static_cast<unsigned>(fetchedTotal),
+                      static_cast<unsigned>(processedTotal),
+                      static_cast<unsigned>(batchCount),
+                      static_cast<unsigned long>(pollDurationMs));
+    }
+
+    // Gating od zakończenia polla, nie od startu — unikamy ciągłego back-to-back
+    // przy wolnym łączu i zmniejszamy opóźnienia callbacków powodowane przez zalew requestów.
+    g_tgLastPollMs = millis();
+
+    telegramLogStatsIfDue(nowMs);
 }
 
 bool telegramSend(const char* msg, const NetConfig& netCfg,
@@ -1764,6 +2671,7 @@ bool telegramSend(const char* msg, const NetConfig& netCfg,
         ++targets;
         bool sent = false;
         for (uint8_t attempt = 0; attempt < maxRetries; ++attempt) {
+            ++g_tgStats.sendAttempts;
             if (telegramSendToChat(token, msg, netCfg)) {
                 Serial.printf("[TG] event=send_ok chat_id=%s len=%u attempt=%u\n",
                               token,
@@ -1774,6 +2682,7 @@ bool telegramSend(const char* msg, const NetConfig& netCfg,
                 break;
             }
             if (attempt + 1 < maxRetries) {
+                ++g_tgStats.sendRetries;
                 vTaskDelay(pdMS_TO_TICKS(waitMs));
             }
         }
@@ -1793,43 +2702,61 @@ bool telegramSend(const char* msg, const NetConfig& netCfg,
 
 void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize) {
     int pos = 0;
-    pos += snprintf(buf + pos, bufSize - pos,
-                    "autogarden - raport\n"
-                    "====================\n");
+    char uptimeBuf[24] = {};
+    char daysBuf[16] = {};
+    formatDurationCompact(data.uptimeMs, uptimeBuf, sizeof(uptimeBuf));
+    formatDaysRemainingShort(data.budget.daysRemaining, daysBuf, sizeof(daysBuf));
+
+    pos = appendFmt(buf, bufSize, pos,
+                    "▣ DAILY REPORT\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "🪣 %.0f / %.0f ml | left %s%s\n"
+                    "🌡 %.1fC | 💧 %.0f%% | ☀ %.0f lx\n"
+                    "⏱ %s\n",
+                    data.budget.reservoirCurrentMl,
+                    data.budget.reservoirCapacityMl,
+                    daysBuf,
+                    data.budget.reservoirLow ? " | LOW" : "",
+                    data.sensors.env.tempC,
+                    data.sensors.env.humidityPct,
+                    data.sensors.env.lux,
+                    uptimeBuf);
 
     for (uint8_t i = 0; i < data.config.numPots; ++i) {
         if (!data.config.pots[i].enabled) continue;
         const PotSensorSnapshot& ps = data.sensors.pots[i];
         const PlantProfile& prof = getActiveProfile(data.config, i);
         const TrendState& ts = data.trends[i];
+        float targetPct = prof.targetMoisturePct;
+        if (data.config.vacationMode) {
+            targetPct -= data.config.vacationTargetReductionPct;
+            if (targetPct < 5.0f) targetPct = 5.0f;
+        }
 
-        pos += snprintf(buf + pos, bufSize - pos,
-                        "\nPot %d (%s): %.0f%% (target %.0f%%)\n",
-                        i + 1, prof.name, ps.moisturePct, prof.targetMoisturePct);
+        pos = appendFmt(buf, bufSize, pos,
+                "\n🪴 POT %u | %s\n"
+                        "  water %.1f%% | target %.1f%% | ema %.1f%%\n",
+                        static_cast<unsigned>(i + 1),
+                        prof.name ? prof.name : "?",
+                        ps.moisturePct,
+                        targetPct,
+                        ps.moistureEma);
 
         if (ts.baselineCalibrated && ts.count > 0) {
             uint8_t lastIdx = (ts.headIdx == 0) ? (TrendState::kHours - 1) : (ts.headIdx - 1);
-            pos += snprintf(buf + pos, bufSize - pos,
-                            "  Trend: %.1f%%/h (baseline: %.1f%%/h)\n",
-                            ts.hourlyDeltas[lastIdx], ts.normalDryingRate);
+            pos = appendFmt(buf, bufSize, pos,
+                            "  trend %s %.2f%%/h | base %.2f%%/h\n",
+                            telegramTrendArrow(ts.hourlyDeltas[lastIdx]),
+                            ts.hourlyDeltas[lastIdx],
+                            ts.normalDryingRate);
+        } else {
+            pos = appendFmt(buf, bufSize, pos, "  trend learning baseline\n");
         }
     }
 
-    pos += snprintf(buf + pos, bufSize - pos,
-                    "\nTemp: %.1fC  Lux: %.0f\n",
-                    data.sensors.env.tempC, data.sensors.env.lux);
-
-    pos += snprintf(buf + pos, bufSize - pos,
-                    "Reservoir: %.0fml (~%.0f days)\n",
-                    data.budget.reservoirCurrentMl, data.budget.daysRemaining);
-
     if (data.config.vacationMode) {
-        pos += snprintf(buf + pos, bufSize - pos, "\nVACATION MODE: ON\n");
+        pos = appendFmt(buf, bufSize, pos, "\nVACATION MODE: ON\n");
     }
-
-    pos += snprintf(buf + pos, bufSize - pos,
-                    "\nUptime: %dh\n",
-                    static_cast<int>(data.uptimeMs / 3600000));
 }
 
 bool isDailyHeartbeatTime(uint32_t nowMs, const SolarClock& clk,

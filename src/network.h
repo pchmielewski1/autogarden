@@ -98,6 +98,11 @@ struct TelegramStatusData {
 void applyLocalTelegramConfig(NetConfig& netCfg);
 const char* telegramConfiguredBotName();
 uint8_t telegramConfiguredTargetCount(const NetConfig& netCfg);
+bool telegramInteractionActive(uint32_t nowMs);
+bool telegramHasActivePanel();
+bool telegramSendToActivePanel(const char* msg,
+                               const TelegramStatusData& status,
+                               const NetConfig& netCfg);
 
 // Sprawdź nowe komendy z Telegram i push do EventQueue
 void telegramPollCommands(uint32_t nowMs, const NetConfig& netCfg,
