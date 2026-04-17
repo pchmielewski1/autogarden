@@ -339,6 +339,7 @@ static WaterLevelStatus updateWaterLevelFilter(WaterLevelFilterState& state,
                                                const WaterLevelSensor& sensor,
                                                uint32_t tripDebounceMs,
                                                uint32_t clearDebounceMs,
+                                               uint32_t recoveryDebounceMs,
                                                uint32_t nowMs) {
     if (!rawLevel.ok()) {
         state.initialized = true;
@@ -359,7 +360,7 @@ static WaterLevelStatus updateWaterLevelFilter(WaterLevelFilterState& state,
     state.rawValid = true;
     state.rawState = desiredState;
 
-    if (!state.initialized || state.filteredState == WaterLevelState::UNKNOWN) {
+    if (!state.initialized) {
         state.initialized = true;
         state.filteredState = desiredState;
         state.pendingTrip = false;
@@ -376,12 +377,23 @@ static WaterLevelStatus updateWaterLevelFilter(WaterLevelFilterState& state,
         return buildWaterLevelStatus(state, sensor.activeLow());
     }
 
+    uint32_t effectiveTripDebounceMs = tripDebounceMs;
+    uint32_t effectiveClearDebounceMs = clearDebounceMs;
+    if (state.filteredState == WaterLevelState::UNKNOWN) {
+        if (recoveryDebounceMs > effectiveTripDebounceMs) {
+            effectiveTripDebounceMs = recoveryDebounceMs;
+        }
+        if (recoveryDebounceMs > effectiveClearDebounceMs) {
+            effectiveClearDebounceMs = recoveryDebounceMs;
+        }
+    }
+
     if (desiredState == WaterLevelState::TRIGGERED) {
         if (!state.pendingTrip) {
             state.pendingTrip = true;
             state.pendingClear = false;
             state.pendingSinceMs = nowMs;
-        } else if ((nowMs - state.pendingSinceMs) >= tripDebounceMs) {
+        } else if ((nowMs - state.pendingSinceMs) >= effectiveTripDebounceMs) {
             state.filteredState = WaterLevelState::TRIGGERED;
             state.pendingTrip = false;
             state.pendingSinceMs = 0;
@@ -394,7 +406,7 @@ static WaterLevelStatus updateWaterLevelFilter(WaterLevelFilterState& state,
         state.pendingClear = true;
         state.pendingTrip = false;
         state.pendingSinceMs = nowMs;
-    } else if ((nowMs - state.pendingSinceMs) >= clearDebounceMs) {
+    } else if ((nowMs - state.pendingSinceMs) >= effectiveClearDebounceMs) {
         state.filteredState = WaterLevelState::OK;
         state.pendingClear = false;
         state.pendingSinceMs = 0;
@@ -962,6 +974,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
         _reservoirSensor,
         kWaterLevelTripDebounceMs,
         kReservoirClearDebounceMs,
+        kWaterLevelRecoveryDebounceMs,
         nowMs);
 
     // Per-pot
@@ -976,6 +989,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
             _overflowSensors[i],
             kWaterLevelTripDebounceMs,
             kPotOverflowClearDebounceMs,
+            kWaterLevelRecoveryDebounceMs,
             nowMs);
         snap.pots[i].waterGuards.potMax = potMaxStatus.filteredState;
         snap.pots[i].waterGuards.potMaxStatus = potMaxStatus;

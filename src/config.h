@@ -20,8 +20,10 @@ static constexpr uint16_t kConfigSchema = 6;  // wersja schematu NVS
 static constexpr float kDefaultHeatBlockTempC = 41.0f;
 static constexpr float kLegacyHeatBlockTempC = 35.0f;
 static constexpr uint32_t kWaterLevelTripDebounceMs = 200;
+static constexpr uint32_t kWaterLevelRecoveryDebounceMs = 1500;
 static constexpr uint32_t kPotOverflowClearDebounceMs = 1500;
 static constexpr uint32_t kReservoirClearDebounceMs = 3000;
+static constexpr uint32_t kReservoirBudgetClampDebounceMs = 5000;
 
 // NVS namespace names
 static constexpr const char* kNvsConfig  = "ag_config";

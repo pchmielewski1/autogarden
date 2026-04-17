@@ -1064,12 +1064,15 @@ void updateWaterBudget(uint32_t nowMs,
     // NOTE: Reservoir sensor state is propagated to all pots[].waterGuards.reservoirMin
     // by readAllSensors(). We check pots[0] since it's always present.
     WaterLevelState resState = sensors.pots[0].waterGuards.reservoirMin;
+    const WaterLevelStatus& resStatus = sensors.pots[0].waterGuards.reservoirMinStatus;
 
     if (resState == WaterLevelState::OK) {
         budget.reservoirLow = false;
         budget.reservoirLowSinceMs = 0;
     } else if (resState == WaterLevelState::TRIGGERED) {
-        if (!budget.reservoirLow) {
+        bool lowConfirmed = resStatus.stableSinceMs > 0
+            && (nowMs - resStatus.stableSinceMs) >= kReservoirBudgetClampDebounceMs;
+        if (!budget.reservoirLow && lowConfirmed) {
             budget.reservoirLow = true;
             budget.reservoirLowSinceMs = nowMs;
             budget.reservoirCurrentMl = budget.reservoirLowThresholdMl;
