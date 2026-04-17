@@ -194,6 +194,17 @@ static const char* pumpOwnerName(PumpOwner owner) {
     }
 }
 
+static const char* lightStateName(LightSignalState state) {
+    switch (state) {
+        case LightSignalState::VALID: return "VALID";
+        case LightSignalState::STALE: return "STALE";
+        case LightSignalState::RECOVERING: return "RECOVERING";
+        case LightSignalState::UNKNOWN:
+        default:
+            return "UNKNOWN";
+    }
+}
+
 static float effectiveTargetForPot(const Config& cfg, uint8_t potIdx) {
     const PlantProfile& prof = getActiveProfile(cfg, potIdx);
     float target = prof.targetMoisturePct;
@@ -351,6 +362,8 @@ static uint32_t statusDigest(const SensorSnapshot& snap) {
     h = hashMix(h, bucket(snap.env.humidityPct, 3.0f));
     h = hashMix(h, bucket(snap.env.lux, 500.0f));
     h = hashMix(h, bucket(snap.env.pressureHpa, 1.0f));
+    h = hashMix(h, static_cast<uint32_t>(snap.env.lightState));
+    h = hashMix(h, snap.env.luxAgeMs / 30000u);
     h = hashMix(h, bucket(g_budget.reservoirCurrentMl, 25.0f));
     h = hashMix(h, bucket(g_budget.totalPumpedMl, 5.0f));
 
@@ -371,6 +384,7 @@ static uint32_t statusCriticalDigest(const SensorSnapshot& snap) {
     h = hashMix(h, g_config.vacationMode ? 1u : 0u);
     h = hashMix(h, g_budget.reservoirLow ? 1u : 0u);
     h = hashMix(h, static_cast<uint32_t>(g_duskDetector.phase));
+    h = hashMix(h, static_cast<uint32_t>(snap.env.lightState));
 
     for (uint8_t i = 0; i < g_config.numPots; ++i) {
         if (!g_config.pots[i].enabled) continue;
@@ -759,8 +773,8 @@ static void controlTaskFn(void* /*param*/) {
             g_hardware.readAllSensors(now, g_config, snap);
 
             // One-shot: bootstrap dusk phase from first valid lux reading
-            if (!duskBootstrapped && snap.env.lux > 0.0f) {
-                duskBootstrap(g_duskDetector, snap.env.lux);
+            if (!duskBootstrapped && snap.env.lightState == LightSignalState::VALID) {
+                duskBootstrap(g_duskDetector, snap.env.lux, snap.env.lightState);
                 duskBootstrapped = true;
             }
 
@@ -875,6 +889,8 @@ static void controlTaskFn(void* /*param*/) {
             uint32_t prevNightSequence = g_duskDetector.nightSequence;
             duskDetectorTick(now,
                              snap.env.lux,
+                             snap.env.lightState,
+                             snap.env.luxAgeMs,
                              snap.env.tempC,
                              snap.env.humidityPct,
                              snap.env.pressureHpa,
@@ -912,6 +928,12 @@ static void controlTaskFn(void* /*param*/) {
             for (uint8_t i = 0; i < kMaxPots; ++i) {
                 if (g_hardware.pump(i).isOn())  sample.flags |= 0x04;
             }
+            if (snap.env.lightState != LightSignalState::VALID) {
+                sample.flags |= 0x08;
+            }
+            if (snap.env.lightState == LightSignalState::RECOVERING) {
+                sample.flags |= 0x10;
+            }
             if (historyTick(now, sample, g_history)) {
                 historyStateSave(now, g_history);
             }
@@ -946,9 +968,18 @@ static void controlTaskFn(void* /*param*/) {
                               g_config.numPots,
                               g_config.vacationMode ? "ON" : "OFF");
 
-                Serial.printf("[ENV] temp=%.1fC hum=%.1f%% lux=%.0f press=%.1fhPa\n",
-                              snap.env.tempC, snap.env.humidityPct,
-                              snap.env.lux, snap.env.pressureHpa);
+                if (snap.env.lightState == LightSignalState::VALID) {
+                    Serial.printf("[ENV] temp=%.1fC hum=%.1f%% lux=%.0f press=%.1fhPa\n",
+                                  snap.env.tempC, snap.env.humidityPct,
+                                  snap.env.lux, snap.env.pressureHpa);
+                } else {
+                    Serial.printf("[ENV] temp=%.1fC hum=%.1f%% lux=%.0f state=%s age=%lus press=%.1fhPa\n",
+                                  snap.env.tempC, snap.env.humidityPct,
+                                  snap.env.lux,
+                                  lightStateName(snap.env.lightState),
+                                  static_cast<unsigned long>(snap.env.luxAgeMs / 1000UL),
+                                  snap.env.pressureHpa);
+                }
 
                 for (uint8_t i = 0; i < g_config.numPots; ++i) {
                     if (!g_config.pots[i].enabled) continue;
@@ -1042,8 +1073,9 @@ static void controlTaskFn(void* /*param*/) {
                     case DuskPhase::DAY:             duskStr = "DAY"; break;
                     case DuskPhase::DUSK_TRANSITION: duskStr = "DUSK_TR"; break;
                 }
-                Serial.printf("[DUSK] phase=%s dawnScore=%.2f duskScore=%.2f samples=%d\n",
+                Serial.printf("[DUSK] phase=%s dawnScore=%.2f duskScore=%.2f frozen=%s samples=%d\n",
                               duskStr, g_duskDetector.dawnScore, g_duskDetector.duskScore,
+                              g_duskDetector.learningFrozen ? "yes" : "no",
                               g_duskDetector.count);
                 if (g_solarClock.calibrated) {
                     Serial.printf("[SOLAR] day=%dh%dm night=%dh%dm cycles=%d\n",

@@ -22,6 +22,95 @@
 // ===========================================================================
 TrendState g_trendStates[kMaxPots];
 
+namespace {
+
+const char* lightSignalStateName(LightSignalState state) {
+    switch (state) {
+        case LightSignalState::VALID: return "VALID";
+        case LightSignalState::STALE: return "STALE";
+        case LightSignalState::RECOVERING: return "RECOVERING";
+        case LightSignalState::UNKNOWN:
+        default:
+            return "UNKNOWN";
+    }
+}
+
+const char* duskPhaseName(DuskPhase phase) {
+    switch (phase) {
+        case DuskPhase::NIGHT: return "NIGHT";
+        case DuskPhase::DAWN_TRANSITION: return "DAWN_TR";
+        case DuskPhase::DAY: return "DAY";
+        case DuskPhase::DUSK_TRANSITION: return "DUSK_TR";
+        default: return "?";
+    }
+}
+
+DuskPhase stablePhaseFor(DuskPhase phase) {
+    switch (phase) {
+        case DuskPhase::DAWN_TRANSITION:
+            return DuskPhase::NIGHT;
+        case DuskPhase::DUSK_TRANSITION:
+            return DuskPhase::DAY;
+        case DuskPhase::DAY:
+        case DuskPhase::NIGHT:
+        default:
+            return phase;
+    }
+}
+
+void clearDuskNamespace() {
+    Preferences purge;
+    if (!purge.begin(kNvsDusk, false)) {
+        return;
+    }
+    purge.clear();
+    purge.end();
+}
+
+bool beginHistoryPrefs(Preferences& prefs, bool readOnly) {
+    return prefs.begin(kNvsHist, readOnly, kNvsHistPartition);
+}
+
+void clearLegacyDefaultHistoryNamespace() {
+    Preferences legacy;
+    if (!legacy.begin(kNvsHist, true)) {
+        return;
+    }
+
+    bool hadLegacyData = legacy.isKey("meta")
+                      || legacy.isKey("lvl2")
+                      || legacy.isKey("lvl3")
+                      || legacy.isKey("wlog")
+                      || legacy.isKey("l2_0")
+                      || legacy.isKey("l3_0")
+                      || legacy.isKey("wl_0");
+    legacy.end();
+
+    if (!hadLegacyData) {
+        return;
+    }
+
+    if (!legacy.begin(kNvsHist, false)) {
+        return;
+    }
+    if (hadLegacyData) {
+        legacy.clear();
+        Serial.println("[HIST] event=legacy_default_cleared action=reset_history");
+    }
+    legacy.end();
+}
+
+void clearHistoryPartitionNamespace() {
+    Preferences prefs;
+    if (!beginHistoryPrefs(prefs, false)) {
+        return;
+    }
+    prefs.clear();
+    prefs.end();
+}
+
+} // namespace
+
 // ===========================================================================
 // EmaFilter
 // ===========================================================================
@@ -169,6 +258,14 @@ static constexpr float kDawnW_temp      = 0.15f;
 static constexpr float kDawnW_humidity  = 0.10f;
 static constexpr float kDawnW_pressure  = 0.05f;
 
+static constexpr float kDuskLuxEnterMax = 500.0f;
+static constexpr float kDuskLuxConfirmMax = 80.0f;
+static constexpr float kDuskLuxCancelMin = 700.0f;
+static constexpr float kDawnLuxEnterMin = 15.0f;
+static constexpr float kDawnLuxConfirmMin = 80.0f;
+static constexpr float kDawnLuxCancelMax = 5.0f;
+static constexpr uint32_t kFreezeResetWindowMs = 90000;
+
 // Helper: clamp do 0..1
 static float clamp01(float x) {
     return (x < 0.0f) ? 0.0f : (x > 1.0f) ? 1.0f : x;
@@ -309,10 +406,49 @@ static float dawnComposite(const DuskScores& s) {
 // ---------------------------------------------------------------------------
 // duskDetectorTick — FSM: NIGHT ↔ DAY z transitentami
 // ---------------------------------------------------------------------------
-void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
+void duskDetectorTick(uint32_t nowMs, float lux, LightSignalState lightState,
+                      uint32_t luxAgeMs, float tempC,
                       float humPct, float pressHpa,
                       DuskDetector& det, const Config& cfg)
 {
+    if (lightState != LightSignalState::VALID) {
+        DuskPhase frozenPhase = stablePhaseFor(det.phase);
+        if (!det.learningFrozen || det.phase != frozenPhase) {
+            Serial.printf("[DUSK] event=freeze reason=%s phase=%s lux_age_s=%lu\n",
+                          lightSignalStateName(lightState),
+                          duskPhaseName(frozenPhase),
+                          static_cast<unsigned long>(luxAgeMs / 1000UL));
+        }
+        det.phase = frozenPhase;
+        det.transitionStartMs = 0;
+        det.dawnScore = 0.0f;
+        det.duskScore = 0.0f;
+        if (!det.learningFrozen) {
+            det.freezeSinceMs = nowMs;
+        }
+        det.learningFrozen = true;
+        return;
+    }
+
+    if (det.learningFrozen) {
+        uint32_t frozenForMs = (det.freezeSinceMs > 0 && nowMs >= det.freezeSinceMs)
+            ? (nowMs - det.freezeSinceMs)
+            : 0;
+        if (frozenForMs >= kFreezeResetWindowMs) {
+            det.head = 0;
+            det.count = 0;
+            det.transitionStartMs = 0;
+            det.dawnScore = 0.0f;
+            det.duskScore = 0.0f;
+        }
+        Serial.printf("[DUSK] event=resume phase=%s frozen_s=%lu lux=%.0f\n",
+                      duskPhaseName(det.phase),
+                      static_cast<unsigned long>(frozenForMs / 1000UL),
+                      lux);
+        det.learningFrozen = false;
+        det.freezeSinceMs = 0;
+    }
+
     // --- Dodaj próbkę do okna ---
     bool addSample = false;
     if (det.count == 0) {
@@ -344,7 +480,7 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
 
         // Próg wejścia: DAWN_SCORE_ENTER = 0.50
         float enterTh = cfg.duskScoreEnterThreshold - 0.05f;  // dawn threshold ~0.50
-        if (det.dawnScore >= enterTh) {
+        if (lux >= kDawnLuxEnterMin && det.dawnScore >= enterTh) {
             // Sprawdź min czas nocy
             if (det.lastDuskMs > 0) {
                 uint32_t nightSoFar = nowMs - det.lastDuskMs;
@@ -369,12 +505,16 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
         float cancelTh = cfg.duskScoreCancelThreshold - 0.05f;
         float confirmTh = cfg.duskScoreConfirmThreshold - 0.05f;  // ~0.60
 
-        if (det.dawnScore < cancelTh) {
+        if (det.dawnScore < cancelTh || lux <= kDawnLuxCancelMax) {
             det.phase = DuskPhase::NIGHT;
+            det.transitionStartMs = 0;
             Serial.printf("[DUSK] event=dawn_cancel score=%.2f elapsed_min=%u\n",
                           det.dawnScore, elapsed / 60000);
-        } else if (det.dawnScore >= confirmTh && elapsed >= cfg.transitionConfirmMs) {
+        } else if (lux >= kDawnLuxConfirmMin
+                   && det.dawnScore >= confirmTh
+                   && elapsed >= cfg.transitionConfirmMs) {
             det.phase = DuskPhase::DAY;
+            det.transitionStartMs = 0;
             det.lastDawnMs = nowMs;
             if (det.lastDuskMs > 0) {
                 det.nightLengthMs = nowMs - det.lastDuskMs;
@@ -384,10 +524,10 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
             }
             duskStateSave(det);
         } else if (elapsed > DuskDetector::kTransitionMaxDurationMs) {
-            det.phase = DuskPhase::DAY;
-            det.lastDawnMs = nowMs;
-            Serial.printf("[DUSK] event=dawn_timeout elapsed_min=%u action=assume_day\n", elapsed / 60000);
-            duskStateSave(det);
+            det.phase = DuskPhase::NIGHT;
+            det.transitionStartMs = 0;
+            Serial.printf("[DUSK] event=dawn_timeout elapsed_min=%u action=revert_night lux=%.0f\n",
+                          elapsed / 60000, lux);
         }
         break;
     }
@@ -397,7 +537,7 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
         DuskScores dusk = scoreDusk(lux, deriv);
         det.duskScore = duskComposite(dusk);
 
-        if (det.duskScore >= cfg.duskScoreEnterThreshold) {
+        if (lux <= kDuskLuxEnterMax && det.duskScore >= cfg.duskScoreEnterThreshold) {
             // Sprawdź min czas dnia
             if (det.lastDawnMs > 0) {
                 uint32_t daySoFar = nowMs - det.lastDawnMs;
@@ -419,14 +559,17 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
         det.duskScore = duskComposite(dusk);
         uint32_t elapsed = nowMs - det.transitionStartMs;
 
-        if (det.duskScore < cfg.duskScoreCancelThreshold) {
+        if (det.duskScore < cfg.duskScoreCancelThreshold || lux >= kDuskLuxCancelMin) {
             det.phase = DuskPhase::DAY;
+            det.transitionStartMs = 0;
             Serial.printf("[DUSK] event=dusk_cancel score=%.2f elapsed_min=%u lux=%.0f\n",
                           det.duskScore, elapsed / 60000, lux);
-        } else if (det.duskScore >= cfg.duskScoreConfirmThreshold
+        } else if (lux <= kDuskLuxConfirmMax
+                   && det.duskScore >= cfg.duskScoreConfirmThreshold
                    && elapsed >= cfg.transitionConfirmMs)
         {
             det.phase = DuskPhase::NIGHT;
+            det.transitionStartMs = 0;
             det.lastDuskMs = nowMs;
             det.nightSequence++;
             if (det.lastDawnMs > 0) {
@@ -442,13 +585,10 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
             // >>> PODLEWANIE OKNO <<<
             // TODO(events): eventQueue.push(Event::tick(EventType::DUSK_DETECTED))
         } else if (elapsed > DuskDetector::kTransitionMaxDurationMs) {
-            det.phase = DuskPhase::NIGHT;
-            det.lastDuskMs = nowMs;
-            det.nightSequence++;
-            Serial.printf("[DUSK] event=dusk_timeout elapsed_min=%u action=assume_night night_seq=%lu\n",
-                          elapsed / 60000,
-                          static_cast<unsigned long>(det.nightSequence));
-            duskStateSave(det);
+            det.phase = DuskPhase::DAY;
+            det.transitionStartMs = 0;
+            Serial.printf("[DUSK] event=dusk_timeout elapsed_min=%u action=revert_day lux=%.0f\n",
+                          elapsed / 60000, lux);
         }
         break;
     }
@@ -466,14 +606,20 @@ bool duskStateSave(const DuskDetector& det) {
         return false;
     }
     DuskState st;
+    st.schema        = kDuskStateSchema;
     st.phase         = static_cast<uint8_t>(det.phase);
     st.dayLengthMs   = det.dayLengthMs;
     st.nightLengthMs = det.nightLengthMs;
     size_t written = prefs.putBytes("dusk", &st, sizeof(DuskState));
     prefs.end();
+    bool ok = written == sizeof(DuskState);
+    if (!ok) {
+        Serial.println("[DUSK] event=nvs_save_failed reason=write_mismatch");
+        return false;
+    }
     Serial.printf("[DUSK] event=nvs_saved phase=%d day_min=%u night_min=%u\n",
                   st.phase, st.dayLengthMs / 60000, st.nightLengthMs / 60000);
-    return written == sizeof(DuskState);
+    return true;
 }
 
 bool duskStateLoad(DuskDetector& det) {
@@ -483,8 +629,14 @@ bool duskStateLoad(DuskDetector& det) {
     DuskState st;
     size_t len = prefs.getBytes("dusk", &st, sizeof(DuskState));
     prefs.end();
-    if (len != sizeof(DuskState)) return false;
-    if (st.phase > static_cast<uint8_t>(DuskPhase::DUSK_TRANSITION)) return false;
+    if (len != sizeof(DuskState) || st.schema != kDuskStateSchema) {
+        clearDuskNamespace();
+        return false;
+    }
+    if (st.phase > static_cast<uint8_t>(DuskPhase::DUSK_TRANSITION)) {
+        clearDuskNamespace();
+        return false;
+    }
 
     // Restore phase — but only stable phases (DAY/NIGHT).
     // Transitions are volatile, revert to the stable side.
@@ -509,13 +661,18 @@ bool duskStateLoad(DuskDetector& det) {
     return true;
 }
 
-void duskBootstrap(DuskDetector& det, float lux) {
+void duskBootstrap(DuskDetector& det, float lux, LightSignalState lightState) {
+    if (lightState != LightSignalState::VALID) {
+        Serial.printf("[DUSK] event=bootstrap_deferred reason=%s\n",
+                      lightSignalStateName(lightState));
+        return;
+    }
+
     // Quick heuristic from first sensor read — override only if confident.
     // If NVS already restored a phase, still override if sensor strongly disagrees.
     //   lux > 200 → definitely daytime (indoor artificial light rarely that high)
     //   lux < 5   → definitely night
     //   5..200    → ambiguous, trust NVS phase
-    DuskPhase before = det.phase;
     if (lux > 200.0f && det.phase == DuskPhase::NIGHT) {
         det.phase = DuskPhase::DAY;
         Serial.printf("[DUSK] event=bootstrap lux=%.0f from=NIGHT to=DAY\n", lux);
@@ -543,7 +700,9 @@ void updateSolarClock(const DuskDetector& det, SolarClock& clk) {
             clk.lastDawnMs = det.lastDawnMs;
             clk.lastDuskMs = det.lastDuskMs;
             if (det.lastDawnMs > 0 && det.lastDuskMs > 0) {
-                clk.cycleCount++;
+                if (clk.cycleCount < 0xFFu) {
+                    clk.cycleCount++;
+                }
             }
             Serial.printf("[SOLAR] event=clock_update day_h=%u day_m=%u night_h=%u night_m=%u cycle=%u\n",
                           clk.dayLengthMs / 3600000, (clk.dayLengthMs / 60000) % 60,
@@ -603,7 +762,7 @@ template class RingBuffer<SensorSample, 720>;
 template class RingBuffer<WateringRecord, 100>;
 
 namespace {
-static constexpr uint16_t kHistorySchema = 2;
+static constexpr uint16_t kHistorySchema = 3;
 static constexpr uint16_t kLevel2ChunkItems = 96;
 static constexpr uint16_t kLevel3ChunkItems = 96;
 static constexpr uint16_t kWateringChunkItems = 50;
@@ -867,7 +1026,7 @@ float historyCalcDailyConsumption(const SensorHistory& hist, uint32_t nowMs) {
 
 bool historyStateSave(uint32_t nowMs, const SensorHistory& hist) {
     Preferences prefs;
-    if (!prefs.begin(kNvsHist, false)) {
+    if (!beginHistoryPrefs(prefs, false)) {
         Serial.println("[HIST] event=nvs_save_failed reason=open_namespace");
         return false;
     }
@@ -957,23 +1116,27 @@ bool historyStateSave(uint32_t nowMs, const SensorHistory& hist) {
 bool historyStateLoad(uint32_t nowMs, SensorHistory& hist) {
     Preferences prefs;
     hist = SensorHistory{};
-    if (!prefs.begin(kNvsHist, true)) {
+    if (!beginHistoryPrefs(prefs, true)) {
         return false;
     }
     if (!prefs.isKey("meta")) {
         prefs.end();
+        clearLegacyDefaultHistoryNamespace();
         return false;
     }
 
     HistoryMeta meta{};
     if (prefs.getBytes("meta", &meta, sizeof(meta)) != sizeof(meta)
-        || (meta.schema != 1 && meta.schema != kHistorySchema)) {
+        || meta.schema != kHistorySchema) {
         prefs.end();
+        clearHistoryPartitionNamespace();
+        clearLegacyDefaultHistoryNamespace();
         Serial.println("[HIST] event=nvs_load_failed reason=meta_invalid");
         return false;
     }
     if (meta.level2Count > 288 || meta.level3Count > 720 || meta.wateringCount > 100) {
         prefs.end();
+        clearHistoryPartitionNamespace();
         Serial.println("[HIST] event=nvs_load_failed reason=count_invalid");
         return false;
     }
@@ -983,37 +1146,23 @@ bool historyStateLoad(uint32_t nowMs, SensorHistory& hist) {
     static PersistWateringRecord s_watering[100];
 
     bool ok = true;
-    if (meta.schema == 1) {
-        if (meta.level2Count > 0) {
-            ok = ok && (prefs.getBytes("lvl2", s_level2, meta.level2Count * sizeof(PersistSensorSample))
-                        == meta.level2Count * sizeof(PersistSensorSample));
-        }
-        if (meta.level3Count > 0) {
-            ok = ok && (prefs.getBytes("lvl3", s_level3, meta.level3Count * sizeof(PersistSensorSample))
-                        == meta.level3Count * sizeof(PersistSensorSample));
-        }
-        if (meta.wateringCount > 0) {
-            ok = ok && (prefs.getBytes("wlog", s_watering, meta.wateringCount * sizeof(PersistWateringRecord))
-                        == meta.wateringCount * sizeof(PersistWateringRecord));
-        }
-    } else {
-        ok = ok && readChunkedBytes(prefs, "l2_", "lvl2", s_level2,
-                                    meta.level2Count,
-                                    kLevel2ChunkItems,
-                                    kLevel2ChunkCount);
-        ok = ok && readChunkedBytes(prefs, "l3_", "lvl3", s_level3,
-                                    meta.level3Count,
-                                    kLevel3ChunkItems,
-                                    kLevel3ChunkCount);
-        ok = ok && readChunkedBytes(prefs, "wl_", "wlog", s_watering,
-                                    meta.wateringCount,
-                                    kWateringChunkItems,
-                                    kWateringChunkCount);
-    }
+    ok = ok && readChunkedBytes(prefs, "l2_", nullptr, s_level2,
+                                meta.level2Count,
+                                kLevel2ChunkItems,
+                                kLevel2ChunkCount);
+    ok = ok && readChunkedBytes(prefs, "l3_", nullptr, s_level3,
+                                meta.level3Count,
+                                kLevel3ChunkItems,
+                                kLevel3ChunkCount);
+    ok = ok && readChunkedBytes(prefs, "wl_", nullptr, s_watering,
+                                meta.wateringCount,
+                                kWateringChunkItems,
+                                kWateringChunkCount);
     prefs.end();
 
     if (!ok) {
         hist = SensorHistory{};
+        clearHistoryPartitionNamespace();
         Serial.println("[HIST] event=nvs_load_failed reason=blob_read");
         return false;
     }

@@ -280,6 +280,8 @@ Po pełnym odczycie kodu widać kilka ważnych aspektów, których wcześniej br
 - po recovery wykonywana jest ponowna inicjalizacja PbHUB, SHT30, QMP6988 i BH1750,
 - recovery uruchamia się dopiero przy serii błędów i ma cooldown czasowy,
 - dla częściowych awarii I2C kod robi lżejszą ścieżkę `reinitI2cSensors()` bez pełnego recovery magistrali,
+- DLight ma dodatkową szybką ścieżkę retry/re-init i publikuje stan jakości światła (`VALID`, `STALE`, `RECOVERING`, `UNKNOWN`),
+- przy awarii DLight detektor dzień/noc zamraża uczenie i wraca do ostatniej stabilnej fazy zamiast uczyć się z uszkodzonego lux,
 - QMP6988 jest zaimplementowany z odczytem OTP i własną kompensacją ciśnienia,
 - dual button ma stabilizację wielopróbkową i oznacza wejście jako `unstable`, jeśli sygnał jest niespójny.
 
@@ -411,6 +413,12 @@ Aktualna implementacja służy przede wszystkim do:
 - opcjonalnego wyznaczania okna przed świtem,
 - wspierania raportów i diagnostyki.
 
+Aktualny kontrakt fail-safe jest bardziej restrykcyjny niż wcześniejsze założenia:
+
+- przejście dzień/noc nie może być potwierdzone bez ważnego, świeżego lux,
+- sygnały temp/humidity/pressure pełnią rolę pomocniczą, nie zastępują światła,
+- przy `STALE` lub `RECOVERING` detector utrzymuje ostatnią stabilną fazę i nie uczy nowych długości dnia/nocy.
+
 ## Safety i blokady
 
 Kod rozróżnia blokady per-pot i globalne.
@@ -493,6 +501,7 @@ To jest zgodne z HLD, bo krytyczne dane budżetu wody nie mogą zniknąć po res
 Ważna poprawka wdrożona w kodzie:
 
 - zapis historii do NVS jest chunkowany, a nie oparty o pojedynczy duży blob.
+- historia została przeniesiona do dedykowanej partycji NVS, aby nie konkurowała o miejsce z `ag_config`, `ag_net`, `ag_dusk` i `ag_runtime`.
 
 ### Szczegóły, które wynikają bezpośrednio z kodu
 
@@ -503,7 +512,7 @@ Aktualna historia ma wersjonowany schemat i trzy warstwy:
 - `level3` próbki godzinowe,
 - osobny `wateringLog`.
 
-Kod wspiera odczyt starego formatu `schema 1` i migrację do `schema 2` z chunkami `l2_`, `l3_`, `wl_`.
+Kod używa wersjonowanego schematu historii na osobnej partycji. Przy bumpie schematu historia i learned state mogą zostać świadomie wyczyszczone, ale `ag_config` i `ag_net` pozostają zachowane.
 
 ### Trendy i anomaly
 

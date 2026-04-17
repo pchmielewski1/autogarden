@@ -24,9 +24,17 @@ static constexpr const char* kNvsNet     = "ag_net";
 static constexpr const char* kNvsHist    = "ag_hist";
 static constexpr const char* kNvsDusk    = "ag_dusk";
 static constexpr const char* kNvsRuntime = "ag_runtime";
+static constexpr const char* kNvsHistPartition = "histnvs";
 
 static constexpr uint16_t kNetConfigSchema = 2;
-static constexpr uint16_t kRuntimeSchema = 4;  // bump on struct change
+static constexpr uint16_t kRuntimeSchema = 5;  // bump on struct change
+
+enum class LightSignalState : uint8_t {
+    VALID = 0,
+    STALE = 1,
+    RECOVERING = 2,
+    UNKNOWN = 3,
+};
 
 // ---------------------------------------------------------------------------
 // Profil rośliny (PlantProfile) — PLAN.md → "Profile roślin"

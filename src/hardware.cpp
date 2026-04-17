@@ -291,6 +291,13 @@ ReadResult<EnvReading> EnvSensor::readEnv(uint32_t nowMs) {
 
 // ===== LightSensor (BH1750) =================================================
 
+namespace {
+static constexpr uint8_t kLightReadAttempts = 2;
+static constexpr uint32_t kLuxStaleHoldMs = 120000;
+static constexpr uint16_t kLuxQuickReinitFailThreshold = 5;
+static constexpr uint32_t kLuxQuickReinitCooldownMs = 5000;
+}
+
 bool LightSensor::init(uint8_t addr) {
     _addr = addr;
     // Power On
@@ -308,18 +315,24 @@ ReadResult<float> LightSensor::readLux(uint32_t nowMs) {
     ReadResult<float> r;
     r.readAtMs = nowMs;
 
-    Wire.requestFrom(_addr, (uint8_t)2);
-    if (Wire.available() < 2) {
-        r.health = SensorHealth::FAIL;
-        r.value = 0.0f;
-        return r;
+    for (uint8_t attempt = 0; attempt < kLightReadAttempts; ++attempt) {
+        Wire.requestFrom(_addr, (uint8_t)2);
+        if (Wire.available() >= 2) {
+            uint8_t hi = Wire.read();
+            uint8_t lo = Wire.read();
+            uint16_t raw = (hi << 8) | lo;
+            r.value = (float)raw / 1.2f;  // BH1750 formula
+            return r;
+        }
+
+        while (Wire.available() > 0) {
+            (void)Wire.read();
+        }
+        delayMicroseconds(150);
     }
 
-    uint8_t hi = Wire.read();
-    uint8_t lo = Wire.read();
-    uint16_t raw = (hi << 8) | lo;
-    r.value = (float)raw / 1.2f;  // BH1750 formula
-
+    r.health = SensorHealth::FAIL;
+    r.value = 0.0f;
     return r;
 }
 
@@ -822,6 +835,12 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     static uint16_t s_failCountLux = 0;
     static uint16_t s_failCountBaro = 0;
     static uint16_t s_failCountRes = 0;
+    static float s_lastValidLux = 0.0f;
+    static bool s_hasValidLux = false;
+    static uint32_t s_lastValidLuxMs = 0;
+    static uint16_t s_consecLuxFails = 0;
+    static uint32_t s_lastLuxReinitMs = 0;
+    static bool s_luxRecovering = false;
     static uint32_t s_lastSoilWarnMs[kMaxPots] = {};
     static uint16_t s_soilMedianSamples[kMaxPots][kMoistureMedianWindow] = {};
     static uint8_t s_soilMedianCount[kMaxPots] = {};
@@ -930,8 +949,50 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     }
 
     auto lux = _lightSensor.readLux(nowMs);
-    if (lux.ok()) snap.env.lux = lux.value;
-    else s_failCountLux++;
+    if (lux.ok()) {
+        if (s_luxRecovering || s_consecLuxFails > 0) {
+            Serial.printf("[HW] event=light_recovered lux=%.0f fail_streak=%u\n",
+                          lux.value, s_consecLuxFails);
+        }
+        snap.env.lux = lux.value;
+        snap.env.lightState = LightSignalState::VALID;
+        snap.env.luxAgeMs = 0;
+        s_lastValidLux = lux.value;
+        s_lastValidLuxMs = nowMs;
+        s_hasValidLux = true;
+        s_consecLuxFails = 0;
+        s_luxRecovering = false;
+    } else {
+        s_failCountLux++;
+        s_consecLuxFails++;
+
+        uint32_t luxAgeMs = (s_hasValidLux && nowMs >= s_lastValidLuxMs)
+            ? (nowMs - s_lastValidLuxMs)
+            : 0;
+        bool reuseLastLux = s_hasValidLux && luxAgeMs <= kLuxStaleHoldMs;
+
+        snap.env.lux = reuseLastLux ? s_lastValidLux : 0.0f;
+        snap.env.luxAgeMs = reuseLastLux ? luxAgeMs : 0;
+        if (s_luxRecovering) {
+            snap.env.lightState = LightSignalState::RECOVERING;
+        } else if (reuseLastLux) {
+            snap.env.lightState = LightSignalState::STALE;
+        } else {
+            snap.env.lightState = LightSignalState::UNKNOWN;
+        }
+
+        if (_hwCfg
+            && s_consecLuxFails >= kLuxQuickReinitFailThreshold
+            && (nowMs - s_lastLuxReinitMs) >= kLuxQuickReinitCooldownMs) {
+            bool reinitOk = _lightSensor.init(_hwCfg->addrLight);
+            s_lastLuxReinitMs = nowMs;
+            s_luxRecovering = true;
+            snap.env.lightState = LightSignalState::RECOVERING;
+            Serial.printf("[HW] event=light_reinit result=%s fail_streak=%u\n",
+                          reinitOk ? "ok" : "fail",
+                          s_consecLuxFails);
+        }
+    }
 
     auto baro = _baroSensor.readPressureHpa(nowMs);
     if (baro.ok()) snap.env.pressureHpa = baro.value;

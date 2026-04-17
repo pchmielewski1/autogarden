@@ -12,6 +12,8 @@
 #include <cmath>
 #include "config.h"
 
+static constexpr uint16_t kDuskStateSchema = 2;
+
 // ---------------------------------------------------------------------------
 // EmaFilter — Exponential Moving Average
 // PLAN.md → "Filtracja odczytów — EMA"
@@ -118,6 +120,8 @@ struct DuskDetector {
     // Scoring (do logowania / UI)
     float    duskScore             = 0.0f;
     float    dawnScore             = 0.0f;
+    bool     learningFrozen        = false;
+    uint32_t freezeSinceMs         = 0;
 
     // Stałe — mapowane z Config w runtime
     static constexpr uint32_t kEnvSampleIntervalMs      = 30000;  // 30 s
@@ -127,7 +131,9 @@ struct DuskDetector {
 };
 
 // Tick — wywoływany co ~1s z ControlTask
-void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
+void duskDetectorTick(uint32_t nowMs, float lux, LightSignalState lightState,
+                      uint32_t luxAgeMs,
+                      float tempC,
                       float humPct, float pressHpa,
                       DuskDetector& det, const Config& cfg);
 
@@ -135,15 +141,17 @@ void duskDetectorTick(uint32_t nowMs, float lux, float tempC,
 // DuskState — persisted to NVS across reboots
 // ---------------------------------------------------------------------------
 struct DuskState {
+    uint16_t schema         = kDuskStateSchema;
     uint8_t  phase          = 0;   // DuskPhase as uint8
+    uint8_t  _pad0          = 0;
     uint32_t dayLengthMs    = 0;   // estimated day length from SolarClock
     uint32_t nightLengthMs  = 0;   // estimated night length
-    uint8_t  _pad[3]        = {};  // alignment
+    uint8_t  _pad[4]        = {};  // alignment
 };
 
 bool duskStateSave(const DuskDetector& det);    // save current phase + estimates to NVS
 bool duskStateLoad(DuskDetector& det);           // restore phase + estimates from NVS
-void duskBootstrap(DuskDetector& det, float lux); // instant phase from first lux reading
+void duskBootstrap(DuskDetector& det, float lux, LightSignalState lightState); // instant phase from first lux reading
 
 // Helpery
 DuskScores scoreDusk(float lux, const EnvDerivatives& d);

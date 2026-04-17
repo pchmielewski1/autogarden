@@ -255,7 +255,8 @@ ScheduleResult evaluateSchedule(uint32_t nowMs,
                                envSens.tempC);
         return { ScheduleDecision::NO_ACTION, "HEAT_BLOCK" };
     }
-    if (envSens.lux > cfg.directSunLuxThreshold) {
+    if (envSens.lightState == LightSignalState::VALID
+        && envSens.lux > cfg.directSunLuxThreshold) {
         throttledSchedBlockLog("direct_sun", "[POT%d] SCHEDULE_BLOCK reason=direct_sun lux=%.0f\n",
                                envSens.lux);
         return { ScheduleDecision::NO_ACTION, "DIRECT_SUN" };

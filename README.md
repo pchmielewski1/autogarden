@@ -34,11 +34,13 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 - **Temperature & humidity** — SHT30 (ENV III).
 - **Barometric pressure** — QMP6988 with OTP calibration.
 - **Ambient light** — BH1750 lux sensor, used for dusk/dawn detection and direct-sun blocking.
+- **Runtime light recovery** — BH1750 failures are retried and re-initialized without reboot; stale light is tracked explicitly.
 
 ### Dusk/Dawn Detection & Scheduling
 - **Sensor-fusion dusk detector** — combines light level, light rate-of-change, temperature, humidity, and pressure into a transition score.
 - **Solar clock** — learns the day/night cycle from observed transitions without external time sync.
 - **Dusk watering window** — schedules watering during the optimal evening window (configurable).
+- **Fail-safe freeze policy** — if the light sensor becomes stale or recovers after a fault, day/night learning freezes on the last stable phase until valid lux returns.
 
 ### User Interface
 - **On-device GUI** on the StickS3 135×240 LCD — main dashboard with live sensor data, watering progress, and reservoir level.
@@ -64,6 +66,7 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 
 ### Configuration & Persistence
 - **NVS storage** — all settings persist across reboots (mode, profiles, reservoir, vacation, calibration).
+- **Dedicated history partition** — large sensor history is stored in a separate NVS partition to avoid starving config/runtime namespaces.
 - **Schema versioning** — automatic migration on firmware update; safe fallback to defaults on mismatch.
 - **Factory reset** — hold BtnA+B for 5 seconds from the Settings screen.
 

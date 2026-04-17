@@ -86,6 +86,15 @@ bool moistureCurveExponentValid(float exponent) {
         && exponent <= kMoistureCurveExponentMax;
 }
 
+void clearNamespace(const char* name, const char* partitionLabel = nullptr) {
+    Preferences prefs;
+    if (!prefs.begin(name, false, partitionLabel)) {
+        return;
+    }
+    prefs.clear();
+    prefs.end();
+}
+
 struct LegacyPotConfigV4 {
     bool     enabled = false;
     uint8_t  plantProfileIndex = 0;
@@ -606,36 +615,12 @@ bool netConfigSave(const NetConfig& net) {
 // ---------------------------------------------------------------------------
 void configFactoryReset() {
     Serial.println("[CONFIG] FACTORY RESET — clearing all NVS namespaces");
-    {
-        Preferences prefs;
-        prefs.begin(kNvsConfig, false);
-        prefs.clear();
-        prefs.end();
-    }
-    {
-        Preferences prefs;
-        prefs.begin(kNvsNet, false);
-        prefs.clear();
-        prefs.end();
-    }
-    {
-        Preferences prefs;
-        prefs.begin(kNvsHist, false);
-        prefs.clear();
-        prefs.end();
-    }
-    {
-        Preferences prefs;
-        prefs.begin(kNvsDusk, false);
-        prefs.clear();
-        prefs.end();
-    }
-    {
-        Preferences prefs;
-        prefs.begin(kNvsRuntime, false);
-        prefs.clear();
-        prefs.end();
-    }
+    clearNamespace(kNvsConfig);
+    clearNamespace(kNvsNet);
+    clearNamespace(kNvsHist);
+    clearNamespace(kNvsHist, kNvsHistPartition);
+    clearNamespace(kNvsDusk);
+    clearNamespace(kNvsRuntime);
     Serial.println("[CONFIG] All NVS cleared. Restarting...");
 }
 
@@ -665,6 +650,7 @@ bool runtimeStateLoad(RuntimeState& rs) {
         Serial.printf("[RUNTIME] schema mismatch (nvs=%d, expected=%d) — discarding\n",
                       schema, kRuntimeSchema);
         prefs.end();
+        clearNamespace(kNvsRuntime);
         return false;
     }
 
@@ -674,6 +660,7 @@ bool runtimeStateLoad(RuntimeState& rs) {
     if (len != sizeof(RuntimeState)) {
         Serial.printf("[RUNTIME] NVS size mismatch (%d vs %d)\n", (int)len, (int)sizeof(RuntimeState));
         rs = RuntimeState{};
+        clearNamespace(kNvsRuntime);
         return false;
     }
 

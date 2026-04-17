@@ -68,6 +68,8 @@ struct EnvSnapshot {
     float    humidityPct;
     float    lux;
     float    pressureHpa;
+    LightSignalState lightState = LightSignalState::UNKNOWN;
+    uint32_t luxAgeMs = 0;
 };
 
 struct SensorSnapshot {
