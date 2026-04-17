@@ -76,6 +76,10 @@ struct SharedState {
     WaterBudget   budget;
     WateringCycle cycles[kMaxPots];
     uint32_t      lastCycleDoneMs[kMaxPots] = {};
+    float         pumped24hMl = 0.0f;
+    float         pumped24hMlPerPot[kMaxPots] = {};
+    uint16_t      wateringEvents24h = 0;
+    uint16_t      wateringEvents24hPerPot[kMaxPots] = {};
     uint32_t      lastFeedbackSeq[kMaxPots] = {};
     WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
     float         lastFeedbackValue1[kMaxPots] = {};
@@ -100,6 +104,13 @@ struct TelegramFeedbackMessage {
 static QueueHandle_t     s_tgFeedbackQueue = nullptr;
 static constexpr UBaseType_t kTelegramFeedbackDrainPerTick = 2;
 
+struct WateringHistory24hSummary {
+    float pumpedMl = 0.0f;
+    float pumpedMlPerPot[kMaxPots] = {};
+    uint16_t events = 0;
+    uint16_t eventsPerPot[kMaxPots] = {};
+};
+
 // ============================================================================
 // Helpers — snapshot (thread-safe r/w)
 // ============================================================================
@@ -120,13 +131,45 @@ static SensorSnapshot readSnapshot() {
     return snap;
 }
 
+static WateringHistory24hSummary summarizeWateringHistory24h(uint32_t nowMs) {
+    WateringHistory24hSummary summary{};
+    for (uint16_t i = 0; i < g_history.wateringLog.size(); ++i) {
+        const WateringRecord& rec = g_history.wateringLog.at(i);
+        if (rec.timestampMs == 0 || rec.timestampMs > nowMs) {
+            continue;
+        }
+        if ((nowMs - rec.timestampMs) > 86400000UL) {
+            continue;
+        }
+
+        float pumpedMl = rec.totalPumpedMl_x10 / 10.0f;
+        summary.pumpedMl += pumpedMl;
+        if (summary.events < 0xFFFFu) {
+            summary.events++;
+        }
+
+        if (rec.potIndex < kMaxPots) {
+            summary.pumpedMlPerPot[rec.potIndex] += pumpedMl;
+            if (summary.eventsPerPot[rec.potIndex] < 0xFFFFu) {
+                summary.eventsPerPot[rec.potIndex]++;
+            }
+        }
+    }
+    return summary;
+}
+
 static void publishSharedStateFromControl() {
     if (xSemaphoreTake(s_stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        WateringHistory24hSummary history24 = summarizeWateringHistory24h(millis());
         s_sharedState.config = g_config;
         s_sharedState.netConfig = g_netConfig;
         s_sharedState.budget = g_budget;
         memcpy(s_sharedState.cycles, g_cycles, sizeof(g_cycles));
         memcpy(s_sharedState.lastCycleDoneMs, g_actuator.lastCycleDoneMs, sizeof(g_actuator.lastCycleDoneMs));
+        s_sharedState.pumped24hMl = history24.pumpedMl;
+        memcpy(s_sharedState.pumped24hMlPerPot, history24.pumpedMlPerPot, sizeof(history24.pumpedMlPerPot));
+        s_sharedState.wateringEvents24h = history24.events;
+        memcpy(s_sharedState.wateringEvents24hPerPot, history24.eventsPerPot, sizeof(history24.eventsPerPot));
         memcpy(s_sharedState.lastFeedbackSeq, g_actuator.lastFeedbackSeq, sizeof(g_actuator.lastFeedbackSeq));
         memcpy(s_sharedState.lastFeedbackCode, g_actuator.lastFeedbackCode, sizeof(g_actuator.lastFeedbackCode));
         memcpy(s_sharedState.lastFeedbackValue1, g_actuator.lastFeedbackValue1, sizeof(g_actuator.lastFeedbackValue1));
@@ -203,6 +246,22 @@ static const char* lightStateName(LightSignalState state) {
         default:
             return "UNKNOWN";
     }
+}
+
+static const char* waterLevelStateName(WaterLevelState state) {
+    switch (state) {
+        case WaterLevelState::OK: return "OK";
+        case WaterLevelState::TRIGGERED: return "TRIG";
+        case WaterLevelState::UNKNOWN:
+        default:
+            return "UNK";
+    }
+}
+
+static const char* waterLevelPendingName(const WaterLevelStatus& status) {
+    if (status.pendingTrip) return "TRIP";
+    if (status.pendingClear) return "CLEAR";
+    return "-";
 }
 
 static float effectiveTargetForPot(const Config& cfg, uint8_t potIdx) {
@@ -373,6 +432,12 @@ static uint32_t statusDigest(const SensorSnapshot& snap) {
         h = hashMix(h, i);
         h = hashMix(h, bucket(ps.moisturePct, 3.0f));
         h = hashMix(h, bucket(ps.moistureEma, 3.0f));
+        h = hashMix(h, static_cast<uint32_t>(ps.waterGuards.potMax));
+        h = hashMix(h, static_cast<uint32_t>(ps.waterGuards.reservoirMin));
+        h = hashMix(h, ps.waterGuards.potMaxStatus.pendingTrip ? 1u : 0u);
+        h = hashMix(h, ps.waterGuards.potMaxStatus.pendingClear ? 1u : 0u);
+        h = hashMix(h, ps.waterGuards.reservoirMinStatus.pendingTrip ? 1u : 0u);
+        h = hashMix(h, ps.waterGuards.reservoirMinStatus.pendingClear ? 1u : 0u);
     }
     return h;
 }
@@ -395,6 +460,8 @@ static uint32_t statusCriticalDigest(const SensorSnapshot& snap) {
         h = hashMix(h, cyc.pulseCount);
         h = hashMix(h, ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? 1u : 0u);
         h = hashMix(h, ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? 1u : 0u);
+        h = hashMix(h, ps.waterGuards.potMaxStatus.pendingTrip ? 1u : 0u);
+        h = hashMix(h, ps.waterGuards.reservoirMinStatus.pendingTrip ? 1u : 0u);
     }
     return h;
 }
@@ -1040,12 +1107,14 @@ static void controlTaskFn(void* /*param*/) {
                         }
                     }
 
-                    Serial.printf("[POT%d] overflow=%s reservoir=%s\n",
+                    Serial.printf("[POT%d] overflow=%s raw=%s pend=%s reservoir=%s raw=%s pend=%s\n",
                                   i,
-                                  ps.waterGuards.potMax == WaterLevelState::OK ? "OK" :
-                                  ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
-                                  ps.waterGuards.reservoirMin == WaterLevelState::OK ? "OK" :
-                                  ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "UNK");
+                                  waterLevelStateName(ps.waterGuards.potMax),
+                                  waterLevelStateName(ps.waterGuards.potMaxStatus.rawState),
+                                  waterLevelPendingName(ps.waterGuards.potMaxStatus),
+                                  waterLevelStateName(ps.waterGuards.reservoirMin),
+                                  waterLevelStateName(ps.waterGuards.reservoirMinStatus.rawState),
+                                  waterLevelPendingName(ps.waterGuards.reservoirMinStatus));
                     if (cyc.phase != WateringPhase::IDLE && cyc.phase != WateringPhase::DONE) {
                         Serial.printf("[POT%d] pulse=%d/%d pumped=%.1fml phaseSince=%ds\n",
                                       i, cyc.pulseCount, cyc.maxPulses,
@@ -1628,9 +1697,11 @@ static void netTaskFn(void* /*param*/) {
     static SensorSnapshot latestSnap{};
     static DailyReportData rptData{};
     static TelegramStatusData tgData{};
-    static char heartbeatBuf[512];
+    static char heartbeatBuf[1024];
     static uint32_t s_lastFeedbackBacklogLogMs = 0;
     static uint32_t s_lastFeedbackDeferredLogMs = 0;
+    static constexpr uint32_t kStartupHeartbeatDelayMs = 5UL * 60 * 1000;
+    static constexpr uint32_t kStartupHeartbeatRetryMs = 5UL * 60 * 1000;
 
     for (;;) {
         uint32_t now = millis();
@@ -1664,34 +1735,53 @@ static void netTaskFn(void* /*param*/) {
             // żeby backlog feedbacku nie opóźniał odpowiedzi inline.
             telegramPollCommands(now, g_netConfig, tgData);
 
-            uint32_t prevLastHeartbeatMs = g_netState.lastHeartbeatMs;
-            bool prevHeartbeatSentToday = g_netState.heartbeatSentToday;
-            if (isDailyHeartbeatTime(now, g_solarClock, g_duskDetector,
-                                     g_netState)) {
+            auto sendHeartbeatReport = [&](DailyReportData::Kind kind, const char* typeLabel) {
                 rptData.sensors  = latestSnap;
                 rptData.budget   = shared.budget;
                 memcpy(rptData.trends, shared.trends, sizeof(shared.trends));
+                memcpy(rptData.lastCycleDoneMs, shared.lastCycleDoneMs, sizeof(shared.lastCycleDoneMs));
+                rptData.pumped24hMl = shared.pumped24hMl;
+                memcpy(rptData.pumped24hMlPerPot, shared.pumped24hMlPerPot, sizeof(shared.pumped24hMlPerPot));
+                rptData.wateringEvents24h = shared.wateringEvents24h;
+                memcpy(rptData.wateringEvents24hPerPot, shared.wateringEvents24hPerPot,
+                       sizeof(shared.wateringEvents24hPerPot));
                 rptData.config   = shared.config;
+                rptData.duskPhase = shared.duskPhase;
+                rptData.solarCalibrated = g_solarClock.calibrated;
+                rptData.kind = kind;
                 rptData.uptimeMs = now;
 
                 formatDailyReport(rptData, heartbeatBuf, sizeof(heartbeatBuf));
-                bool sent = false;
-                if (telegramHasActivePanel()) {
-                    sent = telegramSendToActivePanel(heartbeatBuf, tgData, g_netConfig);
-                    if (sent) {
-                        Serial.println("[NET] event=heartbeat_sent mode=inline_panel");
-                    } else {
-                        Serial.println("[NET] event=heartbeat_deferred reason=panel_send_failed");
-                    }
+                bool sent = telegramSendInlineMessage(heartbeatBuf, tgData, g_netConfig);
+                if (sent) {
+                    Serial.printf("[NET] event=heartbeat_sent type=%s mode=inline\n", typeLabel);
                 } else {
-                    Serial.println("[NET] event=heartbeat_deferred reason=no_active_panel");
+                    Serial.printf("[NET] event=heartbeat_deferred type=%s reason=inline_send_failed\n",
+                                  typeLabel);
                 }
+                return sent;
+            };
+
+            if (!g_netState.startupHeartbeatSent
+                && now >= kStartupHeartbeatDelayMs
+                && (g_netState.lastStartupHeartbeatAttemptMs == 0
+                    || (now - g_netState.lastStartupHeartbeatAttemptMs) >= kStartupHeartbeatRetryMs)) {
+                g_netState.lastStartupHeartbeatAttemptMs = now;
+                if (sendHeartbeatReport(DailyReportData::Kind::STARTUP_CHECK, "startup")) {
+                    g_netState.startupHeartbeatSent = true;
+                }
+            }
+
+            uint32_t prevLastHeartbeatMs = g_netState.lastHeartbeatMs;
+            uint32_t prevLastDailyAnchorMs = g_netState.lastDailyAnchorMs;
+            if (isDailyHeartbeatTime(now, g_solarClock, g_duskDetector,
+                                     g_netState)) {
+                bool sent = sendHeartbeatReport(DailyReportData::Kind::DAILY, "daily");
 
                 if (sent) {
-                    g_netState.heartbeatSentToday = true;
                 } else {
                     g_netState.lastHeartbeatMs = prevLastHeartbeatMs;
-                    g_netState.heartbeatSentToday = prevHeartbeatSentToday;
+                    g_netState.lastDailyAnchorMs = prevLastDailyAnchorMs;
                 }
             }
 

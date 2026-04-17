@@ -47,6 +47,10 @@ static constexpr uint16_t COL_GRAY     = 0x4208;
 static constexpr uint16_t COL_HILITE   = 0x07FF;   // cyan
 static constexpr uint16_t COL_PANEL    = 0x10A2;   // dark panel bg
 static constexpr uint16_t COL_SEP      = 0x31A6;   // separator line
+static constexpr uint16_t COL_CHIP_DAY_BG   = 0x42A0;
+static constexpr uint16_t COL_CHIP_NIGHT_BG = 0x0190;
+static constexpr uint16_t COL_CHIP_TRANS_BG = 0x79E0;
+static constexpr uint16_t COL_CHIP_UPTIME_BG = 0x19E3;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -210,6 +214,42 @@ static void drawCompactChip(int16_t x, int16_t y, int16_t w, const char* text,
     C.setTextColor(textColor);
     C.drawString(text ? text : "", x + (w / 2), y + 7);
     C.setTextDatum(textdatum_t::top_left);
+}
+
+static void duskChipStyle(DuskPhase phase, uint16_t& bgColor, uint16_t& textColor) {
+    switch (phase) {
+        case DuskPhase::DAY:
+            bgColor = COL_CHIP_DAY_BG;
+            textColor = COL_YELLOW;
+            break;
+        case DuskPhase::NIGHT:
+            bgColor = COL_CHIP_NIGHT_BG;
+            textColor = COL_CYAN;
+            break;
+        case DuskPhase::DAWN_TRANSITION:
+        case DuskPhase::DUSK_TRANSITION:
+            bgColor = COL_CHIP_TRANS_BG;
+            textColor = COL_TEXT;
+            break;
+        default:
+            bgColor = COL_PANEL;
+            textColor = COL_TEXT;
+            break;
+    }
+}
+
+static uint16_t duskTextColor(DuskPhase phase) {
+    switch (phase) {
+        case DuskPhase::DAY:
+            return COL_YELLOW;
+        case DuskPhase::NIGHT:
+            return COL_CYAN;
+        case DuskPhase::DAWN_TRANSITION:
+        case DuskPhase::DUSK_TRANSITION:
+            return COL_ORANGE;
+        default:
+            return COL_TEXT;
+    }
 }
 
 static void formatDualPotStatus(uint32_t nowMs,
@@ -419,10 +459,8 @@ static void iconTarget(int16_t x, int16_t y, TargetState state) {
     switch (state) {
         case TargetState::BELOW_TRIGGER: {
             uint16_t col = COL_YELLOW;
-            C.fillTriangle(x + 5, y + 0, x + 1, y + 5, x + 9, y + 5, col);
-            C.fillRect(x + 4, y + 5, 3, 6, col);
-            C.drawFastVLine(x + 1, y + 6, 5, col);
-            C.drawFastVLine(x + 9, y + 6, 5, col);
+            C.fillTriangle(x + 5, y + 0, x + 0, y + 5, x + 10, y + 5, col);
+            C.fillRect(x + 4, y + 4, 3, 7, col);
             break;
         }
         case TargetState::ON_TARGET: {
@@ -434,15 +472,15 @@ static void iconTarget(int16_t x, int16_t y, TargetState state) {
         }
         case TargetState::ABOVE_TARGET: {
             uint16_t col = COL_CYAN;
-            C.fillTriangle(x + 5, y + 11, x + 1, y + 6, x + 9, y + 6, col);
-            C.fillRect(x + 4, y + 1, 3, 6, col);
+            C.fillRect(x + 4, y + 1, 3, 7, col);
+            C.fillTriangle(x + 5, y + 11, x + 0, y + 6, x + 10, y + 6, col);
             break;
         }
         case TargetState::ABOVE_MAX:
         default: {
             uint16_t col = COL_RED;
-            C.fillTriangle(x + 5, y + 11, x + 1, y + 6, x + 9, y + 6, col);
-            C.fillRect(x + 4, y + 1, 3, 6, col);
+            C.fillRect(x + 4, y + 1, 3, 7, col);
+            C.fillTriangle(x + 5, y + 11, x + 0, y + 6, x + 10, y + 6, col);
             C.drawFastHLine(x + 1, y + 0, 9, col);
             break;
         }
@@ -639,12 +677,14 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     C.drawString(buf, 96, 55);
 
     bool overflow = (ps.waterGuards.potMax == WaterLevelState::TRIGGERED);
+    bool overflowPending = ps.waterGuards.potMaxStatus.pendingTrip || ps.waterGuards.potMaxStatus.pendingClear;
     bool resLow   = (ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED);
+    bool resPending = ps.waterGuards.reservoirMinStatus.pendingTrip || ps.waterGuards.reservoirMinStatus.pendingClear;
     iconPot(4, 66);                  // 🪴 zawsze brązowa
-    C.setTextColor(overflow ? COL_RED : COL_GREEN);
-    C.drawString(overflow ? "OVFL" : "OK", TXI, 69);
-    C.setTextColor(resLow ? COL_RED : COL_GREEN);
-    C.drawString(resLow ? "TANK:LOW" : "TANK:OK", 72, 69);
+    C.setTextColor((overflow || overflowPending) ? COL_RED : COL_GREEN);
+    C.drawString(overflow ? "OVFL" : overflowPending ? "OVF~" : "OK", TXI, 69);
+    C.setTextColor((resLow || resPending) ? COL_RED : COL_GREEN);
+    C.drawString(resLow ? "TANK:LOW" : resPending ? "TANK:~" : "TANK:OK", 72, 69);
 
     drawSep(82);
 
@@ -748,7 +788,7 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     // ── Section 6: Dusk + uptime (y 164-178) ─────────────────
     drawSep(164);
     iconSun(4, 166, snap.duskPhase == DuskPhase::DAY ? COL_YELLOW : COL_GRAY);
-    C.setTextColor(COL_DIM);
+    C.setTextColor(duskTextColor(snap.duskPhase));
     const char* duskStr = "?";
     switch (snap.duskPhase) {
         case DuskPhase::DAY:             duskStr = "DAY"; break;
@@ -758,7 +798,8 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     }
     C.drawString(duskStr, TXI, 168);
 
-    iconClock(66, 166);              // ⏰
+    iconClock(66, 166, COL_TEXT);    // ⏰
+    C.setTextColor(COL_TEXT);
     formatUptimeCompact(nowMs, buf, sizeof(buf));
     C.drawString(buf, 80, 168);
 
@@ -850,11 +891,15 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
 
     // Guards per pot — połowa szerokości każdy
     bool res0Ovf = (snap.sensors.pots[0].waterGuards.potMax == WaterLevelState::TRIGGERED);
+    bool res0Pending = snap.sensors.pots[0].waterGuards.potMaxStatus.pendingTrip
+                    || snap.sensors.pots[0].waterGuards.potMaxStatus.pendingClear;
     bool res1Ovf = (snap.sensors.pots[1].waterGuards.potMax == WaterLevelState::TRIGGERED);
-    snprintf(buf, sizeof(buf), "OVF1 %s", res0Ovf ? "HIT" : "OK");
-    drawCompactChip(4, 126, 61, buf, res0Ovf ? 0x7800 : COL_PANEL, res0Ovf ? COL_RED : COL_GREEN);
-    snprintf(buf, sizeof(buf), "OVF2 %s", res1Ovf ? "HIT" : "OK");
-    drawCompactChip(70, 126, 61, buf, res1Ovf ? 0x7800 : COL_PANEL, res1Ovf ? COL_RED : COL_GREEN);
+    bool res1Pending = snap.sensors.pots[1].waterGuards.potMaxStatus.pendingTrip
+                    || snap.sensors.pots[1].waterGuards.potMaxStatus.pendingClear;
+    snprintf(buf, sizeof(buf), "OVF1 %s", res0Ovf ? "HIT" : res0Pending ? "~" : "OK");
+    drawCompactChip(4, 126, 61, buf, (res0Ovf || res0Pending) ? 0x7800 : COL_PANEL, (res0Ovf || res0Pending) ? COL_RED : COL_GREEN);
+    snprintf(buf, sizeof(buf), "OVF2 %s", res1Ovf ? "HIT" : res1Pending ? "~" : "OK");
+    drawCompactChip(70, 126, 61, buf, (res1Ovf || res1Pending) ? 0x7800 : COL_PANEL, (res1Ovf || res1Pending) ? COL_RED : COL_GREEN);
 
     // Env + humidity
     snprintf(buf, sizeof(buf), "T %.1fC", env.tempC);
@@ -880,15 +925,18 @@ void renderDualPotScreen(uint32_t nowMs, const UiSnap& snap, const UiState& stat
 
     // Dusk + uptime
     const char* duskStr2 = "?";
+    uint16_t duskChipBg = COL_PANEL;
+    uint16_t duskChipText = COL_TEXT;
     switch (snap.duskPhase) {
         case DuskPhase::DAY:             duskStr2 = "DAY"; break;
         case DuskPhase::NIGHT:           duskStr2 = "NIGHT"; break;
         case DuskPhase::DUSK_TRANSITION: duskStr2 = "DUSK"; break;
         case DuskPhase::DAWN_TRANSITION: duskStr2 = "DAWN"; break;
     }
-    drawCompactChip(4, 198, 61, duskStr2, COL_PANEL, COL_DIM);
+    duskChipStyle(snap.duskPhase, duskChipBg, duskChipText);
+    drawCompactChip(4, 198, 61, duskStr2, duskChipBg, duskChipText);
     formatUptimeCompact(nowMs, buf, sizeof(buf));
-    drawCompactChip(70, 198, 61, buf, COL_PANEL, COL_DIM);
+    drawCompactChip(70, 198, 61, buf, COL_CHIP_UPTIME_BG, COL_TEXT);
 
     // RAWf per pot — dwa pola, bez pełnej szerokości
     snprintf(buf, sizeof(buf), "P1 %u", static_cast<unsigned>(snap.sensors.pots[0].moistureRawFiltered));

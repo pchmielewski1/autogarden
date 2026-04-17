@@ -42,6 +42,19 @@ enum class WaterLevelState : uint8_t {
     UNKNOWN,     // sensor fault
 };
 
+struct WaterLevelStatus {
+    WaterLevelState rawState = WaterLevelState::UNKNOWN;
+    WaterLevelState filteredState = WaterLevelState::UNKNOWN;
+    bool rawHigh = false;
+    bool rawValid = false;
+    bool activeLow = true;
+    bool pendingTrip = false;
+    bool pendingClear = false;
+    bool unstable = false;
+    uint32_t stableSinceMs = 0;
+    uint32_t pendingSinceMs = 0;
+};
+
 // ---------------------------------------------------------------------------
 // Sensory — wyniki odczytów
 // ---------------------------------------------------------------------------
@@ -51,8 +64,10 @@ struct EnvReading {
 };
 
 struct WaterGuards {
-    WaterLevelState potMax;        // overflow per-pot
-    WaterLevelState reservoirMin;  // reservoir level (wspólny)
+    WaterLevelState potMax = WaterLevelState::UNKNOWN;
+    WaterLevelState reservoirMin = WaterLevelState::UNKNOWN;
+    WaterLevelStatus potMaxStatus;
+    WaterLevelStatus reservoirMinStatus;
 };
 
 struct PotSensorSnapshot {
@@ -136,7 +151,10 @@ private:
 class WaterLevelSensor {
 public:
     void init(PbHubBus* bus, uint8_t channel, uint8_t pin, bool activeLow);
+    ReadResult<bool> readRawLevel(uint32_t nowMs);
     ReadResult<WaterLevelState> readState(uint32_t nowMs);
+    WaterLevelState normalizePhysicalLevel(bool physicalHigh) const;
+    bool activeLow() const { return _activeLow; }
 
 private:
     PbHubBus* _bus = nullptr;

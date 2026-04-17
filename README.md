@@ -26,7 +26,8 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 - **Hard pump timeout** (30 s) — hardware-level failsafe independent of the FSM, kills any pump that exceeds max on-time.
 - **Cooldown enforcement** — minimum interval between watering cycles prevents over-watering.
 - **Anti-overflow** — capacitive water-level sensors on the pot and reservoir block the pump when water is detected.
-- **Weather blocks** — suppresses watering during direct sun (>40 klux) or extreme heat (>35 °C).
+- **Asymmetric water-level filtering** — water-level sensors use fast trip and slower clear, so pumps stop quickly on edge hits without flapping UI/FSM/Telegram every 100 ms.
+- **Weather blocks** — suppresses non-rescue watering during direct sun (>40 klux) or extreme heat (>41 °C).
 - **Mode-switch abort** — switching from AUTO to MANUAL immediately stops any active watering cycle and turns off pumps.
 
 ### Environment Sensing
@@ -45,13 +46,15 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 ### User Interface
 - **On-device GUI** on the StickS3 135×240 LCD — main dashboard with live sensor data, watering progress, and reservoir level.
 - **Dual-view mode** — compact (both pots) or detailed (single pot) views.
+- **Guard diagnostics** — status dumps and on-device guard labels distinguish stable trigger from transient pending level transitions.
 - **Settings screen** — profile selection, reservoir capacity/threshold, pulse size, mode toggle, vacation toggle, Wi-Fi provisioning, factory reset.
 - **Physical controls** — front button (BtnA) + side button (BtnB) navigation; DualButton for manual pump test (blue = pump, red = emergency stop).
 
 ### Network (Optional)
 - **Wi-Fi with captive portal** — AP mode for initial provisioning, auto-off after 5 min idle.
 - **Telegram bot** — interactive remote control via `/ag` with inline menu, status/history/profile views, safe watering pulse, stop, refill, vacation, mode toggle, and Wi-Fi portal launch.
-- **Daily heartbeat report** — automated snapshot with sensor readings, water budget, and trends.
+- **Alert deduplication** — water-level incidents generate one incident notification and one clear instead of flapping per tick.
+- **Daily heartbeat report** — automated inline Telegram snapshot with 24 h watering history, drying trends, and reservoir endurance estimate; one startup check is sent after 5 minutes, then the normal daily report targets dawn + 3 h.
 - **Reconnect with backoff** — Wi-Fi auto-reconnects (5 s → 5 min exponential backoff), never blocks the watering task.
 
 ### Implementation Status
@@ -69,6 +72,10 @@ Designed as an offline-first embedded appliance — all watering logic runs loca
 - **Dedicated history partition** — large sensor history is stored in a separate NVS partition to avoid starving config/runtime namespaces.
 - **Schema versioning** — automatic migration on firmware update; safe fallback to defaults on mismatch.
 - **Factory reset** — hold BtnA+B for 5 seconds from the Settings screen.
+
+### Logging
+- **Single-record logger contract** — application logs go through one `AGSerial` path, one write per logical record.
+- **Explicit truncation markers** — oversized or multiline records are normalized and tagged instead of silently corrupting adjacent lines.
 
 ---
 

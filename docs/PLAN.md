@@ -33,6 +33,17 @@ To są główne zasady projektu i nadal obowiązują w aktualnym kodzie.
 - konfiguracja i stan runtime mają przeżyć restart przez NVS,
 - pompa musi być chroniona przez timeout, cooldown i blokady poziomu wody.
 
+## Aktualny kontrakt poziomu wody i loggera
+
+Po ostatniej serii poprawek aktualny runtime kontrakt jest następujący:
+
+- `potMax` i `reservoirMin` nie sterują już safety z pojedynczego raw read; każdy sensor ma stan `raw`, `filtered`, `pendingTrip`, `pendingClear` i znaczniki czasu stabilizacji,
+- filtracja jest asymetryczna: szybki trip rzędu setek ms i wolniejszy clear rzędu sekund,
+- aktywna pompa zatrzymuje się już na `pendingTrip`, ale trwała blokada, wznowienie i estymacja budżetu używają stanu filtrowanego,
+- overflow w aktywnym cyklu przechodzi do `OVERFLOW_WAIT`, a pusty rezerwuar zatrzymuje aktywny cykl fail-safe,
+- alerty poziomu wody są deduplikowane do jednego incydentu i jednego clear,
+- `AGSerial` pozostaje jedyną ścieżką logowania aplikacyjnego i zapisuje jeden logiczny rekord na jedno wywołanie.
+
 ### Warstwy odpowiedzialności
 
 - warstwa hardware: sensory, PbHUB, pompy, przyciski,
@@ -190,7 +201,7 @@ Aktualne domyślne endpointy i wykładniki są per-pot:
 - `antiOverflowEnabled = true`
 - `overflowMaxWaitMs = 600000 ms`
 - `waterLevelUnknownPolicy = BLOCK`
-- `heatBlockTempC = 35.0`
+- `heatBlockTempC = 41.0`
 - `directSunLuxThreshold = 40000`
 - `duskWateringWindowMs = 7200000 ms`
 - `fallbackIntervalMs = 6 h`
@@ -691,8 +702,11 @@ Status Telegram pokazuje między innymi:
 Aktualna implementacja heartbeat jest prostsza niż dawne wersje planu:
 
 - ma mechanizm antyspamowy oparty o `lastHeartbeatMs`,
-- korzysta z prostego sprawdzania okna czasowego,
-- raport jest zbudowany z bieżącego stanu, nie z pełnego persisted analytics pipeline.
+- preferuje wysyłkę jako wiadomość inline Telegram; gdy nie ma aktywnego panelu, tworzy nową wiadomość inline do skonfigurowanych targetów,
+- zostawia jeden raport kontrolny `startup check` po `5 min` od uruchomienia,
+- właściwy daily celuje w okno około `3 h` po wykrytym świcie zamiast wysyłać raport zaraz po rozpoczęciu dnia,
+- fallback daily bez skalibrowanego `SolarClock` działa co `24 h` uptime,
+- raport jest zbudowany z bieżącego stanu oraz podsumowania historii podlewania z ostatnich `24 h`.
 
 ## Logowanie
 

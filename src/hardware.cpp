@@ -217,31 +217,40 @@ void WaterLevelSensor::init(PbHubBus* bus, uint8_t channel, uint8_t pin, bool ac
     _activeLow = activeLow;
 }
 
-ReadResult<WaterLevelState> WaterLevelSensor::readState(uint32_t nowMs) {
-    ReadResult<WaterLevelState> r;
+ReadResult<bool> WaterLevelSensor::readRawLevel(uint32_t nowMs) {
+    ReadResult<bool> r;
     r.readAtMs = nowMs;
 
     if (!_bus) {
         r.health = SensorHealth::FAIL;
-        r.value = WaterLevelState::UNKNOWN;
+        r.value = false;
         return r;
     }
 
-    auto raw = _bus->digitalRead(_channel, _pin);
+    r = _bus->digitalRead(_channel, _pin);
+    r.readAtMs = nowMs;
+    return r;
+}
+
+WaterLevelState WaterLevelSensor::normalizePhysicalLevel(bool physicalHigh) const {
+    if (_activeLow) {
+        return physicalHigh ? WaterLevelState::OK : WaterLevelState::TRIGGERED;
+    }
+    return physicalHigh ? WaterLevelState::TRIGGERED : WaterLevelState::OK;
+}
+
+ReadResult<WaterLevelState> WaterLevelSensor::readState(uint32_t nowMs) {
+    ReadResult<WaterLevelState> r;
+    r.readAtMs = nowMs;
+
+    auto raw = readRawLevel(nowMs);
     if (!raw.ok()) {
         r.health = SensorHealth::FAIL;
         r.value = WaterLevelState::UNKNOWN;
         return r;
     }
 
-    // PLAN.md: activeLow → TRIGGERED when LOW, OK when HIGH
-    // Ale w domenie: TRIGGERED = problem (overflow / reservoir empty)
-    bool physicalHigh = raw.value;
-    if (_activeLow) {
-        r.value = physicalHigh ? WaterLevelState::OK : WaterLevelState::TRIGGERED;
-    } else {
-        r.value = physicalHigh ? WaterLevelState::TRIGGERED : WaterLevelState::OK;
-    }
+    r.value = normalizePhysicalLevel(raw.value);
 
     return r;
 }
@@ -296,6 +305,104 @@ static constexpr uint8_t kLightReadAttempts = 2;
 static constexpr uint32_t kLuxStaleHoldMs = 120000;
 static constexpr uint16_t kLuxQuickReinitFailThreshold = 5;
 static constexpr uint32_t kLuxQuickReinitCooldownMs = 5000;
+
+struct WaterLevelFilterState {
+    bool initialized = false;
+    WaterLevelState rawState = WaterLevelState::UNKNOWN;
+    WaterLevelState filteredState = WaterLevelState::UNKNOWN;
+    bool rawHigh = false;
+    bool rawValid = false;
+    bool pendingTrip = false;
+    bool pendingClear = false;
+    uint32_t stableSinceMs = 0;
+    uint32_t pendingSinceMs = 0;
+};
+
+static WaterLevelStatus buildWaterLevelStatus(const WaterLevelFilterState& state,
+                                              bool activeLow) {
+    WaterLevelStatus status;
+    status.rawState = state.rawState;
+    status.filteredState = state.filteredState;
+    status.rawHigh = state.rawHigh;
+    status.rawValid = state.rawValid;
+    status.activeLow = activeLow;
+    status.pendingTrip = state.pendingTrip;
+    status.pendingClear = state.pendingClear;
+    status.unstable = state.pendingTrip || state.pendingClear || !state.rawValid;
+    status.stableSinceMs = state.stableSinceMs;
+    status.pendingSinceMs = state.pendingSinceMs;
+    return status;
+}
+
+static WaterLevelStatus updateWaterLevelFilter(WaterLevelFilterState& state,
+                                               const ReadResult<bool>& rawLevel,
+                                               const WaterLevelSensor& sensor,
+                                               uint32_t tripDebounceMs,
+                                               uint32_t clearDebounceMs,
+                                               uint32_t nowMs) {
+    if (!rawLevel.ok()) {
+        state.initialized = true;
+        state.rawValid = false;
+        state.rawState = WaterLevelState::UNKNOWN;
+        state.pendingTrip = false;
+        state.pendingClear = false;
+        state.pendingSinceMs = 0;
+        if (state.filteredState != WaterLevelState::UNKNOWN) {
+            state.filteredState = WaterLevelState::UNKNOWN;
+            state.stableSinceMs = nowMs;
+        }
+        return buildWaterLevelStatus(state, sensor.activeLow());
+    }
+
+    WaterLevelState desiredState = sensor.normalizePhysicalLevel(rawLevel.value);
+    state.rawHigh = rawLevel.value;
+    state.rawValid = true;
+    state.rawState = desiredState;
+
+    if (!state.initialized || state.filteredState == WaterLevelState::UNKNOWN) {
+        state.initialized = true;
+        state.filteredState = desiredState;
+        state.pendingTrip = false;
+        state.pendingClear = false;
+        state.pendingSinceMs = 0;
+        state.stableSinceMs = nowMs;
+        return buildWaterLevelStatus(state, sensor.activeLow());
+    }
+
+    if (desiredState == state.filteredState) {
+        state.pendingTrip = false;
+        state.pendingClear = false;
+        state.pendingSinceMs = 0;
+        return buildWaterLevelStatus(state, sensor.activeLow());
+    }
+
+    if (desiredState == WaterLevelState::TRIGGERED) {
+        if (!state.pendingTrip) {
+            state.pendingTrip = true;
+            state.pendingClear = false;
+            state.pendingSinceMs = nowMs;
+        } else if ((nowMs - state.pendingSinceMs) >= tripDebounceMs) {
+            state.filteredState = WaterLevelState::TRIGGERED;
+            state.pendingTrip = false;
+            state.pendingSinceMs = 0;
+            state.stableSinceMs = nowMs;
+        }
+        return buildWaterLevelStatus(state, sensor.activeLow());
+    }
+
+    if (!state.pendingClear) {
+        state.pendingClear = true;
+        state.pendingTrip = false;
+        state.pendingSinceMs = nowMs;
+    } else if ((nowMs - state.pendingSinceMs) >= clearDebounceMs) {
+        state.filteredState = WaterLevelState::OK;
+        state.pendingClear = false;
+        state.pendingSinceMs = 0;
+        state.stableSinceMs = nowMs;
+    }
+
+    return buildWaterLevelStatus(state, sensor.activeLow());
+}
 }
 
 bool LightSensor::init(uint8_t addr) {
@@ -821,7 +928,7 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     snap.timestampMs = nowMs;
 
     // Reservoir — wspólny
-    auto resState = _reservoirSensor.readState(nowMs);
+    auto resRawLevel = _reservoirSensor.readRawLevel(nowMs);
 
     // Throttled I2C failure logging (max every 10s)
     static uint32_t s_lastFailLogMs = 0;
@@ -835,6 +942,8 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     static uint16_t s_failCountLux = 0;
     static uint16_t s_failCountBaro = 0;
     static uint16_t s_failCountRes = 0;
+    static WaterLevelFilterState s_overflowFilter[kMaxPots] = {};
+    static WaterLevelFilterState s_reservoirFilter = {};
     static float s_lastValidLux = 0.0f;
     static bool s_hasValidLux = false;
     static uint32_t s_lastValidLuxMs = 0;
@@ -846,19 +955,33 @@ void HardwareManager::readAllSensors(uint32_t nowMs, const Config& cfg, SensorSn
     static uint8_t s_soilMedianCount[kMaxPots] = {};
     static uint8_t s_soilMedianHead[kMaxPots] = {};
 
-    if (!resState.ok()) s_failCountRes++;
+    if (!resRawLevel.ok()) s_failCountRes++;
+    WaterLevelStatus reservoirStatus = updateWaterLevelFilter(
+        s_reservoirFilter,
+        resRawLevel,
+        _reservoirSensor,
+        kWaterLevelTripDebounceMs,
+        kReservoirClearDebounceMs,
+        nowMs);
 
     // Per-pot
     for (uint8_t i = 0; i < cfg.numPots; i++) {
         if (!cfg.pots[i].enabled) continue;
 
         // Overflow sensor
-        auto potMaxState = _overflowSensors[i].readState(nowMs);
-        snap.pots[i].waterGuards.potMax = potMaxState.ok()
-            ? potMaxState.value : WaterLevelState::UNKNOWN;
-        if (!potMaxState.ok()) s_failCountOverflow[i]++;
-        snap.pots[i].waterGuards.reservoirMin = resState.ok()
-            ? resState.value : WaterLevelState::UNKNOWN;
+        auto potMaxRawLevel = _overflowSensors[i].readRawLevel(nowMs);
+        WaterLevelStatus potMaxStatus = updateWaterLevelFilter(
+            s_overflowFilter[i],
+            potMaxRawLevel,
+            _overflowSensors[i],
+            kWaterLevelTripDebounceMs,
+            kPotOverflowClearDebounceMs,
+            nowMs);
+        snap.pots[i].waterGuards.potMax = potMaxStatus.filteredState;
+        snap.pots[i].waterGuards.potMaxStatus = potMaxStatus;
+        if (!potMaxRawLevel.ok()) s_failCountOverflow[i]++;
+        snap.pots[i].waterGuards.reservoirMin = reservoirStatus.filteredState;
+        snap.pots[i].waterGuards.reservoirMinStatus = reservoirStatus;
 
         // Moisture ADC
         auto rawResult = _soilSensors[i].readRaw(nowMs);

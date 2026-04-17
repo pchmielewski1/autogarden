@@ -8,6 +8,7 @@
 #include "config.h"
 #include <Preferences.h>
 #include <Arduino.h>
+#include <cmath>
 #include "log_serial.h"
 
 #define Serial AGSerial
@@ -71,6 +72,14 @@ bool normalizeFixedPumpParameters(Config& cfg) {
     return changed;
 }
 
+bool normalizeHeatBlockThreshold(Config& cfg) {
+    if (std::fabs(cfg.heatBlockTempC - kLegacyHeatBlockTempC) < 0.05f) {
+        cfg.heatBlockTempC = kDefaultHeatBlockTempC;
+        return true;
+    }
+    return false;
+}
+
 bool moistureEndpointsValid(uint16_t dryRaw, uint16_t wetRaw) {
     if (dryRaw > 4095 || wetRaw > 4095) {
         return false;
@@ -122,7 +131,7 @@ struct LegacyConfigV4 {
     bool antiOverflowEnabled = true;
     uint32_t overflowMaxWaitMs = 600000;
     UnknownPolicy waterLevelUnknownPolicy = UnknownPolicy::BLOCK;
-    float heatBlockTempC = 35.0f;
+    float heatBlockTempC = kLegacyHeatBlockTempC;
     float directSunLuxThreshold = 40000.0f;
     bool morningWateringEnabled = false;
     uint32_t duskWateringWindowMs = 7200000;
@@ -175,7 +184,7 @@ struct LegacyConfigV5 {
     bool antiOverflowEnabled = true;
     uint32_t overflowMaxWaitMs = 600000;
     UnknownPolicy waterLevelUnknownPolicy = UnknownPolicy::BLOCK;
-    float heatBlockTempC = 35.0f;
+    float heatBlockTempC = kLegacyHeatBlockTempC;
     float directSunLuxThreshold = 40000.0f;
     bool morningWateringEnabled = false;
     uint32_t duskWateringWindowMs = 7200000;
@@ -456,6 +465,7 @@ bool configLoad(Config& cfg) {
             return false;
         }
         migrateConfigV4ToV5(legacy, cfg);
+        normalizeHeatBlockThreshold(cfg);
         if (!configValidate(cfg)) {
             Serial.println("[CONFIG] Migrated config failed validation — using defaults");
             configLoadDefaults(cfg);
@@ -475,6 +485,7 @@ bool configLoad(Config& cfg) {
             return false;
         }
         migrateConfigV5ToV6(legacy, cfg);
+        normalizeHeatBlockThreshold(cfg);
         if (!configValidate(cfg)) {
             Serial.println("[CONFIG] Migrated v5 config failed validation — using defaults");
             configLoadDefaults(cfg);
@@ -492,6 +503,7 @@ bool configLoad(Config& cfg) {
     }
 
     bool fixedPumpParamsChanged = normalizeFixedPumpParameters(cfg);
+    bool heatBlockThresholdChanged = normalizeHeatBlockThreshold(cfg);
 
     if (!configValidate(cfg)) {
         Serial.println("[CONFIG] Loaded config failed validation — using defaults");
@@ -499,9 +511,15 @@ bool configLoad(Config& cfg) {
         return false;
     }
 
-    if (fixedPumpParamsChanged) {
+    if (fixedPumpParamsChanged || heatBlockThresholdChanged) {
         configSave(cfg);
-        Serial.println("[CONFIG] Applied fixed M5 Watering pump parameters");
+        if (fixedPumpParamsChanged) {
+            Serial.println("[CONFIG] Applied fixed M5 Watering pump parameters");
+        }
+        if (heatBlockThresholdChanged) {
+            Serial.printf("[CONFIG] Raised default heat block threshold to %.1fC\n",
+                          cfg.heatBlockTempC);
+        }
     }
 
     Serial.printf("[CONFIG] Loaded OK: numPots=%d, mode=%s, reservoir=%.0fml\n",

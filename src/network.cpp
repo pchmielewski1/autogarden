@@ -372,6 +372,42 @@ static void forEachChatId(const char* chatIds, Callback cb) {
     }
 }
 
+bool telegramSendInlineMessage(const char* msg,
+                               const TelegramStatusData& status,
+                               const NetConfig& netCfg) {
+    if (!msg || msg[0] == '\0') {
+        return false;
+    }
+    if (telegramHasActivePanel()) {
+        return telegramSendToActivePanel(msg, status, netCfg);
+    }
+    if (!chatIdListHasAny(netCfg.telegramChatIds) || WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+
+    buildTelegramPanelKeyboard(status,
+                               TelegramPanelView::MENU,
+                               status.selectedPot,
+                               g_tgKeyboardBuf,
+                               sizeof(g_tgKeyboardBuf));
+
+    bool anyOk = false;
+    forEachChatId(netCfg.telegramChatIds, [&](const char* token) {
+        bool sent = telegramSendInlineKeyboardToChat(String(token),
+                                                     msg,
+                                                     g_tgKeyboardBuf,
+                                                     netCfg,
+                                                     0,
+                                                     1,
+                                                     0,
+                                                     TelegramPanelView::MENU,
+                                                     status.selectedPot,
+                                                     false);
+        anyOk = anyOk || sent;
+    });
+    return anyOk;
+}
+
 void applyLocalTelegramConfig(NetConfig& netCfg) {
     const char* cfgName = netCfg.telegramBotName[0] ? netCfg.telegramBotName : AG_TELEGRAM_BOT_NAME;
     safeCopy(g_tgConfiguredBotName, sizeof(g_tgConfiguredBotName), cfgName);
@@ -548,7 +584,8 @@ static bool telegramWaterBlocked(const TelegramStatusData& status,
             safeCopy(reasonBuf, reasonBufSize, "Blocked: overflow sensor triggered.");
             return true;
         }
-        if (pot.waterGuards.potMax == WaterLevelState::UNKNOWN) {
+        if (status.config.waterLevelUnknownPolicy == UnknownPolicy::BLOCK
+            && pot.waterGuards.potMax == WaterLevelState::UNKNOWN) {
             safeCopy(reasonBuf, reasonBufSize, "Blocked: overflow sensor unknown.");
             return true;
         }
@@ -556,7 +593,8 @@ static bool telegramWaterBlocked(const TelegramStatusData& status,
             safeCopy(reasonBuf, reasonBufSize, "Blocked: reservoir sensor triggered.");
             return true;
         }
-        if (pot.waterGuards.reservoirMin == WaterLevelState::UNKNOWN) {
+        if (status.config.waterLevelUnknownPolicy == UnknownPolicy::BLOCK
+            && pot.waterGuards.reservoirMin == WaterLevelState::UNKNOWN) {
             safeCopy(reasonBuf, reasonBufSize, "Blocked: reservoir sensor unknown.");
             return true;
         }
@@ -2707,26 +2745,57 @@ void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize) {
     formatDurationCompact(data.uptimeMs, uptimeBuf, sizeof(uptimeBuf));
     formatDaysRemainingShort(data.budget.daysRemaining, daysBuf, sizeof(daysBuf));
 
+    float estimatedDays = NAN;
+    if (!isnan(data.budget.daysRemaining) && data.budget.daysRemaining < 900.0f) {
+        estimatedDays = data.budget.daysRemaining;
+    } else if (data.pumped24hMl > 1.0f) {
+        estimatedDays = data.budget.reservoirCurrentMl / data.pumped24hMl;
+    }
+
+    const char* title = (data.kind == DailyReportData::Kind::STARTUP_CHECK)
+        ? "▣ DAILY REPORT [startup check]\n"
+        : "▣ DAILY REPORT\n";
+
     pos = appendFmt(buf, bufSize, pos,
-                    "▣ DAILY REPORT\n"
+                    "%s"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "🪣 %.0f / %.0f ml | left %s%s\n"
-                    "🌡 %.1fC | 💧 %.0f%% | ☀ %.0f lx\n"
-                    "⏱ %s\n",
+                    "🪣 %.0f / %.0f ml%s\n"
+                    "📉 24h use %.0f ml / %u cycles | ",
+                    title,
                     data.budget.reservoirCurrentMl,
                     data.budget.reservoirCapacityMl,
-                    daysBuf,
                     data.budget.reservoirLow ? " | LOW" : "",
+                    data.pumped24hMl,
+                    static_cast<unsigned>(data.wateringEvents24h));
+
+    if (!isnan(estimatedDays)) {
+        pos = appendFmt(buf, bufSize, pos, "est %.1fd\n", estimatedDays);
+    } else {
+        pos = appendFmt(buf, bufSize, pos, "est learning\n");
+    }
+
+    pos = appendFmt(buf, bufSize, pos,
+                    "🌗 %s | solar %s | ⏱ %s\n"
+                    "🌡 %.1fC | 💧 %.0f%% | ☀ %.0f lx\n",
+                    telegramDuskPhasePretty(data.duskPhase),
+                    data.solarCalibrated ? "cal" : "learn",
+                    uptimeBuf,
                     data.sensors.env.tempC,
                     data.sensors.env.humidityPct,
-                    data.sensors.env.lux,
-                    uptimeBuf);
+                    data.sensors.env.lux);
+
+    if (data.kind == DailyReportData::Kind::STARTUP_CHECK) {
+        pos = appendFmt(buf, bufSize, pos,
+                        "🕘 schedule boot+5m, then dawn+3h\n");
+    }
 
     for (uint8_t i = 0; i < data.config.numPots; ++i) {
         if (!data.config.pots[i].enabled) continue;
         const PotSensorSnapshot& ps = data.sensors.pots[i];
         const PlantProfile& prof = getActiveProfile(data.config, i);
         const TrendState& ts = data.trends[i];
+        char sinceBuf[24] = {};
+        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
         float targetPct = prof.targetMoisturePct;
         if (data.config.vacationMode) {
             targetPct -= data.config.vacationTargetReductionPct;
@@ -2735,19 +2804,26 @@ void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize) {
 
         pos = appendFmt(buf, bufSize, pos,
                 "\n🪴 POT %u | %s\n"
-                        "  water %.1f%% | target %.1f%% | ema %.1f%%\n",
+                        "  water %.1f%% | target %.1f%% | ema %.1f%%\n"
+                        "  24h water %.0f ml / %u cycles | last %s\n",
                         static_cast<unsigned>(i + 1),
                         prof.name ? prof.name : "?",
                         ps.moisturePct,
                         targetPct,
-                        ps.moistureEma);
+                        ps.moistureEma,
+                        data.pumped24hMlPerPot[i],
+                        static_cast<unsigned>(data.wateringEvents24hPerPot[i]),
+                        sinceBuf);
 
         if (ts.baselineCalibrated && ts.count > 0) {
             uint8_t lastIdx = (ts.headIdx == 0) ? (TrendState::kHours - 1) : (ts.headIdx - 1);
+            float avg6h = trendRecentAverage(ts, 6);
             pos = appendFmt(buf, bufSize, pos,
-                            "  trend %s %.2f%%/h | base %.2f%%/h\n",
+                            "  trend 1h %s %.2f | 6h %s %.2f | base %.2f %%/h\n",
                             telegramTrendArrow(ts.hourlyDeltas[lastIdx]),
                             ts.hourlyDeltas[lastIdx],
+                            telegramTrendArrow(avg6h),
+                            avg6h,
                             ts.normalDryingRate);
         } else {
             pos = appendFmt(buf, bufSize, pos, "  trend learning baseline\n");
@@ -2763,34 +2839,53 @@ bool isDailyHeartbeatTime(uint32_t nowMs, const SolarClock& clk,
                           const DuskDetector& det,
                           NetworkState& ns)
 {
-    // Debounce: max 1 heartbeat per 20h
+    static constexpr uint32_t kDailyHeartbeatMinGapMs = 20UL * 3600 * 1000;
+    static constexpr uint32_t kDailyHeartbeatOffsetMs = 3UL * 3600 * 1000;
+    static constexpr uint32_t kDailyHeartbeatWindowMs = 10UL * 60 * 1000;
+
+    // Debounce: max 1 daily heartbeat per ~day window.
     if (ns.lastHeartbeatMs > 0 &&
-        (nowMs - ns.lastHeartbeatMs) < 20UL * 3600 * 1000) {
+        (nowMs - ns.lastHeartbeatMs) < kDailyHeartbeatMinGapMs) {
         return false;
     }
 
-    // Strategy 1: SolarClock (dawn + 30 min)
+    // Strategy 1: SolarClock (3h after dawn).
     if (clk.calibrated) {
-        uint32_t estDawn = estimateNextDawn(det, clk, nowMs);
-        if (estDawn > 0) {
-            uint32_t target = estDawn + 30UL * 60 * 1000;
-            int32_t diff = static_cast<int32_t>(nowMs - target);
-            if (abs(diff) < 5 * 60 * 1000) {
-                if (!ns.heartbeatSentToday) {
-                    ns.heartbeatSentToday = true;
-                    ns.lastHeartbeatMs = nowMs;
-                    return true;
-                }
-            } else {
-                ns.heartbeatSentToday = false;
+        uint32_t targetDawnMs = 0;
+        uint32_t targetMs = 0;
+
+        if ((det.phase == DuskPhase::DAY || det.phase == DuskPhase::DUSK_TRANSITION)
+            && det.lastDawnMs > 0) {
+            uint32_t todayTargetMs = det.lastDawnMs + kDailyHeartbeatOffsetMs;
+            if (nowMs <= (todayTargetMs + kDailyHeartbeatWindowMs)) {
+                targetDawnMs = det.lastDawnMs;
+                targetMs = todayTargetMs;
+            }
+        }
+
+        if (targetMs == 0) {
+            uint32_t estDawn = estimateNextDawn(det, clk, nowMs);
+            if (estDawn > 0) {
+                targetDawnMs = estDawn;
+                targetMs = estDawn + kDailyHeartbeatOffsetMs;
+            }
+        }
+
+        if (targetMs > 0) {
+            int32_t diff = static_cast<int32_t>(nowMs - targetMs);
+            if (abs(diff) <= static_cast<int32_t>(kDailyHeartbeatWindowMs)
+                && ns.lastDailyAnchorMs != targetDawnMs) {
+                ns.lastDailyAnchorMs = targetDawnMs;
+                ns.lastHeartbeatMs = nowMs;
+                return true;
             }
             return false;
         }
     }
 
-    // Strategy 2: fallback — every 24h from last heartbeat (or 5 min from boot)
+    // Strategy 2: fallback — every 24h of uptime.
     if (ns.lastHeartbeatMs == 0) {
-        if (nowMs > 5UL * 60 * 1000) {
+        if (nowMs >= 24UL * 3600 * 1000) {
             ns.lastHeartbeatMs = nowMs;
             return true;
         }

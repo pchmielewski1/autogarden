@@ -18,6 +18,80 @@ static const char* skipSpaces(const char* s) {
     return s;
 }
 
+static void forceTailMarker(char* text, size_t textSize, const char* marker) {
+    if (!text || textSize == 0 || !marker) {
+        return;
+    }
+
+    if (strstr(text, marker) != nullptr) {
+        return;
+    }
+
+    size_t markerLen = strlen(marker);
+    if (textSize <= markerLen + 1) {
+        return;
+    }
+
+    size_t len = strlen(text);
+    if (len + markerLen >= textSize) {
+        len = textSize - markerLen - 1;
+        text[len] = '\0';
+        while (len > 0 && text[len - 1] == ' ') {
+            text[--len] = '\0';
+        }
+    }
+
+    strncat(text, marker, textSize - strlen(text) - 1);
+}
+
+static void sanitizeLogRecord(const char* in,
+                              char* out,
+                              size_t outSize,
+                              bool& hadEmbeddedNewline,
+                              bool& truncated) {
+    hadEmbeddedNewline = false;
+    truncated = false;
+    if (!out || outSize == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    if (!in) {
+        return;
+    }
+
+    size_t w = 0;
+    bool lastWasSpace = false;
+    for (size_t i = 0; in[i] != '\0'; ++i) {
+        char ch = in[i];
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            hadEmbeddedNewline = true;
+            ch = ' ';
+        }
+
+        bool isSpace = (ch == ' ' || ch == '\t');
+        if (isSpace && lastWasSpace) {
+            continue;
+        }
+
+        if (w + 1 >= outSize) {
+            truncated = true;
+            break;
+        }
+
+        out[w++] = isSpace ? ' ' : ch;
+        lastWasSpace = isSpace;
+    }
+
+    while (w > 0 && out[w - 1] == ' ') {
+        --w;
+    }
+    out[w] = '\0';
+}
+
 static void escapeForQuotes(const char* in, char* out, size_t outSize) {
     if (!out || outSize == 0) {
         return;
@@ -53,7 +127,7 @@ static const char* normalizeLogLine(const char* in, char* out, size_t outSize) {
             size_t tagLen = static_cast<size_t>(end - t + 1);
             const char* msg = skipSpaces(end + 1);
             if (*msg == ':' || *msg == '-') msg = skipSpaces(msg + 1);
-            char escaped[512];
+            char escaped[768];
             escapeForQuotes(msg, escaped, sizeof(escaped));
             snprintf(out, outSize, "%.*s event=msg text=\"%s\"",
                      static_cast<int>(tagLen), t, escaped);
@@ -61,7 +135,7 @@ static const char* normalizeLogLine(const char* in, char* out, size_t outSize) {
         }
     }
 
-    char escaped[512];
+    char escaped[768];
     escapeForQuotes(t, escaped, sizeof(escaped));
     snprintf(out, outSize, "[LOG] event=msg text=\"%s\"", escaped);
     return out;
@@ -102,57 +176,42 @@ static size_t writePrefixedLines(const char* text) {
         locked = false;
     }
 
-    const char* p = text;
     size_t outBytes = 0;
 
-    while (*p) {
-        const char* lineEnd = strchr(p, '\n');
-        size_t lineLen = lineEnd ? static_cast<size_t>(lineEnd - p) : strlen(p);
+    char sanitized[768];
+    bool hadEmbeddedNewline = false;
+    bool truncated = false;
+    sanitizeLogRecord(text, sanitized, sizeof(sanitized), hadEmbeddedNewline, truncated);
 
-        char prefix[32];
-        uint32_t now = millis();
-        uint32_t seq = nextLogSeq();
-        int n = snprintf(prefix, sizeof(prefix), "[%10lu|%06lu] ",
-                         static_cast<unsigned long>(now),
-                         static_cast<unsigned long>(seq));
+    char normalized[832];
+    const char* finalLine = normalizeLogLine(sanitized, normalized, sizeof(normalized));
 
-        if (lineLen > 0) {
-            char lineBuf[768];
-            if (lineLen >= sizeof(lineBuf)) {
-                lineLen = sizeof(lineBuf) - 1;
-            }
-            memcpy(lineBuf, p, lineLen);
-            lineBuf[lineLen] = '\0';
+    char payload[896];
+    int payloadLen = snprintf(payload, sizeof(payload), "%s", finalLine);
+    if (payloadLen < 0) {
+        payload[0] = '\0';
+    }
+    if (hadEmbeddedNewline) {
+        forceTailMarker(payload, sizeof(payload), " multiline=yes");
+    }
+    if (truncated || payloadLen >= static_cast<int>(sizeof(payload))) {
+        forceTailMarker(payload, sizeof(payload), " trunc=yes");
+    }
 
-            char normalized[800];
-            const char* finalLine = normalizeLogLine(lineBuf, normalized, sizeof(normalized));
-            char fullLine[960];
-            int fullLen = snprintf(fullLine, sizeof(fullLine), "%s%s\n",
-                                   (n > 0) ? prefix : "",
-                                   finalLine);
-            if (fullLen > 0) {
-                size_t writeLen = static_cast<size_t>(fullLen);
-                if (writeLen >= sizeof(fullLine)) {
-                    writeLen = sizeof(fullLine) - 1;
-                    fullLine[writeLen - 1] = '\n';
-                    fullLine[writeLen] = '\0';
-                }
-                ::Serial.write(reinterpret_cast<const uint8_t*>(fullLine), writeLen);
-                outBytes += writeLen;
-            }
-        } else if (n > 0) {
-            char fullLine[64];
-            int fullLen = snprintf(fullLine, sizeof(fullLine), "%s\n", prefix);
-            if (fullLen > 0) {
-                ::Serial.write(reinterpret_cast<const uint8_t*>(fullLine), static_cast<size_t>(fullLen));
-                outBytes += static_cast<size_t>(fullLen);
-            }
+    char fullLine[1024];
+    int fullLen = snprintf(fullLine, sizeof(fullLine), "[%10lu|%06lu] %s\n",
+                           static_cast<unsigned long>(millis()),
+                           static_cast<unsigned long>(nextLogSeq()),
+                           payload[0] != '\0' ? payload : "[LOG] event=msg text=\"\"");
+    if (fullLen > 0) {
+        size_t writeLen = static_cast<size_t>(fullLen);
+        if (writeLen >= sizeof(fullLine)) {
+            writeLen = sizeof(fullLine) - 1;
+            fullLine[writeLen - 1] = '\n';
+            fullLine[writeLen] = '\0';
         }
-
-        if (!lineEnd) {
-            break;
-        }
-        p = lineEnd + 1;
+        ::Serial.write(reinterpret_cast<const uint8_t*>(fullLine), writeLen);
+        outBytes += writeLen;
     }
 
     if (locked && s_logMutex) {
@@ -190,7 +249,7 @@ size_t LogSerialProxy::printf(const char* fmt, ...) {
         return 0;
     }
 
-    char buffer[512];
+    char buffer[768];
     va_list args;
     va_start(args, fmt);
     int n = vsnprintf(buffer, sizeof(buffer), fmt, args);
@@ -202,6 +261,7 @@ size_t LogSerialProxy::printf(const char* fmt, ...) {
 
     if (n >= static_cast<int>(sizeof(buffer))) {
         buffer[sizeof(buffer) - 1] = '\0';
+        forceTailMarker(buffer, sizeof(buffer), " trunc=yes");
     }
 
     return writePrefixedLines(buffer);

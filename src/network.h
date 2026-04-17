@@ -48,7 +48,9 @@ struct NetworkState {
 
     // Telegram heartbeat
     uint32_t          lastHeartbeatMs      = 0;
-    bool              heartbeatSentToday   = false;
+    uint32_t          lastDailyAnchorMs    = 0;
+    bool              startupHeartbeatSent = false;
+    uint32_t          lastStartupHeartbeatAttemptMs = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -100,6 +102,9 @@ const char* telegramConfiguredBotName();
 uint8_t telegramConfiguredTargetCount(const NetConfig& netCfg);
 bool telegramInteractionActive(uint32_t nowMs);
 bool telegramHasActivePanel();
+bool telegramSendInlineMessage(const char* msg,
+                               const TelegramStatusData& status,
+                               const NetConfig& netCfg);
 bool telegramSendToActivePanel(const char* msg,
                                const TelegramStatusData& status,
                                const NetConfig& netCfg);
@@ -115,17 +120,30 @@ bool telegramSend(const char* msg, const NetConfig& netCfg,
 // Formatuj raport dzienny
 // (wymaga snapshot danych — przekazywany jako const ref)
 struct DailyReportData {
+    enum class Kind : uint8_t {
+        STARTUP_CHECK = 0,
+        DAILY = 1,
+    };
+
     SensorSnapshot  sensors;
     WaterBudget     budget;
     TrendState      trends[kMaxPots];
     Config          config;
+    uint32_t        lastCycleDoneMs[kMaxPots] = {};
+    float           pumped24hMl = 0.0f;
+    float           pumped24hMlPerPot[kMaxPots] = {};
+    uint16_t        wateringEvents24h = 0;
+    uint16_t        wateringEvents24hPerPot[kMaxPots] = {};
+    DuskPhase       duskPhase = DuskPhase::NIGHT;
+    bool            solarCalibrated = false;
+    Kind            kind = Kind::DAILY;
     uint32_t        uptimeMs;
 };
 
 void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize);
 void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_t bufSize);
 
-// Sprawdź czy pora na heartbeat (SolarClock / fallback 24h)
+// Sprawdź czy pora na heartbeat (SolarClock / fallback 24h bez boot burst)
 bool isDailyHeartbeatTime(uint32_t nowMs, const SolarClock& clk,
                           const DuskDetector& det,
                           NetworkState& ns);

@@ -60,12 +60,96 @@ static WateringFeedbackCode feedbackCodeFromSafetyReason(const char* reason) {
     return WateringFeedbackCode::NONE;
 }
 
+static bool isReservoirSafetyCode(WateringFeedbackCode code) {
+    return code == WateringFeedbackCode::SAFETY_BLOCK_TANK_EMPTY
+        || code == WateringFeedbackCode::SAFETY_BLOCK_RESERVOIR_EMPTY
+        || code == WateringFeedbackCode::SAFETY_BLOCK_TANK_SENSOR_UNKNOWN;
+}
+
+static void accountInterruptedPulse(uint32_t nowMs,
+                                    uint8_t potIdx,
+                                    const PotConfig& potCfg,
+                                    WateringCycle& cycle,
+                                    WaterBudget& budget,
+                                    PumpActuator& pump) {
+    if (cycle.phase != WateringPhase::PULSE || !pump.isOn()) {
+        return;
+    }
+
+    uint32_t pumpedMs = pump.onDuration(nowMs);
+    if (pumpedMs == 0) {
+        return;
+    }
+
+    cycle.totalPumpedMs += pumpedMs;
+    float pumpedMl = (pumpedMs / 1000.0f) * potCfg.pumpMlPerSec;
+    cycle.totalPumpedMl += pumpedMl;
+    addPumped(budget, pumpedMl, potIdx);
+}
+
+static bool isActiveCyclePhase(WateringPhase phase) {
+    return phase == WateringPhase::PULSE
+        || phase == WateringPhase::SOAK
+        || phase == WateringPhase::MEASURING
+        || phase == WateringPhase::OVERFLOW_WAIT;
+}
+
+static void syncWaterAlertLatches(const SensorSnapshot& sensors, ActuatorState& actuator) {
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        if (sensors.pots[i].waterGuards.potMax == WaterLevelState::OK) {
+            actuator.overflowIncidentLatched[i] = false;
+            actuator.overflowUnknownLatched[i] = false;
+        }
+    }
+
+    if (sensors.pots[0].waterGuards.reservoirMin == WaterLevelState::OK) {
+        if (actuator.reservoirIncidentLatched || actuator.reservoirUnknownLatched) {
+            actuator.reservoirClearPending = true;
+        }
+        actuator.reservoirIncidentLatched = false;
+        actuator.reservoirUnknownLatched = false;
+    }
+}
+
 static void publishFeedback(ActuatorState& actuator,
                             uint8_t potIdx,
                             WateringFeedbackCode code,
                             float value1 = 0.0f,
                             float value2 = 0.0f,
                             uint8_t pulseCount = 0) {
+    switch (code) {
+        case WateringFeedbackCode::OVERFLOW_DETECTED:
+        case WateringFeedbackCode::SAFETY_BLOCK_OVERFLOW_RISK:
+            if (actuator.overflowIncidentLatched[potIdx]) {
+                return;
+            }
+            actuator.overflowIncidentLatched[potIdx] = true;
+            break;
+        case WateringFeedbackCode::SAFETY_BLOCK_OVERFLOW_SENSOR_UNKNOWN:
+            if (actuator.overflowUnknownLatched[potIdx]) {
+                return;
+            }
+            actuator.overflowUnknownLatched[potIdx] = true;
+            break;
+        case WateringFeedbackCode::SAFETY_BLOCK_TANK_EMPTY:
+        case WateringFeedbackCode::SAFETY_BLOCK_RESERVOIR_EMPTY:
+            if (actuator.reservoirIncidentLatched) {
+                return;
+            }
+            actuator.reservoirIncidentLatched = true;
+            actuator.reservoirClearPending = false;
+            break;
+        case WateringFeedbackCode::SAFETY_BLOCK_TANK_SENSOR_UNKNOWN:
+            if (actuator.reservoirUnknownLatched) {
+                return;
+            }
+            actuator.reservoirUnknownLatched = true;
+            actuator.reservoirClearPending = false;
+            break;
+        default:
+            break;
+    }
+
     actuator.lastFeedbackSeq[potIdx]++;
     actuator.lastFeedbackCode[potIdx] = code;
     actuator.lastFeedbackValue1[potIdx] = value1;
@@ -346,6 +430,8 @@ void wateringTick(uint32_t nowMs,
     static uint32_t s_lastSafetyLogMs[kMaxPots] = {};
     static char s_lastSafetyReason[kMaxPots][32] = {};
 
+    syncWaterAlertLatches(sensors, actuator);
+
     for (uint8_t potIdx = 0; potIdx < cfg.numPots; ++potIdx) {
         if (!cfg.pots[potIdx].enabled) continue;
 
@@ -355,13 +441,68 @@ void wateringTick(uint32_t nowMs,
         const PlantProfile& prof = getActiveProfile(cfg, potIdx);
         PumpActuator& pump = hw.pump(potIdx);
 
+        if (cfg.antiOverflowEnabled
+            && (potSens.waterGuards.potMax == WaterLevelState::TRIGGERED
+                || potSens.waterGuards.potMaxStatus.pendingTrip)
+            && isActiveCyclePhase(cycle.phase)
+            && cycle.phase != WateringPhase::OVERFLOW_WAIT) {
+            accountInterruptedPulse(nowMs, potIdx, potCfg, cycle, budget, pump);
+            if (pump.isOn()) {
+                pump.off(nowMs, "OVERFLOW_RISK");
+                actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
+            }
+            cycle.phase = WateringPhase::OVERFLOW_WAIT;
+            cycle.phaseStartMs = nowMs;
+            Serial.printf("[POT%d] OVERFLOW_STOP state=%s pending=%s pulse=%u\n",
+                          potIdx,
+                          potSens.waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "OK",
+                          potSens.waterGuards.potMaxStatus.pendingTrip ? "yes" : "no",
+                          cycle.pulseCount);
+            continue;
+        }
+
+        if (cfg.antiOverflowEnabled
+            && (potSens.waterGuards.reservoirMin == WaterLevelState::TRIGGERED
+                || potSens.waterGuards.reservoirMinStatus.pendingTrip)
+            && isActiveCyclePhase(cycle.phase)) {
+            accountInterruptedPulse(nowMs, potIdx, potCfg, cycle, budget, pump);
+            if (pump.isOn()) {
+                pump.off(nowMs, "TANK_EMPTY");
+                actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
+            }
+            cycle.phase = WateringPhase::BLOCKED;
+            cycle.phaseStartMs = nowMs;
+            Serial.printf("[POT%d] RESERVOIR_STOP state=%s pending=%s phase=%d\n",
+                          potIdx,
+                          potSens.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "OK",
+                          potSens.waterGuards.reservoirMinStatus.pendingTrip ? "yes" : "no",
+                          static_cast<int>(cycle.phase));
+            continue;
+        }
+
         // --- EXTENDED SAFETY (per-pot + global) ---
-        SafetyResult safety = evaluateExtendedSafety(
-            nowMs, potSens, cfg, potCfg, budget, actuator, potIdx);
+        SafetyResult safety;
+        if (cycle.phase == WateringPhase::OVERFLOW_WAIT) {
+            if (cfg.waterLevelUnknownPolicy == UnknownPolicy::BLOCK
+                && potSens.waterGuards.potMax == WaterLevelState::UNKNOWN) {
+                safety = { true, "OVERFLOW_SENSOR_UNKNOWN" };
+            } else if (potSens.waterGuards.reservoirMin == WaterLevelState::TRIGGERED) {
+                safety = { true, "TANK_EMPTY" };
+            } else if (cfg.waterLevelUnknownPolicy == UnknownPolicy::BLOCK
+                       && potSens.waterGuards.reservoirMin == WaterLevelState::UNKNOWN) {
+                safety = { true, "TANK_SENSOR_UNKNOWN" };
+            } else if (budget.reservoirLow && budget.reservoirCurrentMl <= 0.0f) {
+                safety = { true, "RESERVOIR_EMPTY" };
+            }
+        } else {
+            safety = evaluateExtendedSafety(
+                nowMs, potSens, cfg, potCfg, budget, actuator, potIdx);
+        }
 
         if (safety.hardBlock) {
             WateringPhase prevPhase = cycle.phase;
             if (cycle.phase == WateringPhase::PULSE && pump.isOn()) {
+                accountInterruptedPulse(nowMs, potIdx, potCfg, cycle, budget, pump);
                 pump.off(nowMs, safety.reason);
                 actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
             }
@@ -382,6 +523,7 @@ void wateringTick(uint32_t nowMs,
             if (reasonChanged || prevPhase != WateringPhase::BLOCKED) {
                 WateringFeedbackCode code = feedbackCodeFromSafetyReason(reason);
                 if (code != WateringFeedbackCode::NONE) {
+                    actuator.activeSafetyCode[potIdx] = code;
                     publishFeedback(actuator, potIdx, code);
                 }
             }
@@ -533,10 +675,8 @@ void wateringTick(uint32_t nowMs,
                 if (potSens.waterGuards.potMax == WaterLevelState::TRIGGERED) {
                     cycle.phase = WateringPhase::OVERFLOW_WAIT;
                     cycle.phaseStartMs = nowMs;
-                    Serial.printf("[POT%d] OVERFLOW_DETECTED after pulse %d\n",
+                    Serial.printf("[POT%d] OVERFLOW_STOP after pulse %d\n",
                                   potIdx, cycle.pulseCount);
-                    publishFeedback(actuator, potIdx, WateringFeedbackCode::OVERFLOW_DETECTED,
-                                    potSens.moisturePct, 0.0f, cycle.pulseCount);
                 } else {
                     cycle.phase = WateringPhase::SOAK;
                     cycle.phaseStartMs = nowMs;
@@ -545,12 +685,14 @@ void wateringTick(uint32_t nowMs,
 
             // Hard timeout safety — pompa nie powinna być ON dłużej niż pumpOnMsMax
             if (pump.isOn() && pump.onDuration(nowMs) > cfg.pumpOnMsMax) {
+                uint32_t timeoutMs = pump.onDuration(nowMs);
+                accountInterruptedPulse(nowMs, potIdx, potCfg, cycle, budget, pump);
                 pump.off(nowMs, "HARD_TIMEOUT");
                 actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
                 cycle.phase = WateringPhase::BLOCKED;
                 Serial.printf("[POT%d] HARD_TIMEOUT pump forced off\n", potIdx);
                 publishFeedback(actuator, potIdx, WateringFeedbackCode::HARD_TIMEOUT,
-                                pump.onDuration(nowMs), cfg.pumpOnMsMax, cycle.pulseCount);
+                                timeoutMs, cfg.pumpOnMsMax, cycle.pulseCount);
             }
             break;
         }
@@ -599,8 +741,6 @@ void wateringTick(uint32_t nowMs,
             } else if (potSens.waterGuards.potMax == WaterLevelState::TRIGGERED) {
                 cycle.phase = WateringPhase::OVERFLOW_WAIT;
                 cycle.phaseStartMs = nowMs;
-                publishFeedback(actuator, potIdx, WateringFeedbackCode::OVERFLOW_DETECTED,
-                                moistureNow, 0.0f, cycle.pulseCount);
             } else {
                 // Kolejny puls
                 cycle.phase = WateringPhase::PULSE;
@@ -613,7 +753,17 @@ void wateringTick(uint32_t nowMs,
         case WateringPhase::OVERFLOW_WAIT: {
             uint32_t elapsed = nowMs - cycle.phaseStartMs;
 
-            if (potSens.waterGuards.potMax != WaterLevelState::TRIGGERED) {
+            if (potSens.waterGuards.potMax == WaterLevelState::TRIGGERED
+                && !actuator.overflowIncidentLatched[potIdx]) {
+                Serial.printf("[POT%d] OVERFLOW_DETECTED stable after %lus\n",
+                              potIdx, static_cast<unsigned long>(elapsed / 1000UL));
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::OVERFLOW_DETECTED,
+                                potSens.moisturePct, 0.0f, cycle.pulseCount);
+            }
+
+            if (potSens.waterGuards.potMax == WaterLevelState::OK
+                && !potSens.waterGuards.potMaxStatus.pendingTrip
+                && !potSens.waterGuards.potMaxStatus.pendingClear) {
                 Serial.printf("[POT%d] OVERFLOW_CLEARED after %ds\n", potIdx, elapsed / 1000);
 
                 float effectiveTarget = prof.targetMoisturePct;
@@ -623,15 +773,18 @@ void wateringTick(uint32_t nowMs,
                 }
 
                 if (potSens.moisturePct < effectiveTarget) {
-                    // Kontynuuj ze zmniejszonym pulsem
-                    cycle.pulseDurationMs /= 3;
-                    if (cycle.pulseDurationMs < 500) cycle.pulseDurationMs = 500;
+                    if (actuator.overflowIncidentLatched[potIdx]) {
+                        cycle.pulseDurationMs /= 3;
+                        if (cycle.pulseDurationMs < 500) cycle.pulseDurationMs = 500;
+                    }
                     cycle.phase = WateringPhase::PULSE;
                     cycle.phaseStartMs = nowMs;
                     Serial.printf("[POT%d] OVERFLOW_RESUME reduced_pulse=%dms\n",
                                   potIdx, cycle.pulseDurationMs);
-                    publishFeedback(actuator, potIdx, WateringFeedbackCode::OVERFLOW_RESUME,
-                                    potSens.moisturePct, effectiveTarget, cycle.pulseCount);
+                    if (actuator.overflowIncidentLatched[potIdx]) {
+                        publishFeedback(actuator, potIdx, WateringFeedbackCode::OVERFLOW_RESUME,
+                                        potSens.moisturePct, effectiveTarget, cycle.pulseCount);
+                    }
                 } else {
                     cycle.phase = WateringPhase::DONE;
                 }
@@ -683,9 +836,22 @@ void wateringTick(uint32_t nowMs,
             SafetyResult recheck = evaluateExtendedSafety(
                 nowMs, potSens, cfg, potCfg, budget, actuator, potIdx);
             if (!recheck.hardBlock) {
+                WateringFeedbackCode activeSafety = actuator.activeSafetyCode[potIdx];
+                bool publishUnblock = false;
+                if (isReservoirSafetyCode(activeSafety)) {
+                    publishUnblock = actuator.reservoirClearPending;
+                    if (publishUnblock) {
+                        actuator.reservoirClearPending = false;
+                    }
+                } else if (activeSafety != WateringFeedbackCode::NONE) {
+                    publishUnblock = true;
+                }
                 cycle.phase = WateringPhase::IDLE;
                 Serial.printf("[POT%d] SAFETY_UNBLOCK\n", potIdx);
-                publishFeedback(actuator, potIdx, WateringFeedbackCode::SAFETY_UNBLOCK);
+                if (publishUnblock) {
+                    publishFeedback(actuator, potIdx, WateringFeedbackCode::SAFETY_UNBLOCK);
+                }
+                actuator.activeSafetyCode[potIdx] = WateringFeedbackCode::NONE;
             }
             break;
         }
@@ -796,26 +962,36 @@ void manualPumpTick(uint32_t nowMs,
         }
 
         // Overflow check per-pot (only if anti-overflow is enabled)
-        if (cfg.antiOverflowEnabled &&
-            (potSens.waterGuards.potMax == WaterLevelState::TRIGGERED
-             || potSens.waterGuards.potMax == WaterLevelState::UNKNOWN)) {
+        if (cfg.antiOverflowEnabled) {
+            bool overflowTriggered = potSens.waterGuards.potMax == WaterLevelState::TRIGGERED;
+            bool overflowUnknown = cfg.waterLevelUnknownPolicy == UnknownPolicy::BLOCK
+                && potSens.waterGuards.potMax == WaterLevelState::UNKNOWN;
+            bool reservoirTriggered = potSens.waterGuards.reservoirMin == WaterLevelState::TRIGGERED;
+            bool reservoirUnknown = cfg.waterLevelUnknownPolicy == UnknownPolicy::BLOCK
+                && potSens.waterGuards.reservoirMin == WaterLevelState::UNKNOWN;
+
+            if (overflowTriggered || overflowUnknown || reservoirTriggered || reservoirUnknown) {
             if (manual.blueOwnsPump && hw.pump(selectedPot).isOn()) {
-                hw.pump(selectedPot).off(nowMs, potSens.waterGuards.potMax == WaterLevelState::TRIGGERED
-                                                    ? "MANUAL_OVERFLOW"
-                                                    : "MANUAL_OVERFLOW_UNKNOWN");
+                const char* stopReason = overflowTriggered ? "MANUAL_OVERFLOW"
+                    : overflowUnknown ? "MANUAL_OVERFLOW_UNKNOWN"
+                    : reservoirTriggered ? "MANUAL_RESERVOIR_EMPTY"
+                    : "MANUAL_RESERVOIR_UNKNOWN";
+                hw.pump(selectedPot).off(nowMs, stopReason);
                 actuator.currentPumpOwner[selectedPot] = PumpOwner::NONE;
             }
             Serial.printf("[POT%d] MANUAL_BLOCK reason=%s\n",
                           selectedPot,
-                          potSens.waterGuards.potMax == WaterLevelState::TRIGGERED
-                              ? "overflow_sensor"
-                              : "overflow_sensor_unknown");
+                          overflowTriggered ? "overflow_sensor"
+                              : overflowUnknown ? "overflow_sensor_unknown"
+                              : reservoirTriggered ? "reservoir_empty"
+                              : "reservoir_sensor_unknown");
             manual.locked = true;
             manual.lockUntilMs = nowMs + 10000;
             manual.blueHeldMs = 0;
             manual.blueOwnsPump = false;
             manual.activePot = 0xFF;
             return;
+            }
         }
 
         // Pompuj

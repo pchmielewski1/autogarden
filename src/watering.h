@@ -159,6 +159,12 @@ struct ActuatorState {
     float    lastFeedbackValue1[kMaxPots] = {};
     float    lastFeedbackValue2[kMaxPots] = {};
     uint8_t  lastFeedbackPulseCount[kMaxPots] = {};
+    bool     overflowIncidentLatched[kMaxPots] = {};
+    bool     overflowUnknownLatched[kMaxPots] = {};
+    bool     reservoirIncidentLatched = false;
+    bool     reservoirUnknownLatched = false;
+    bool     reservoirClearPending = false;
+    WateringFeedbackCode activeSafetyCode[kMaxPots] = {};
 };
 
 // ---------------------------------------------------------------------------
