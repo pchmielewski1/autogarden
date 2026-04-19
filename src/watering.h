@@ -26,6 +26,7 @@ enum class WateringPhase : uint8_t {
     IDLE,
     EVALUATING,
     PULSE,
+    STOPPING,
     SOAK,
     MEASURING,
     OVERFLOW_WAIT,
@@ -51,7 +52,9 @@ enum class WateringFeedbackCode : uint8_t {
     SAFETY_BLOCK_TANK_SENSOR_UNKNOWN,
     SAFETY_BLOCK_RESERVOIR_EMPTY,
     SAFETY_BLOCK_PUMP_CONFIG_INVALID,
+    SAFETY_BLOCK_PUMP_STOP_FAILED,
     HARD_TIMEOUT,
+    PUMP_STOP_RECOVERED,
     SAFETY_UNBLOCK,
     CYCLE_DONE_GENERIC,
 };
@@ -61,6 +64,60 @@ enum class PumpOwner : uint8_t {
     AUTO,
     MANUAL,
     REMOTE,
+};
+
+enum class PumpStopReason : uint8_t {
+    NONE = 0,
+    PULSE_DONE,
+    OVERFLOW_RISK,
+    TANK_EMPTY,
+    SAFETY_BLOCK,
+    HARD_TIMEOUT,
+    MANUAL_RELEASE,
+    MANUAL_STOP,
+    MANUAL_OVERFLOW,
+    MANUAL_INPUT_UNSTABLE,
+    MANUAL_MAX_HOLD,
+    BUTTON_SPAM,
+    MODE_SWITCH,
+    REMOTE_STOP,
+    FAILSAFE_IDLE_OFF,
+    HW_SAFETY_TIMEOUT,
+    STARTUP_SAFE_OFF,
+};
+
+enum class PumpStopFaultState : uint8_t {
+    NONE = 0,
+    STOP_PENDING,
+    STOP_FAILED_LATCHED,
+};
+
+struct PumpStopRequest {
+    PumpStopReason reason = PumpStopReason::NONE;
+    PumpOwner ownerAtRequest = PumpOwner::NONE;
+    bool accountRuntimeOnSuccess = false;
+    bool hasCycleContext = false;
+    WateringPhase successCyclePhase = WateringPhase::IDLE;
+    bool clearCycleOnSuccess = false;
+    bool publishFailureFeedback = false;
+    bool publishRecoveryFeedback = false;
+};
+
+struct PumpStopStatus {
+    bool pending = false;
+    PumpStopFaultState faultState = PumpStopFaultState::NONE;
+    PumpStopReason reason = PumpStopReason::NONE;
+    PumpOwner ownerAtRequest = PumpOwner::NONE;
+    uint32_t requestedAtMs = 0;
+    uint32_t nextRetryAtMs = 0;
+    uint8_t retryCount = 0;
+    uint32_t lastConfirmedOnMs = 0;
+    bool accountRuntimeOnSuccess = false;
+    bool hasCycleContext = false;
+    WateringPhase successCyclePhase = WateringPhase::IDLE;
+    bool clearCycleOnSuccess = false;
+    bool publishFailureFeedback = false;
+    bool publishRecoveryFeedback = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -152,8 +209,10 @@ struct ScheduleResult {
 // ---------------------------------------------------------------------------
 struct ActuatorState {
     uint32_t lastPumpStopAtMs[kMaxPots] = {};
+    uint32_t lastPumpActivityMs[kMaxPots] = {};
     uint32_t lastCycleDoneMs[kMaxPots]  = {};
     PumpOwner currentPumpOwner[kMaxPots] = {};
+    PumpStopStatus pumpStop[kMaxPots] = {};
     uint32_t lastFeedbackSeq[kMaxPots]  = {};
     WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
     float    lastFeedbackValue1[kMaxPots] = {};
@@ -219,6 +278,18 @@ void manualPumpTick(uint32_t nowMs,
                     uint8_t selectedPot,
                     WaterBudget& budget,
                     HardwareManager& hw);
+
+bool requestPumpStop(uint32_t nowMs,
+                     uint8_t potIdx,
+                     const PumpStopRequest& request,
+                     ActuatorState& actuator);
+
+void servicePumpStopRequests(uint32_t nowMs,
+                             const Config& cfg,
+                             WateringCycle cycles[],
+                             WaterBudget& budget,
+                             ActuatorState& actuator,
+                             HardwareManager& hw);
 
 // Budżet wody
 void updateWaterBudget(uint32_t nowMs,

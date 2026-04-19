@@ -82,6 +82,9 @@ struct TelegramStatusData {
     SensorSnapshot  sensors;
     WaterBudget     budget;
     WateringCycle   cycles[kMaxPots];
+    PumpStopStatus  pumpStop[kMaxPots];
+    PumpOwner       currentPumpOwner[kMaxPots] = {};
+    uint32_t        lastPumpActivityMs[kMaxPots] = {};
     uint32_t        lastCycleDoneMs[kMaxPots] = {};
     uint32_t        lastFeedbackSeq[kMaxPots] = {};
     WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
@@ -129,6 +132,7 @@ struct DailyReportData {
     WaterBudget     budget;
     TrendState      trends[kMaxPots];
     Config          config;
+    uint32_t        lastPumpActivityMs[kMaxPots] = {};
     uint32_t        lastCycleDoneMs[kMaxPots] = {};
     float           pumped24hMl = 0.0f;
     float           pumped24hMlPerPot[kMaxPots] = {};

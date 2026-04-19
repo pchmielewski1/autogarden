@@ -51,6 +51,8 @@ struct UiState {
 struct UiSnap {
     SensorSnapshot  sensors;
     WateringCycle   cycles[kMaxPots];
+    PumpStopStatus  pumpStop[kMaxPots];
+    PumpOwner       currentPumpOwner[kMaxPots];
     WaterBudget     budget;
     Config          config;
     NetConfig       netConfig;

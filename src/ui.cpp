@@ -126,6 +126,7 @@ static const char* phaseStr(WateringPhase ph) {
         case WateringPhase::IDLE:           return "IDLE";
         case WateringPhase::EVALUATING:     return "EVAL";
         case WateringPhase::PULSE:          return "PULSE";
+        case WateringPhase::STOPPING:       return "STOP";
         case WateringPhase::SOAK:           return "SOAK";
         case WateringPhase::MEASURING:      return "MEAS";
         case WateringPhase::OVERFLOW_WAIT:  return "OVFL";
@@ -264,11 +265,32 @@ static void formatDualPotStatus(uint32_t nowMs,
     const PotConfig& potCfg = snap.config.pots[potIdx];
     const PlantProfile& prof = getActiveProfile(snap.config, potIdx);
 
+    if (snap.pumpStop[potIdx].pending) {
+        snprintf(out, outSize, "%s",
+                 snap.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED
+                     ? "STOP!"
+                     : "STOP");
+        color = snap.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED
+            ? COL_RED
+            : COL_ORANGE;
+        return;
+    }
+
     if (cyc.phase == WateringPhase::PULSE) {
         snprintf(out, outSize, "%u/%u",
                  static_cast<unsigned>(cyc.pulseCount + 1),
                  static_cast<unsigned>(cyc.maxPulses));
         color = COL_BLUE;
+        return;
+    }
+    if (cyc.phase == WateringPhase::STOPPING) {
+        snprintf(out, outSize, "%s",
+                 snap.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED
+                     ? "STOP!"
+                     : "STOP");
+        color = snap.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED
+            ? COL_RED
+            : COL_ORANGE;
         return;
     }
     if (cyc.phase == WateringPhase::SOAK) {
@@ -292,7 +314,9 @@ static void formatDualPotStatus(uint32_t nowMs,
         return;
     }
     if (cyc.phase == WateringPhase::BLOCKED) {
-        if (ps.waterGuards.potMax == WaterLevelState::TRIGGERED) {
+        if (snap.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
+            snprintf(out, outSize, "%s", "STOP!");
+        } else if (ps.waterGuards.potMax == WaterLevelState::TRIGGERED) {
             snprintf(out, outSize, "%s", "OVF");
         } else if (ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ||
                    (snap.budget.reservoirLow && snap.budget.reservoirCurrentMl <= 0.0f)) {
@@ -729,7 +753,12 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     drawSep(132);
 
     // ── Section 5: Watering phase (y 134-170) ─────────────────
-    switch (cyc.phase) {
+    WateringPhase displayPhase = cyc.phase;
+    if (snap.pumpStop[potIdx].pending && displayPhase == WateringPhase::IDLE) {
+        displayPhase = WateringPhase::STOPPING;
+    }
+
+    switch (displayPhase) {
     case WateringPhase::IDLE:
         C.setTextColor(COL_GRAY);
         C.drawString("Watering: IDLE", 4, 136);
@@ -746,6 +775,16 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
         }
         break;
     }
+
+    case WateringPhase::STOPPING:
+        C.setTextColor(snap.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED
+                           ? COL_RED
+                           : COL_ORANGE);
+        C.drawString(snap.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED
+                         ? "STOPPING FAILED"
+                         : "STOPPING PUMP...",
+                     4, 136);
+        break;
 
     case WateringPhase::SOAK: {
         C.setTextColor(COL_CYAN);
@@ -770,7 +809,10 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
 
     case WateringPhase::BLOCKED:
         C.setTextColor(COL_RED);
-        C.drawString("BLOCKED", 4, 136);
+        C.drawString(snap.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED
+                         ? "BLOCKED: STOP FAIL"
+                         : "BLOCKED",
+                     4, 136);
         break;
 
     case WateringPhase::EVALUATING:
@@ -814,6 +856,10 @@ void renderSinglePotScreen(uint32_t nowMs, const UiSnap& snap, uint8_t potIdx) {
     int16_t alertY = 212;
     if (bud.reservoirLow) {
         drawAlertBanner(alertY, "! RESERVOIR LOW", COL_RED);
+        alertY += 24;
+    }
+    if (snap.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
+        drawAlertBanner(alertY, "! PUMP STOP FAIL", COL_RED);
         alertY += 24;
     }
     if (overflow) {

@@ -507,8 +507,14 @@ static void formatLastFeedback(const TelegramStatusData& data,
         case WateringFeedbackCode::SAFETY_BLOCK_PUMP_CONFIG_INVALID:
             safeCopy(buf, bufSize, "blocked pump_config_invalid");
             break;
+        case WateringFeedbackCode::SAFETY_BLOCK_PUMP_STOP_FAILED:
+            safeCopy(buf, bufSize, "blocked pump_stop_failed");
+            break;
         case WateringFeedbackCode::HARD_TIMEOUT:
             snprintf(buf, bufSize, "hard_timeout %.0fms", data.lastFeedbackValue1[potIdx]);
+            break;
+        case WateringFeedbackCode::PUMP_STOP_RECOVERED:
+            safeCopy(buf, bufSize, "pump_stop_recovered");
             break;
         case WateringFeedbackCode::SAFETY_UNBLOCK:
             safeCopy(buf, bufSize, "safety_unblock");
@@ -541,6 +547,16 @@ static bool telegramWaterBlocked(const TelegramStatusData& status,
     }
     if (status.config.mode != Mode::AUTO) {
         safeCopy(reasonBuf, reasonBufSize, "Blocked: water requires AUTO mode.");
+        return true;
+    }
+
+    if (status.pumpStop[potIdx].pending
+        || status.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
+        safeCopy(reasonBuf,
+                 reasonBufSize,
+                 status.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED
+                     ? "Blocked: pump stop failed, retrying recovery."
+                     : "Blocked: pump stop pending.");
         return true;
     }
 
@@ -650,7 +666,11 @@ static void telegramWaterButtonLabel(const TelegramStatusData& status,
         return;
     }
 
-    if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
+    if (status.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
+        safeCopy(buf, bufSize, "\xF0\x9F\x9A\xAB Stop fault");
+    } else if (status.cycles[potIdx].phase == WateringPhase::STOPPING) {
+        safeCopy(buf, bufSize, "\xE2\x8F\xB9 Stopping...");
+    } else if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
         safeCopy(buf, bufSize, "\xF0\x9F\x92\xA7 Watering...");
     } else if (strstr(reason, "already wet") != nullptr || strstr(reason, "above max") != nullptr) {
         safeCopy(buf, bufSize, "\xE2\x9C\x85 Wet enough");
@@ -918,7 +938,7 @@ static void formatTelegramMenuSummary(const TelegramStatusData& data, char* buf,
         char actionLine[96] = {};
         char sinceBuf[24] = {};
         formatPotActionLine(data, i, actionLine, sizeof(actionLine));
-        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
+        formatElapsedShort(data.uptimeMs, data.lastPumpActivityMs[i], sinceBuf, sizeof(sinceBuf));
         float last1h = trendRecentAverage(data.trends[i], 1);
 
         pos = appendFmt(buf, bufSize, pos, "\n🪴 POT %u | %s%s\n",
@@ -933,7 +953,7 @@ static void formatTelegramMenuSummary(const TelegramStatusData& data, char* buf,
                         isnan(last1h) ? 0.0f : last1h);
         pos = appendFmt(buf, bufSize, pos,
                         "  action %s\n"
-                        "  ovf %s | last %s\n",
+                        "  ovf %s | pump %s\n",
                         actionLine,
                         telegramWaterLevelStateShort(data.sensors.pots[i].waterGuards.potMax),
                         sinceBuf);
@@ -1141,6 +1161,7 @@ static const char* telegramCyclePhaseShort(WateringPhase phase) {
         case WateringPhase::IDLE: return "IDLE";
         case WateringPhase::EVALUATING: return "EVAL";
         case WateringPhase::PULSE: return "PULSE";
+        case WateringPhase::STOPPING: return "STOP";
         case WateringPhase::SOAK: return "SOAK";
         case WateringPhase::MEASURING: return "MEAS";
         case WateringPhase::OVERFLOW_WAIT: return "OFLOW";
@@ -1253,7 +1274,11 @@ static void formatPotActionLine(const TelegramStatusData& status,
         return;
     }
 
-    if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
+    if (status.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
+        safeCopy(buf, bufSize, "pump stop fault");
+    } else if (status.cycles[potIdx].phase == WateringPhase::STOPPING) {
+        safeCopy(buf, bufSize, "stopping pump");
+    } else if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
         safeCopy(buf, bufSize, "watering active");
     } else if (cooldownRemainingMs > 0) {
         snprintf(buf, bufSize, "cooldown / %lus left",
@@ -1490,7 +1515,7 @@ static void formatTelegramHistoryReport(const TelegramStatusData& data,
         const TrendState& ts = data.trends[i];
         const PlantProfile& prof = getActiveProfile(data.config, i);
         char sinceBuf[24] = {};
-        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
+        formatElapsedShort(data.uptimeMs, data.lastPumpActivityMs[i], sinceBuf, sizeof(sinceBuf));
 
         pos = appendFmt(buf, bufSize, pos, "\n🪴 POT %u | %s\n",
                         static_cast<unsigned>(i + 1),
@@ -1500,7 +1525,7 @@ static void formatTelegramHistoryReport(const TelegramStatusData& data,
                         data.sensors.pots[i].moisturePct,
                         data.sensors.pots[i].moistureEma,
                         data.budget.totalPumpedMlPerPot[i]);
-        pos = appendFmt(buf, bufSize, pos, "  last cycle %s\n", sinceBuf);
+        pos = appendFmt(buf, bufSize, pos, "  last pump %s\n", sinceBuf);
 
         if (ts.count > 0) {
             float last1h = trendRecentAverage(ts, 1);
@@ -1578,7 +1603,7 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
         char actionLine[96] = {};
         char lastState[64] = {};
         char sinceBuf[24] = {};
-        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
+        formatElapsedShort(data.uptimeMs, data.lastPumpActivityMs[i], sinceBuf, sizeof(sinceBuf));
         formatPotActionLine(data, i, actionLine, sizeof(actionLine));
         formatLastFeedback(data, i, lastState, sizeof(lastState));
         if (data.config.vacationMode) {
@@ -1586,13 +1611,16 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
             if (targetPct < 5.0f) targetPct = 5.0f;
         }
         float last1h = trendRecentAverage(data.trends[i], 1);
+        const char* phaseShort = (data.pumpStop[i].pending && data.cycles[i].phase == WateringPhase::IDLE)
+            ? "STOP"
+            : telegramCyclePhaseShort(data.cycles[i].phase);
         pos = appendFmt(buf, bufSize, pos,
                 "\n🪴 POT %u | %s%s\n"
                         "  water %.1f%% | target %.1f%% | ema %.1f%%\n"
                         "  trend %s %.2f%%/h | raw %u | exp %.2f\n"
                         "  dry/wet %u/%u | phase %s | pulses %u\n"
                         "  action %s\n"
-                        "  ovf %s | res %s | last %s (%s)\n",
+                    "  ovf %s | res %s | pump %s (%s)\n",
                         static_cast<unsigned>(i + 1),
                         prof.name ? prof.name : "?",
                         (i == data.selectedPot) ? " [selected]" : "",
@@ -1605,7 +1633,7 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
                         data.config.pots[i].moistureCurveExponent,
                         data.config.pots[i].moistureDryRaw,
                         data.config.pots[i].moistureWetRaw,
-                        telegramCyclePhaseShort(data.cycles[i].phase),
+                        phaseShort,
                         data.cycles[i].pulseCount,
                         actionLine,
                         telegramWaterLevelStateShort(data.sensors.pots[i].waterGuards.potMax),
@@ -1634,7 +1662,7 @@ static bool pushConfigEvent(EventType type, uint8_t key, uint16_t valueU16, floa
 
 static bool anyWateringActive(const TelegramStatusData& status) {
     for (uint8_t i = 0; i < status.config.numPots; ++i) {
-        if (status.cycles[i].phase != WateringPhase::IDLE) {
+        if (status.cycles[i].phase != WateringPhase::IDLE || status.pumpStop[i].pending) {
             return true;
         }
     }
@@ -1834,9 +1862,12 @@ static bool handleTelegramCallback(const telegramMessage& message,
                          ? "Stop requested. Active watering is being forced OFF."
                          : "Stop requested, but nothing is active right now.");
             for (uint8_t i = 0; i < replyStatus.config.numPots; ++i) {
-                if (replyStatus.cycles[i].phase != WateringPhase::IDLE) {
-                    replyStatus.cycles[i].reset();
-                    replyStatus.lastCycleDoneMs[i] = replyStatus.uptimeMs;
+                if (replyStatus.cycles[i].phase != WateringPhase::IDLE || replyStatus.currentPumpOwner[i] != PumpOwner::NONE) {
+                    replyStatus.cycles[i].phase = WateringPhase::STOPPING;
+                    replyStatus.cycles[i].phaseStartMs = replyStatus.uptimeMs;
+                    replyStatus.pumpStop[i].pending = true;
+                    replyStatus.pumpStop[i].faultState = PumpStopFaultState::STOP_PENDING;
+                    replyStatus.pumpStop[i].reason = PumpStopReason::REMOTE_STOP;
                 }
             }
         } else {
@@ -2795,7 +2826,7 @@ void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize) {
         const PlantProfile& prof = getActiveProfile(data.config, i);
         const TrendState& ts = data.trends[i];
         char sinceBuf[24] = {};
-        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
+        formatElapsedShort(data.uptimeMs, data.lastPumpActivityMs[i], sinceBuf, sizeof(sinceBuf));
         float targetPct = prof.targetMoisturePct;
         if (data.config.vacationMode) {
             targetPct -= data.config.vacationTargetReductionPct;
@@ -2805,7 +2836,7 @@ void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize) {
         pos = appendFmt(buf, bufSize, pos,
                 "\n🪴 POT %u | %s\n"
                         "  water %.1f%% | target %.1f%% | ema %.1f%%\n"
-                        "  24h water %.0f ml / %u cycles | last %s\n",
+                    "  24h water %.0f ml / %u cycles | pump %s\n",
                         static_cast<unsigned>(i + 1),
                         prof.name ? prof.name : "?",
                         ps.moisturePct,

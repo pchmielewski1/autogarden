@@ -66,29 +66,37 @@ static bool isReservoirSafetyCode(WateringFeedbackCode code) {
         || code == WateringFeedbackCode::SAFETY_BLOCK_TANK_SENSOR_UNKNOWN;
 }
 
-static void accountInterruptedPulse(uint32_t nowMs,
-                                    uint8_t potIdx,
-                                    const PotConfig& potCfg,
-                                    WateringCycle& cycle,
-                                    WaterBudget& budget,
-                                    PumpActuator& pump) {
-    if (cycle.phase != WateringPhase::PULSE || !pump.isOn()) {
-        return;
-    }
+static constexpr uint8_t kPumpStopRetryLimit = 3;
+static constexpr uint32_t kPumpStopRetryIntervalMs = 20;
+static constexpr uint32_t kPumpStopLatchedRetryMs = 250;
 
-    uint32_t pumpedMs = pump.onDuration(nowMs);
-    if (pumpedMs == 0) {
-        return;
+static float runtimeToMl(uint32_t runtimeMs, const PotConfig& potCfg) {
+    if (runtimeMs == 0 || potCfg.pumpMlPerSec <= 0.0f) {
+        return 0.0f;
     }
+    return (runtimeMs / 1000.0f) * potCfg.pumpMlPerSec;
+}
 
-    cycle.totalPumpedMs += pumpedMs;
-    float pumpedMl = (pumpedMs / 1000.0f) * potCfg.pumpMlPerSec;
-    cycle.totalPumpedMl += pumpedMl;
-    addPumped(budget, pumpedMl, potIdx);
+static float accountConfirmedRuntime(uint8_t potIdx,
+                                     uint32_t runtimeMs,
+                                     const PotConfig& potCfg,
+                                     bool hasCycleContext,
+                                     WateringCycle& cycle,
+                                     WaterBudget& budget) {
+    float pumpedMl = runtimeToMl(runtimeMs, potCfg);
+    if (runtimeMs > 0 && hasCycleContext) {
+        cycle.totalPumpedMs += runtimeMs;
+        cycle.totalPumpedMl += pumpedMl;
+    }
+    if (pumpedMl > 0.0f) {
+        addPumped(budget, pumpedMl, potIdx);
+    }
+    return pumpedMl;
 }
 
 static bool isActiveCyclePhase(WateringPhase phase) {
     return phase == WateringPhase::PULSE
+        || phase == WateringPhase::STOPPING
         || phase == WateringPhase::SOAK
         || phase == WateringPhase::MEASURING
         || phase == WateringPhase::OVERFLOW_WAIT;
@@ -168,6 +176,58 @@ static const char* pumpOwnerName(PumpOwner owner) {
     }
 }
 
+static const char* pumpStopReasonName(PumpStopReason reason) {
+    switch (reason) {
+        case PumpStopReason::PULSE_DONE: return "PULSE_DONE";
+        case PumpStopReason::OVERFLOW_RISK: return "OVERFLOW_RISK";
+        case PumpStopReason::TANK_EMPTY: return "TANK_EMPTY";
+        case PumpStopReason::SAFETY_BLOCK: return "SAFETY_BLOCK";
+        case PumpStopReason::HARD_TIMEOUT: return "HARD_TIMEOUT";
+        case PumpStopReason::MANUAL_RELEASE: return "MANUAL_RELEASE";
+        case PumpStopReason::MANUAL_STOP: return "MANUAL_STOP";
+        case PumpStopReason::MANUAL_OVERFLOW: return "MANUAL_OVERFLOW";
+        case PumpStopReason::MANUAL_INPUT_UNSTABLE: return "MANUAL_INPUT_UNSTABLE";
+        case PumpStopReason::MANUAL_MAX_HOLD: return "MANUAL_MAX_HOLD";
+        case PumpStopReason::BUTTON_SPAM: return "BUTTON_SPAM";
+        case PumpStopReason::MODE_SWITCH: return "MODE_SWITCH";
+        case PumpStopReason::REMOTE_STOP: return "REMOTE_STOP";
+        case PumpStopReason::FAILSAFE_IDLE_OFF: return "FAILSAFE_IDLE_OFF";
+        case PumpStopReason::HW_SAFETY_TIMEOUT: return "HW_SAFETY_TIMEOUT";
+        case PumpStopReason::STARTUP_SAFE_OFF: return "STARTUP_SAFE_OFF";
+        case PumpStopReason::NONE:
+        default:
+            return "NONE";
+    }
+}
+
+static const char* pumpStopOffReason(PumpStopReason reason) {
+    switch (reason) {
+        case PumpStopReason::PULSE_DONE: return "pulse_done";
+        case PumpStopReason::OVERFLOW_RISK: return "OVERFLOW_RISK";
+        case PumpStopReason::TANK_EMPTY: return "TANK_EMPTY";
+        case PumpStopReason::SAFETY_BLOCK: return "SAFETY_BLOCK";
+        case PumpStopReason::HARD_TIMEOUT: return "HARD_TIMEOUT";
+        case PumpStopReason::MANUAL_RELEASE: return "MANUAL_RELEASE";
+        case PumpStopReason::MANUAL_STOP: return "MANUAL_STOP";
+        case PumpStopReason::MANUAL_OVERFLOW: return "MANUAL_OVERFLOW";
+        case PumpStopReason::MANUAL_INPUT_UNSTABLE: return "MANUAL_INPUT_UNSTABLE";
+        case PumpStopReason::MANUAL_MAX_HOLD: return "MANUAL_MAX_HOLD";
+        case PumpStopReason::BUTTON_SPAM: return "BUTTON_SPAM";
+        case PumpStopReason::MODE_SWITCH: return "mode_switch";
+        case PumpStopReason::REMOTE_STOP: return "REMOTE_STOP";
+        case PumpStopReason::FAILSAFE_IDLE_OFF: return "FAILSAFE_IDLE_OFF";
+        case PumpStopReason::HW_SAFETY_TIMEOUT: return "HW_SAFETY_TIMEOUT";
+        case PumpStopReason::STARTUP_SAFE_OFF: return "STARTUP_SAFE_OFF";
+        case PumpStopReason::NONE:
+        default:
+            return "none";
+    }
+}
+
+static bool pumpStopBlocksActions(const PumpStopStatus& stop) {
+    return stop.pending || stop.faultState == PumpStopFaultState::STOP_FAILED_LATCHED;
+}
+
 static float moistureForScheduleDecision(const PotSensorSnapshot& potSens) {
     if (!std::isnan(potSens.moistureEma) && potSens.moistureEma >= 0.0f) {
         return potSens.moistureEma;
@@ -181,6 +241,155 @@ static float moistureForCycleControl(const PotSensorSnapshot& potSens) {
 
 static bool moistureLooksOutOfSoil(float moisturePct) {
     return !std::isnan(moisturePct) && moisturePct >= 0.0f && moisturePct <= 5.0f;
+}
+
+bool requestPumpStop(uint32_t nowMs,
+                     uint8_t potIdx,
+                     const PumpStopRequest& request,
+                     ActuatorState& actuator) {
+    if (potIdx >= kMaxPots) {
+        return false;
+    }
+
+    PumpStopStatus& stop = actuator.pumpStop[potIdx];
+    if (!stop.pending) {
+        stop.pending = true;
+        stop.faultState = PumpStopFaultState::STOP_PENDING;
+        stop.requestedAtMs = nowMs;
+        stop.nextRetryAtMs = nowMs;
+        stop.retryCount = 0;
+        stop.lastConfirmedOnMs = 0;
+        stop.reason = request.reason;
+        stop.ownerAtRequest = request.ownerAtRequest;
+        stop.accountRuntimeOnSuccess = request.accountRuntimeOnSuccess;
+        stop.hasCycleContext = request.hasCycleContext;
+        stop.successCyclePhase = request.successCyclePhase;
+        stop.clearCycleOnSuccess = request.clearCycleOnSuccess;
+        stop.publishFailureFeedback = request.publishFailureFeedback;
+        stop.publishRecoveryFeedback = request.publishRecoveryFeedback;
+        return true;
+    }
+
+    if (request.reason != PumpStopReason::NONE) {
+        stop.reason = request.reason;
+    }
+    if (request.ownerAtRequest != PumpOwner::NONE) {
+        stop.ownerAtRequest = request.ownerAtRequest;
+    }
+    stop.accountRuntimeOnSuccess = stop.accountRuntimeOnSuccess || request.accountRuntimeOnSuccess;
+    if (request.hasCycleContext) {
+        stop.hasCycleContext = true;
+        stop.successCyclePhase = request.successCyclePhase;
+    }
+    stop.clearCycleOnSuccess = stop.clearCycleOnSuccess || request.clearCycleOnSuccess;
+    stop.publishFailureFeedback = stop.publishFailureFeedback || request.publishFailureFeedback;
+    stop.publishRecoveryFeedback = stop.publishRecoveryFeedback || request.publishRecoveryFeedback;
+    if (stop.nextRetryAtMs > nowMs) {
+        stop.nextRetryAtMs = nowMs;
+    }
+    if (stop.faultState == PumpStopFaultState::NONE) {
+        stop.faultState = PumpStopFaultState::STOP_PENDING;
+    }
+    return true;
+}
+
+void servicePumpStopRequests(uint32_t nowMs,
+                             const Config& cfg,
+                             WateringCycle cycles[],
+                             WaterBudget& budget,
+                             ActuatorState& actuator,
+                             HardwareManager& hw) {
+    for (uint8_t potIdx = 0; potIdx < kMaxPots; ++potIdx) {
+        PumpStopStatus& stop = actuator.pumpStop[potIdx];
+        if (!stop.pending || nowMs < stop.nextRetryAtMs) {
+            continue;
+        }
+
+        WateringCycle& cycle = cycles[potIdx];
+        PumpActuator& pump = hw.pump(potIdx);
+        const PotConfig& potCfg = cfg.pots[potIdx];
+        bool wasLatched = stop.faultState == PumpStopFaultState::STOP_FAILED_LATCHED;
+        uint32_t runtimeMs = pump.onDuration(nowMs);
+        if (runtimeMs > 0) {
+            stop.lastConfirmedOnMs = nowMs;
+        }
+
+        if (pump.off(nowMs, pumpStopOffReason(stop.reason))) {
+            float pumpedMl = 0.0f;
+            if (stop.accountRuntimeOnSuccess) {
+                pumpedMl = accountConfirmedRuntime(potIdx, runtimeMs, potCfg,
+                                                   stop.hasCycleContext, cycle, budget);
+                if (runtimeMs > 0) {
+                    actuator.lastPumpActivityMs[potIdx] = nowMs;
+                }
+            }
+
+            actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
+            actuator.lastPumpStopAtMs[potIdx] = nowMs;
+
+            if (stop.hasCycleContext) {
+                if (stop.reason == PumpStopReason::PULSE_DONE) {
+                    cycle.pulseCount++;
+                    Serial.printf("[POT%d] PULSE_END n=%d pumped_ml=%.1f total_ml=%.1f\n",
+                                  potIdx, cycle.pulseCount, pumpedMl, cycle.totalPumpedMl);
+                }
+
+                if (stop.clearCycleOnSuccess) {
+                    if (cycle.phase != WateringPhase::IDLE) {
+                        cycle.reset();
+                        actuator.lastCycleDoneMs[potIdx] = nowMs;
+                    }
+                } else {
+                    cycle.phase = stop.successCyclePhase;
+                    cycle.phaseStartMs = nowMs;
+                    if (stop.successCyclePhase == WateringPhase::OVERFLOW_WAIT) {
+                        Serial.printf("[POT%d] OVERFLOW_STOP after pulse %d\n",
+                                      potIdx, cycle.pulseCount);
+                    } else if (stop.successCyclePhase == WateringPhase::BLOCKED
+                               && actuator.activeSafetyCode[potIdx] != WateringFeedbackCode::NONE) {
+                        publishFeedback(actuator, potIdx, actuator.activeSafetyCode[potIdx]);
+                    }
+                }
+            }
+
+            if (stop.reason == PumpStopReason::HARD_TIMEOUT
+                || stop.reason == PumpStopReason::HW_SAFETY_TIMEOUT) {
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::HARD_TIMEOUT,
+                                runtimeMs, cfg.pumpOnMsMax, cycle.pulseCount);
+            }
+            if (wasLatched && stop.publishRecoveryFeedback) {
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::PUMP_STOP_RECOVERED,
+                                runtimeMs, stop.retryCount, cycle.pulseCount);
+            }
+
+            stop = PumpStopStatus{};
+            continue;
+        }
+
+        stop.retryCount++;
+        if (stop.retryCount >= kPumpStopRetryLimit) {
+            bool firstLatched = stop.faultState != PumpStopFaultState::STOP_FAILED_LATCHED;
+            stop.faultState = PumpStopFaultState::STOP_FAILED_LATCHED;
+            stop.nextRetryAtMs = nowMs + kPumpStopLatchedRetryMs;
+            if (firstLatched && stop.publishFailureFeedback) {
+                publishFeedback(actuator, potIdx,
+                                WateringFeedbackCode::SAFETY_BLOCK_PUMP_STOP_FAILED,
+                                stop.retryCount,
+                                static_cast<float>(stop.reason),
+                                cycle.pulseCount);
+            }
+        } else {
+            stop.faultState = PumpStopFaultState::STOP_PENDING;
+            stop.nextRetryAtMs = nowMs + kPumpStopRetryIntervalMs;
+        }
+
+        Serial.printf("[POT%d] PUMP_STOP_RETRY reason=%s attempt=%u owner=%s phase=%d\n",
+                      potIdx,
+                      pumpStopReasonName(stop.reason),
+                      static_cast<unsigned>(stop.retryCount),
+                      pumpOwnerName(stop.ownerAtRequest),
+                      static_cast<int>(cycle.phase));
+    }
 }
 
 // ===========================================================================
@@ -440,19 +649,42 @@ void wateringTick(uint32_t nowMs,
         const PotSensorSnapshot& potSens = sensors.pots[potIdx];
         const PlantProfile& prof = getActiveProfile(cfg, potIdx);
         PumpActuator& pump = hw.pump(potIdx);
+        auto requestCyclePumpStop = [&](PumpStopReason reason,
+                                        WateringPhase successPhase,
+                                        bool clearCycleOnSuccess = false,
+                                        bool publishFailureFeedback = true,
+                                        bool publishRecoveryFeedback = true) {
+            PumpStopRequest stopReq{};
+            stopReq.reason = reason;
+            stopReq.ownerAtRequest = (actuator.currentPumpOwner[potIdx] != PumpOwner::NONE)
+                ? actuator.currentPumpOwner[potIdx]
+                : cycle.source;
+            stopReq.accountRuntimeOnSuccess = pump.isOn();
+            stopReq.hasCycleContext = true;
+            stopReq.successCyclePhase = successPhase;
+            stopReq.clearCycleOnSuccess = clearCycleOnSuccess;
+            stopReq.publishFailureFeedback = publishFailureFeedback;
+            stopReq.publishRecoveryFeedback = publishRecoveryFeedback;
+            requestPumpStop(nowMs, potIdx, stopReq, actuator);
+            cycle.phase = WateringPhase::STOPPING;
+            cycle.phaseStartMs = nowMs;
+        };
 
         if (cfg.antiOverflowEnabled
             && (potSens.waterGuards.potMax == WaterLevelState::TRIGGERED
                 || potSens.waterGuards.potMaxStatus.pendingTrip)
             && isActiveCyclePhase(cycle.phase)
             && cycle.phase != WateringPhase::OVERFLOW_WAIT) {
-            accountInterruptedPulse(nowMs, potIdx, potCfg, cycle, budget, pump);
             if (pump.isOn()) {
-                pump.off(nowMs, "OVERFLOW_RISK");
-                actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
+                requestCyclePumpStop(PumpStopReason::OVERFLOW_RISK,
+                                     WateringPhase::OVERFLOW_WAIT,
+                                     false,
+                                     true,
+                                     true);
+            } else {
+                cycle.phase = WateringPhase::OVERFLOW_WAIT;
+                cycle.phaseStartMs = nowMs;
             }
-            cycle.phase = WateringPhase::OVERFLOW_WAIT;
-            cycle.phaseStartMs = nowMs;
             Serial.printf("[POT%d] OVERFLOW_STOP state=%s pending=%s pulse=%u\n",
                           potIdx,
                           potSens.waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "OK",
@@ -465,13 +697,18 @@ void wateringTick(uint32_t nowMs,
             && (potSens.waterGuards.reservoirMin == WaterLevelState::TRIGGERED
                 || potSens.waterGuards.reservoirMinStatus.pendingTrip)
             && isActiveCyclePhase(cycle.phase)) {
-            accountInterruptedPulse(nowMs, potIdx, potCfg, cycle, budget, pump);
+            actuator.activeSafetyCode[potIdx] = WateringFeedbackCode::SAFETY_BLOCK_TANK_EMPTY;
             if (pump.isOn()) {
-                pump.off(nowMs, "TANK_EMPTY");
-                actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
+                requestCyclePumpStop(PumpStopReason::TANK_EMPTY,
+                                     WateringPhase::BLOCKED,
+                                     false,
+                                     true,
+                                     true);
+            } else {
+                cycle.phase = WateringPhase::BLOCKED;
+                cycle.phaseStartMs = nowMs;
+                publishFeedback(actuator, potIdx, WateringFeedbackCode::SAFETY_BLOCK_TANK_EMPTY);
             }
-            cycle.phase = WateringPhase::BLOCKED;
-            cycle.phaseStartMs = nowMs;
             Serial.printf("[POT%d] RESERVOIR_STOP state=%s pending=%s phase=%d\n",
                           potIdx,
                           potSens.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "OK",
@@ -501,14 +738,11 @@ void wateringTick(uint32_t nowMs,
 
         if (safety.hardBlock) {
             WateringPhase prevPhase = cycle.phase;
-            if (cycle.phase == WateringPhase::PULSE && pump.isOn()) {
-                accountInterruptedPulse(nowMs, potIdx, potCfg, cycle, budget, pump);
-                pump.off(nowMs, safety.reason);
-                actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
-            }
-            cycle.phase = WateringPhase::BLOCKED;
-
             const char* reason = safety.reason ? safety.reason : "?";
+            WateringFeedbackCode code = feedbackCodeFromSafetyReason(reason);
+            if (code != WateringFeedbackCode::NONE) {
+                actuator.activeSafetyCode[potIdx] = code;
+            }
             bool reasonChanged = (strncmp(s_lastSafetyReason[potIdx], reason,
                                           sizeof(s_lastSafetyReason[potIdx]) - 1) != 0);
             bool timeElapsed = (nowMs - s_lastSafetyLogMs[potIdx]) >= 5000;
@@ -520,10 +754,20 @@ void wateringTick(uint32_t nowMs,
                 s_lastSafetyReason[potIdx][sizeof(s_lastSafetyReason[potIdx]) - 1] = '\0';
                 s_lastSafetyLogMs[potIdx] = nowMs;
             }
-            if (reasonChanged || prevPhase != WateringPhase::BLOCKED) {
-                WateringFeedbackCode code = feedbackCodeFromSafetyReason(reason);
-                if (code != WateringFeedbackCode::NONE) {
-                    actuator.activeSafetyCode[potIdx] = code;
+
+            if (pump.isOn() && (cycle.phase == WateringPhase::PULSE || cycle.phase == WateringPhase::STOPPING)) {
+                requestCyclePumpStop(strcmp(reason, "TANK_EMPTY") == 0
+                                         ? PumpStopReason::TANK_EMPTY
+                                         : PumpStopReason::SAFETY_BLOCK,
+                                     WateringPhase::BLOCKED,
+                                     false,
+                                     true,
+                                     true);
+            } else {
+                cycle.phase = WateringPhase::BLOCKED;
+                cycle.phaseStartMs = nowMs;
+                if ((reasonChanged || prevPhase != WateringPhase::BLOCKED)
+                    && code != WateringFeedbackCode::NONE) {
                     publishFeedback(actuator, potIdx, code);
                 }
             }
@@ -534,6 +778,10 @@ void wateringTick(uint32_t nowMs,
 
         // ==================== IDLE ====================
         case WateringPhase::IDLE: {
+            if (pumpStopBlocksActions(actuator.pumpStop[potIdx])) {
+                break;
+            }
+
             // Cooldown check
             uint32_t effCooldown = cfg.cooldownMs;
             if (cfg.vacationMode) {
@@ -646,6 +894,11 @@ void wateringTick(uint32_t nowMs,
 
         // ==================== PULSE ====================
         case WateringPhase::PULSE: {
+            if (pumpStopBlocksActions(actuator.pumpStop[potIdx])) {
+                cycle.phase = WateringPhase::STOPPING;
+                break;
+            }
+
             if (!pump.isOn()) {
                 if (pump.on(nowMs, cycle.pulseDurationMs)) {
                     actuator.currentPumpOwner[potIdx] = cycle.source;
@@ -659,43 +912,32 @@ void wateringTick(uint32_t nowMs,
             }
 
             if ((nowMs - cycle.phaseStartMs) >= cycle.pulseDurationMs) {
-                pump.off(nowMs, "pulse_done");
-                actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
-                cycle.pulseCount++;
-                cycle.totalPumpedMs += cycle.pulseDurationMs;
-
-                float pulsedMl = (cycle.pulseDurationMs / 1000.0f) * potCfg.pumpMlPerSec;
-                cycle.totalPumpedMl += pulsedMl;
-                addPumped(budget, pulsedMl, potIdx);
-
-                Serial.printf("[POT%d] PULSE_END n=%d pumped_ml=%.1f total_ml=%.1f\n",
-                              potIdx, cycle.pulseCount, pulsedMl, cycle.totalPumpedMl);
-
-                // Overflow check
-                if (potSens.waterGuards.potMax == WaterLevelState::TRIGGERED) {
-                    cycle.phase = WateringPhase::OVERFLOW_WAIT;
-                    cycle.phaseStartMs = nowMs;
-                    Serial.printf("[POT%d] OVERFLOW_STOP after pulse %d\n",
-                                  potIdx, cycle.pulseCount);
-                } else {
-                    cycle.phase = WateringPhase::SOAK;
-                    cycle.phaseStartMs = nowMs;
-                }
+                WateringPhase successPhase =
+                    (potSens.waterGuards.potMax == WaterLevelState::TRIGGERED)
+                        ? WateringPhase::OVERFLOW_WAIT
+                        : WateringPhase::SOAK;
+                requestCyclePumpStop(PumpStopReason::PULSE_DONE,
+                                     successPhase,
+                                     false,
+                                     true,
+                                     true);
             }
 
             // Hard timeout safety — pompa nie powinna być ON dłużej niż pumpOnMsMax
             if (pump.isOn() && pump.onDuration(nowMs) > cfg.pumpOnMsMax) {
-                uint32_t timeoutMs = pump.onDuration(nowMs);
-                accountInterruptedPulse(nowMs, potIdx, potCfg, cycle, budget, pump);
-                pump.off(nowMs, "HARD_TIMEOUT");
-                actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
-                cycle.phase = WateringPhase::BLOCKED;
-                Serial.printf("[POT%d] HARD_TIMEOUT pump forced off\n", potIdx);
-                publishFeedback(actuator, potIdx, WateringFeedbackCode::HARD_TIMEOUT,
-                                timeoutMs, cfg.pumpOnMsMax, cycle.pulseCount);
+                requestCyclePumpStop(PumpStopReason::HARD_TIMEOUT,
+                                     WateringPhase::BLOCKED,
+                                     false,
+                                     true,
+                                     true);
+                Serial.printf("[POT%d] HARD_TIMEOUT pump stop requested\n", potIdx);
             }
             break;
         }
+
+        // ==================== STOPPING ====================
+        case WateringPhase::STOPPING:
+            break;
 
         // ==================== SOAK ====================
         case WateringPhase::SOAK: {
@@ -875,13 +1117,27 @@ void manualPumpTick(uint32_t nowMs,
                     HardwareManager& hw)
 {
     static uint32_t s_lastUnstableLogMs = 0;
+    auto requestManualStop = [&](uint8_t potIdx, PumpStopReason reason) {
+        PumpStopRequest stopReq{};
+        stopReq.reason = reason;
+        stopReq.ownerAtRequest = PumpOwner::MANUAL;
+        stopReq.accountRuntimeOnSuccess = potIdx < cfg.numPots && hw.pump(potIdx).isOn();
+        stopReq.hasCycleContext = false;
+        stopReq.successCyclePhase = WateringPhase::IDLE;
+        stopReq.clearCycleOnSuccess = false;
+        stopReq.publishFailureFeedback = true;
+        stopReq.publishRecoveryFeedback = true;
+        requestPumpStop(nowMs, potIdx, stopReq, actuator);
+    };
 
     if (btn.unstable) {
-        if (manual.blueOwnsPump && selectedPot < cfg.numPots && hw.pump(selectedPot).isOn()) {
-            hw.pump(selectedPot).off(nowMs, "MANUAL_INPUT_UNSTABLE");
-            actuator.currentPumpOwner[selectedPot] = PumpOwner::NONE;
+        uint8_t unstablePot = (manual.blueOwnsPump && manual.activePot < cfg.numPots)
+            ? manual.activePot
+            : selectedPot;
+        if (manual.blueOwnsPump && unstablePot < cfg.numPots && hw.pump(unstablePot).isOn()) {
+            requestManualStop(unstablePot, PumpStopReason::MANUAL_INPUT_UNSTABLE);
             Serial.printf("[POT%d] MANUAL_STOP reason=unstable_input owner=%s\n",
-                          selectedPot, pumpOwnerName(PumpOwner::MANUAL));
+                          unstablePot, pumpOwnerName(PumpOwner::MANUAL));
         }
         manual.blueHeldMs = 0;
         manual.blueOwnsPump = false;
@@ -899,8 +1155,7 @@ void manualPumpTick(uint32_t nowMs,
     if (btn.redPressed) {
         for (uint8_t i = 0; i < cfg.numPots; ++i) {
             if (hw.pump(i).isOn()) {
-                hw.pump(i).off(nowMs, "MANUAL_STOP");
-                actuator.currentPumpOwner[i] = PumpOwner::NONE;
+                requestManualStop(i, PumpStopReason::MANUAL_STOP);
                 Serial.printf("[POT%d] MANUAL_STOP red_button\n", i);
             }
         }
@@ -924,6 +1179,7 @@ void manualPumpTick(uint32_t nowMs,
     manual.locked = false;
 
     if (selectedPot >= cfg.numPots) return;
+    if (pumpStopBlocksActions(actuator.pumpStop[selectedPot])) return;
     const PotSensorSnapshot& potSens = sensors.pots[selectedPot];
 
     // === BLUE: trzymaj = pompuj wybraną doniczkę ===
@@ -947,12 +1203,14 @@ void manualPumpTick(uint32_t nowMs,
 
         // Max hold time
         if (heldDuration > cfg.manualMaxHoldMs) {
-            if (manual.blueOwnsPump && hw.pump(selectedPot).isOn()) {
-                hw.pump(selectedPot).off(nowMs, "MANUAL_MAX_HOLD");
-                actuator.currentPumpOwner[selectedPot] = PumpOwner::NONE;
+            uint8_t activePot = (manual.blueOwnsPump && manual.activePot < cfg.numPots)
+                ? manual.activePot
+                : selectedPot;
+            if (manual.blueOwnsPump && hw.pump(activePot).isOn()) {
+                requestManualStop(activePot, PumpStopReason::MANUAL_MAX_HOLD);
             }
             Serial.printf("[POT%d] MANUAL_BLOCK reason=hold_too_long duration=%d\n",
-                          selectedPot, heldDuration);
+                          activePot, heldDuration);
             manual.locked = true;
             manual.lockUntilMs = nowMs + cfg.manualCooldownMs;
             manual.blueHeldMs = 0;
@@ -971,26 +1229,24 @@ void manualPumpTick(uint32_t nowMs,
                 && potSens.waterGuards.reservoirMin == WaterLevelState::UNKNOWN;
 
             if (overflowTriggered || overflowUnknown || reservoirTriggered || reservoirUnknown) {
-            if (manual.blueOwnsPump && hw.pump(selectedPot).isOn()) {
-                const char* stopReason = overflowTriggered ? "MANUAL_OVERFLOW"
-                    : overflowUnknown ? "MANUAL_OVERFLOW_UNKNOWN"
-                    : reservoirTriggered ? "MANUAL_RESERVOIR_EMPTY"
-                    : "MANUAL_RESERVOIR_UNKNOWN";
-                hw.pump(selectedPot).off(nowMs, stopReason);
-                actuator.currentPumpOwner[selectedPot] = PumpOwner::NONE;
-            }
-            Serial.printf("[POT%d] MANUAL_BLOCK reason=%s\n",
-                          selectedPot,
-                          overflowTriggered ? "overflow_sensor"
-                              : overflowUnknown ? "overflow_sensor_unknown"
-                              : reservoirTriggered ? "reservoir_empty"
-                              : "reservoir_sensor_unknown");
-            manual.locked = true;
-            manual.lockUntilMs = nowMs + 10000;
-            manual.blueHeldMs = 0;
-            manual.blueOwnsPump = false;
-            manual.activePot = 0xFF;
-            return;
+                uint8_t activePot = (manual.blueOwnsPump && manual.activePot < cfg.numPots)
+                    ? manual.activePot
+                    : selectedPot;
+                if (manual.blueOwnsPump && hw.pump(activePot).isOn()) {
+                    requestManualStop(activePot, PumpStopReason::MANUAL_OVERFLOW);
+                }
+                Serial.printf("[POT%d] MANUAL_BLOCK reason=%s\n",
+                              activePot,
+                              overflowTriggered ? "overflow_sensor"
+                                  : overflowUnknown ? "overflow_sensor_unknown"
+                                  : reservoirTriggered ? "reservoir_empty"
+                                  : "reservoir_sensor_unknown");
+                manual.locked = true;
+                manual.lockUntilMs = nowMs + 10000;
+                manual.blueHeldMs = 0;
+                manual.blueOwnsPump = false;
+                manual.activePot = 0xFF;
+                return;
             }
         }
 
@@ -1010,14 +1266,15 @@ void manualPumpTick(uint32_t nowMs,
         }
     } else {
         // Przycisk puszczony
-        if (manual.blueOwnsPump && hw.pump(selectedPot).isOn() && manual.blueHeldMs > 0) {
+        uint8_t activePot = (manual.blueOwnsPump && manual.activePot < cfg.numPots)
+            ? manual.activePot
+            : selectedPot;
+        if (manual.blueOwnsPump && hw.pump(activePot).isOn() && manual.blueHeldMs > 0) {
             uint32_t heldDuration = nowMs - manual.blueHeldMs;
-            float pumpedMl = (heldDuration / 1000.0f) * cfg.pots[selectedPot].pumpMlPerSec;
-            hw.pump(selectedPot).off(nowMs, "MANUAL_RELEASE");
-            actuator.currentPumpOwner[selectedPot] = PumpOwner::NONE;
-            addPumped(budget, pumpedMl, selectedPot);
-            Serial.printf("[MANUAL] event=pump_off held_ms=%u pumped_ml=%.1f\n",
-                          static_cast<unsigned>(heldDuration), pumpedMl);
+            requestManualStop(activePot, PumpStopReason::MANUAL_RELEASE);
+            Serial.printf("[MANUAL] event=pump_off_request held_ms=%u pot=%u\n",
+                          static_cast<unsigned>(heldDuration),
+                          static_cast<unsigned>(activePot));
         }
         manual.blueHeldMs = 0;
         manual.blueOwnsPump = false;
@@ -1039,9 +1296,11 @@ void manualPumpTick(uint32_t nowMs,
         manual.locked = true;
         manual.lockUntilMs = nowMs + 20000;
         manual.blueHeldMs = 0;
-        if (manual.blueOwnsPump && hw.pump(selectedPot).isOn()) {
-            hw.pump(selectedPot).off(nowMs, "BUTTON_SPAM");
-            actuator.currentPumpOwner[selectedPot] = PumpOwner::NONE;
+        uint8_t activePot = (manual.blueOwnsPump && manual.activePot < cfg.numPots)
+            ? manual.activePot
+            : selectedPot;
+        if (manual.blueOwnsPump && hw.pump(activePot).isOn()) {
+            requestManualStop(activePot, PumpStopReason::BUTTON_SPAM);
         }
         manual.blueOwnsPump = false;
         manual.activePot = 0xFF;

@@ -75,6 +75,9 @@ struct SharedState {
     NetConfig     netConfig;
     WaterBudget   budget;
     WateringCycle cycles[kMaxPots];
+    PumpStopStatus pumpStop[kMaxPots];
+    PumpOwner     currentPumpOwner[kMaxPots] = {};
+    uint32_t      lastPumpActivityMs[kMaxPots] = {};
     uint32_t      lastCycleDoneMs[kMaxPots] = {};
     float         pumped24hMl = 0.0f;
     float         pumped24hMlPerPot[kMaxPots] = {};
@@ -165,6 +168,9 @@ static void publishSharedStateFromControl() {
         s_sharedState.netConfig = g_netConfig;
         s_sharedState.budget = g_budget;
         memcpy(s_sharedState.cycles, g_cycles, sizeof(g_cycles));
+        memcpy(s_sharedState.pumpStop, g_actuator.pumpStop, sizeof(g_actuator.pumpStop));
+        memcpy(s_sharedState.currentPumpOwner, g_actuator.currentPumpOwner, sizeof(g_actuator.currentPumpOwner));
+        memcpy(s_sharedState.lastPumpActivityMs, g_actuator.lastPumpActivityMs, sizeof(g_actuator.lastPumpActivityMs));
         memcpy(s_sharedState.lastCycleDoneMs, g_actuator.lastCycleDoneMs, sizeof(g_actuator.lastCycleDoneMs));
         s_sharedState.pumped24hMl = history24.pumpedMl;
         memcpy(s_sharedState.pumped24hMlPerPot, history24.pumpedMlPerPot, sizeof(history24.pumpedMlPerPot));
@@ -286,6 +292,7 @@ static const char* remoteWaterRejectMessage(const char* reason) {
     if (strcmp(reason, "pot_disabled") == 0) return "water request blocked: pot is disabled.";
     if (strcmp(reason, "mode_manual") == 0) return "water request blocked: mode is MANUAL.";
     if (strcmp(reason, "cycle_active") == 0) return "water request blocked: watering is already active.";
+    if (strcmp(reason, "pump_stopping") == 0) return "water request blocked: pump stop is still pending.";
     if (strcmp(reason, "cooldown") == 0) return "water request blocked: cooldown is still active.";
     if (strcmp(reason, "PUMP_CONFIG_INVALID") == 0) return "water request blocked: pump parameters are invalid.";
     if (strcmp(reason, "OVERFLOW_RISK") == 0) return "water request blocked: overflow sensor is triggered.";
@@ -379,10 +386,18 @@ static void publishWateringFeedback(const uint32_t* prevFeedbackSeq) {
                 queueTelegramFeedbackFmt("Pot %u: blocked by safety, fixed pump parameters are invalid.",
                                          static_cast<unsigned>(i + 1));
                 break;
+            case WateringFeedbackCode::SAFETY_BLOCK_PUMP_STOP_FAILED:
+                queueTelegramFeedbackFmt("Pot %u: pump stop failed, automatic retries are active and watering stays blocked.",
+                                         static_cast<unsigned>(i + 1));
+                break;
             case WateringFeedbackCode::HARD_TIMEOUT:
                 queueTelegramFeedbackFmt("Pot %u: hard timeout, pump forced OFF after %.0fms.",
                                          static_cast<unsigned>(i + 1),
                                          g_actuator.lastFeedbackValue1[i]);
+                break;
+            case WateringFeedbackCode::PUMP_STOP_RECOVERED:
+                queueTelegramFeedbackFmt("Pot %u: pump stop recovered after retry, control resumed.",
+                                         static_cast<unsigned>(i + 1));
                 break;
             case WateringFeedbackCode::SAFETY_UNBLOCK:
                 queueTelegramFeedbackFmt("Pot %u: safety block cleared.",
@@ -434,6 +449,9 @@ static uint32_t statusDigest(const SensorSnapshot& snap) {
         h = hashMix(h, bucket(ps.moistureEma, 3.0f));
         h = hashMix(h, static_cast<uint32_t>(ps.waterGuards.potMax));
         h = hashMix(h, static_cast<uint32_t>(ps.waterGuards.reservoirMin));
+        h = hashMix(h, static_cast<uint32_t>(g_actuator.currentPumpOwner[i]));
+        h = hashMix(h, g_actuator.pumpStop[i].pending ? 1u : 0u);
+        h = hashMix(h, static_cast<uint32_t>(g_actuator.pumpStop[i].faultState));
         h = hashMix(h, ps.waterGuards.potMaxStatus.pendingTrip ? 1u : 0u);
         h = hashMix(h, ps.waterGuards.potMaxStatus.pendingClear ? 1u : 0u);
         h = hashMix(h, ps.waterGuards.reservoirMinStatus.pendingTrip ? 1u : 0u);
@@ -458,6 +476,10 @@ static uint32_t statusCriticalDigest(const SensorSnapshot& snap) {
         h = hashMix(h, i);
         h = hashMix(h, static_cast<uint32_t>(cyc.phase));
         h = hashMix(h, cyc.pulseCount);
+        h = hashMix(h, static_cast<uint32_t>(g_actuator.currentPumpOwner[i]));
+        h = hashMix(h, g_actuator.pumpStop[i].pending ? 1u : 0u);
+        h = hashMix(h, static_cast<uint32_t>(g_actuator.pumpStop[i].faultState));
+        h = hashMix(h, g_actuator.pumpStop[i].retryCount);
         h = hashMix(h, ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? 1u : 0u);
         h = hashMix(h, ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? 1u : 0u);
         h = hashMix(h, ps.waterGuards.potMaxStatus.pendingTrip ? 1u : 0u);
@@ -599,20 +621,14 @@ static void saveRuntimeNow(uint32_t& lastSaveMs) {
     lastSaveMs = millis();
 }
 
-static bool forcePumpOffWithRetry(uint8_t potIdx, uint32_t nowMs,
-                                  const char* reason,
-                                  uint8_t retries = 3) {
-    PumpActuator& pump = g_hardware.pump(potIdx);
-    for (uint8_t attempt = 0; attempt < retries; ++attempt) {
-        if (pump.off(nowMs, reason)) {
-            g_actuator.currentPumpOwner[potIdx] = PumpOwner::NONE;
-            return true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(2));
+static void requestControlPumpStop(uint32_t nowMs,
+                                   uint8_t potIdx,
+                                   const PumpStopRequest& request) {
+    requestPumpStop(nowMs, potIdx, request, g_actuator);
+    if (request.hasCycleContext) {
+        g_cycles[potIdx].phase = WateringPhase::STOPPING;
+        g_cycles[potIdx].phaseStartMs = nowMs;
     }
-    Serial.printf("[POT%d] SAFETY_BLOCK reason=pump_off_failed src=%s\n",
-                  potIdx, reason ? reason : "unknown");
-    return false;
 }
 
 static bool startRemoteWateringPulse(uint32_t nowMs,
@@ -635,6 +651,15 @@ static bool startRemoteWateringPulse(uint32_t nowMs,
         Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=cycle_active phase=%d\n",
                       potIdx, static_cast<int>(g_cycles[potIdx].phase));
         if (rejectReason) *rejectReason = "cycle_active";
+        return false;
+    }
+    if (g_actuator.pumpStop[potIdx].pending
+        || g_actuator.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
+        Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=pump_stopping fault=%d retries=%u\n",
+                      potIdx,
+                      static_cast<int>(g_actuator.pumpStop[potIdx].faultState),
+                      static_cast<unsigned>(g_actuator.pumpStop[potIdx].retryCount));
+        if (rejectReason) *rejectReason = "pump_stopping";
         return false;
     }
 
@@ -819,6 +844,20 @@ static void controlTaskFn(void* /*param*/) {
     bool duskBootstrapped = false;  // one-shot lux-based phase check
     uint32_t lastFailsafeOffMs[kMaxPots] = {};
     uint32_t lastUnexpectedPumpLogMs[kMaxPots] = {};
+    uint32_t lastPumpStopPublishMs = 0;
+
+    for (uint8_t i = 0; i < kMaxPots; ++i) {
+        PumpStopRequest startupStop{};
+        startupStop.reason = PumpStopReason::STARTUP_SAFE_OFF;
+        startupStop.ownerAtRequest = PumpOwner::NONE;
+        startupStop.accountRuntimeOnSuccess = false;
+        startupStop.hasCycleContext = false;
+        startupStop.successCyclePhase = WateringPhase::IDLE;
+        startupStop.clearCycleOnSuccess = false;
+        startupStop.publishFailureFeedback = true;
+        startupStop.publishRecoveryFeedback = true;
+        requestControlPumpStop(millis(), i, startupStop);
+    }
 
     for (;;) {
         uint32_t now = millis();
@@ -871,16 +910,23 @@ static void controlTaskFn(void* /*param*/) {
             } else {
                 // Mode != AUTO → abort any active watering cycles
                 for (uint8_t i = 0; i < g_config.numPots; ++i) {
-                    if (g_cycles[i].phase != WateringPhase::IDLE) {
-                        if (g_cycles[i].phase == WateringPhase::PULSE &&
-                            g_hardware.pump(i).isOn()) {
-                            forcePumpOffWithRetry(i, now, "mode_switch");
-                        }
+                    bool cycleActive = g_cycles[i].phase != WateringPhase::IDLE;
+                    bool stopPending = g_actuator.pumpStop[i].pending;
+                    if ((cycleActive || g_hardware.pump(i).isOn()) && !stopPending) {
+                        PumpStopRequest stopReq{};
+                        stopReq.reason = PumpStopReason::MODE_SWITCH;
+                        stopReq.ownerAtRequest = g_actuator.currentPumpOwner[i];
+                        stopReq.accountRuntimeOnSuccess = g_hardware.pump(i).isOn();
+                        stopReq.hasCycleContext = cycleActive;
+                        stopReq.successCyclePhase = WateringPhase::IDLE;
+                        stopReq.clearCycleOnSuccess = cycleActive;
+                        stopReq.publishFailureFeedback = true;
+                        stopReq.publishRecoveryFeedback = true;
+                        requestControlPumpStop(now, i, stopReq);
                         Serial.printf("[POT%d] CYCLE_ABORT reason=mode_switch phase=%d\n",
                                       i, static_cast<int>(g_cycles[i].phase));
                         queueTelegramFeedbackFmt("Pot %u: cycle aborted because mode switched to MANUAL.",
                                                  static_cast<unsigned>(i + 1));
-                        g_cycles[i].reset();
                     }
                 }
             }
@@ -888,19 +934,41 @@ static void controlTaskFn(void* /*param*/) {
             // Hardware-level pump safety — niezależnie od trybu/FSM
             for (uint8_t i = 0; i < g_config.numPots; ++i) {
                 PumpActuator& p = g_hardware.pump(i);
-                if (p.isOn() && p.onDuration(now) > g_config.pumpOnMsMax) {
-                    forcePumpOffWithRetry(i, now, "HW_SAFETY_TIMEOUT");
-                    Serial.printf("[POT%d] HW_SAFETY: pump forced off after %dms\n",
+                bool cycleActive = g_cycles[i].phase != WateringPhase::IDLE;
+                if (p.isOn() && p.onDuration(now) > g_config.pumpOnMsMax
+                    && !g_actuator.pumpStop[i].pending) {
+                    PumpStopRequest stopReq{};
+                    stopReq.reason = PumpStopReason::HW_SAFETY_TIMEOUT;
+                    stopReq.ownerAtRequest = g_actuator.currentPumpOwner[i];
+                    stopReq.accountRuntimeOnSuccess = true;
+                    stopReq.hasCycleContext = cycleActive;
+                    stopReq.successCyclePhase = cycleActive ? WateringPhase::BLOCKED : WateringPhase::IDLE;
+                    stopReq.clearCycleOnSuccess = false;
+                    stopReq.publishFailureFeedback = true;
+                    stopReq.publishRecoveryFeedback = true;
+                    requestControlPumpStop(now, i, stopReq);
+                    Serial.printf("[POT%d] HW_SAFETY: pump stop requested after %dms\n",
                                   i, p.onDuration(now));
                 }
 
                 bool cycleOwnsPump = g_cycles[i].phase == WateringPhase::PULSE;
                 bool manualOwnsPump = g_manual.blueOwnsPump && g_manual.activePot == i;
-                bool legalContext = cycleOwnsPump || manualOwnsPump;
+                bool stopPending = g_actuator.pumpStop[i].pending;
+                bool legalContext = cycleOwnsPump || manualOwnsPump || stopPending;
 
-                if (!legalContext && (now - lastFailsafeOffMs[i]) >= 1000) {
+                if (!legalContext && (now - lastFailsafeOffMs[i]) >= 1000
+                    && !g_actuator.pumpStop[i].pending) {
                     lastFailsafeOffMs[i] = now;
-                    forcePumpOffWithRetry(i, now, "FAILSAFE_IDLE_OFF");
+                    PumpStopRequest stopReq{};
+                    stopReq.reason = PumpStopReason::FAILSAFE_IDLE_OFF;
+                    stopReq.ownerAtRequest = g_actuator.currentPumpOwner[i];
+                    stopReq.accountRuntimeOnSuccess = p.isOn();
+                    stopReq.hasCycleContext = false;
+                    stopReq.successCyclePhase = WateringPhase::IDLE;
+                    stopReq.clearCycleOnSuccess = false;
+                    stopReq.publishFailureFeedback = true;
+                    stopReq.publishRecoveryFeedback = true;
+                    requestControlPumpStop(now, i, stopReq);
                 }
 
                 if (!legalContext && p.isOn() && (now - lastUnexpectedPumpLogMs[i]) >= 2000) {
@@ -1057,6 +1125,7 @@ static void controlTaskFn(void* /*param*/) {
                         case WateringPhase::IDLE:          phaseStr = "IDLE"; break;
                         case WateringPhase::EVALUATING:    phaseStr = "EVAL"; break;
                         case WateringPhase::PULSE:         phaseStr = "PULSE"; break;
+                        case WateringPhase::STOPPING:      phaseStr = "STOPPING"; break;
                         case WateringPhase::SOAK:          phaseStr = "SOAK"; break;
                         case WateringPhase::MEASURING:     phaseStr = "MEAS"; break;
                         case WateringPhase::OVERFLOW_WAIT: phaseStr = "OFLOW"; break;
@@ -1070,6 +1139,12 @@ static void controlTaskFn(void* /*param*/) {
                                   i,
                                   pumpOwnerName(g_actuator.currentPumpOwner[i]),
                                   g_manual.locked ? "YES" : "no");
+                    Serial.printf("[POT%d] pump_stop pending=%s fault=%d retries=%u reason=%d\n",
+                                  i,
+                                  g_actuator.pumpStop[i].pending ? "yes" : "no",
+                                  static_cast<int>(g_actuator.pumpStop[i].faultState),
+                                  static_cast<unsigned>(g_actuator.pumpStop[i].retryCount),
+                                  static_cast<int>(g_actuator.pumpStop[i].reason));
 
                     if (cyc.phase == WateringPhase::IDLE && g_config.mode == Mode::AUTO) {
                         const PlantProfile& pr = getActiveProfile(g_config, i);
@@ -1344,34 +1419,28 @@ static void controlTaskFn(void* /*param*/) {
 
                 case EventType::REQUEST_PUMP_OFF: {
                     bool any = false;
-                    bool budgetChanged = false;
                     for (uint8_t i = 0; i < g_config.numPots; ++i) {
-                        if (g_hardware.pump(i).isOn()) {
+                        bool cycleActive = g_cycles[i].phase != WateringPhase::IDLE;
+                        bool pumpOn = g_hardware.pump(i).isOn();
+                        if (pumpOn || cycleActive || g_actuator.pumpStop[i].pending) {
                             any = true;
-                            uint32_t onMs = g_hardware.pump(i).onDuration(now);
-                            if (g_config.pots[i].pumpMlPerSec > 0.0f && onMs > 0) {
-                                float pumpedMl = (onMs / 1000.0f) * g_config.pots[i].pumpMlPerSec;
-                                addPumped(g_budget, pumpedMl, i);
-                                g_cycles[i].totalPumpedMs += onMs;
-                                g_cycles[i].totalPumpedMl += pumpedMl;
-                                budgetChanged = true;
-                            }
-                            forcePumpOffWithRetry(i, now, "REMOTE_STOP");
-                        }
-                        if (g_cycles[i].phase != WateringPhase::IDLE) {
-                            any = true;
-                            g_cycles[i].reset();
-                            g_actuator.lastCycleDoneMs[i] = now;
+                            PumpStopRequest stopReq{};
+                            stopReq.reason = PumpStopReason::REMOTE_STOP;
+                            stopReq.ownerAtRequest = g_actuator.currentPumpOwner[i];
+                            stopReq.accountRuntimeOnSuccess = pumpOn;
+                            stopReq.hasCycleContext = cycleActive;
+                            stopReq.successCyclePhase = WateringPhase::IDLE;
+                            stopReq.clearCycleOnSuccess = cycleActive;
+                            stopReq.publishFailureFeedback = true;
+                            stopReq.publishRecoveryFeedback = true;
+                            requestControlPumpStop(now, i, stopReq);
                         }
                     }
                     g_manual.blueHeldMs = 0;
                     g_manual.blueOwnsPump = false;
+                    g_manual.activePot = 0xFF;
                     g_manual.locked = true;
                     g_manual.lockUntilMs = now + 5000;
-                    if (budgetChanged) {
-                        s_runtimeDirty = true;
-                        saveRuntimeNow(lastRuntimeSave);
-                    }
                     Serial.printf("[CTRL] event=remote_stop any=%s\n", any ? "yes" : "no");
                     publishSharedStateFromControl();
                     break;
@@ -1413,6 +1482,26 @@ static void controlTaskFn(void* /*param*/) {
 
                 default:
                     break;
+            }
+        }
+
+        bool pumpStopWorkActive = false;
+        for (uint8_t i = 0; i < kMaxPots; ++i) {
+            if (g_actuator.pumpStop[i].pending || g_cycles[i].phase == WateringPhase::STOPPING) {
+                pumpStopWorkActive = true;
+                break;
+            }
+        }
+        if (pumpStopWorkActive) {
+            servicePumpStopRequests(now, g_config, g_cycles, g_budget, g_actuator, g_hardware);
+            if (g_budget.totalPumpedMl != prevTotalPumped) {
+                prevTotalPumped = g_budget.totalPumpedMl;
+                s_runtimeDirty = true;
+                saveRuntimeNow(lastRuntimeSave);
+            }
+            if ((now - lastPumpStopPublishMs) >= 25 || !pumpStopWorkActive) {
+                publishSharedStateFromControl();
+                lastPumpStopPublishMs = now;
             }
         }
 
@@ -1670,6 +1759,8 @@ static void uiTaskFn(void* /*param*/) {
             UiSnap uSnap{};
             uSnap.sensors       = readSnapshot();
             memcpy(uSnap.cycles, shared.cycles, sizeof(shared.cycles));
+            memcpy(uSnap.pumpStop, shared.pumpStop, sizeof(shared.pumpStop));
+            memcpy(uSnap.currentPumpOwner, shared.currentPumpOwner, sizeof(shared.currentPumpOwner));
             uSnap.budget        = shared.budget;
             uSnap.config        = shared.config;
             uSnap.netConfig     = shared.netConfig;
@@ -1717,6 +1808,9 @@ static void netTaskFn(void* /*param*/) {
             tgData.sensors = latestSnap;
             tgData.budget = shared.budget;
             memcpy(tgData.cycles, shared.cycles, sizeof(shared.cycles));
+            memcpy(tgData.pumpStop, shared.pumpStop, sizeof(shared.pumpStop));
+            memcpy(tgData.currentPumpOwner, shared.currentPumpOwner, sizeof(shared.currentPumpOwner));
+            memcpy(tgData.lastPumpActivityMs, shared.lastPumpActivityMs, sizeof(shared.lastPumpActivityMs));
             memcpy(tgData.lastCycleDoneMs, shared.lastCycleDoneMs, sizeof(shared.lastCycleDoneMs));
             memcpy(tgData.lastFeedbackSeq, shared.lastFeedbackSeq, sizeof(shared.lastFeedbackSeq));
             memcpy(tgData.lastFeedbackCode, shared.lastFeedbackCode, sizeof(shared.lastFeedbackCode));
@@ -1739,6 +1833,7 @@ static void netTaskFn(void* /*param*/) {
                 rptData.sensors  = latestSnap;
                 rptData.budget   = shared.budget;
                 memcpy(rptData.trends, shared.trends, sizeof(shared.trends));
+                memcpy(rptData.lastPumpActivityMs, shared.lastPumpActivityMs, sizeof(shared.lastPumpActivityMs));
                 memcpy(rptData.lastCycleDoneMs, shared.lastCycleDoneMs, sizeof(shared.lastCycleDoneMs));
                 rptData.pumped24hMl = shared.pumped24hMl;
                 memcpy(rptData.pumped24hMlPerPot, shared.pumped24hMlPerPot, sizeof(shared.pumped24hMlPerPot));
