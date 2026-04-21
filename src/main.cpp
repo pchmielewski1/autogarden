@@ -75,14 +75,8 @@ struct SharedState {
     NetConfig     netConfig;
     WaterBudget   budget;
     WateringCycle cycles[kMaxPots];
-    PumpStopStatus pumpStop[kMaxPots];
-    PumpOwner     currentPumpOwner[kMaxPots] = {};
-    uint32_t      lastPumpActivityMs[kMaxPots] = {};
+    PumpStopStatus pumpStop[kMaxPots] = {};
     uint32_t      lastCycleDoneMs[kMaxPots] = {};
-    float         pumped24hMl = 0.0f;
-    float         pumped24hMlPerPot[kMaxPots] = {};
-    uint16_t      wateringEvents24h = 0;
-    uint16_t      wateringEvents24hPerPot[kMaxPots] = {};
     uint32_t      lastFeedbackSeq[kMaxPots] = {};
     WateringFeedbackCode lastFeedbackCode[kMaxPots] = {};
     float         lastFeedbackValue1[kMaxPots] = {};
@@ -107,13 +101,6 @@ struct TelegramFeedbackMessage {
 static QueueHandle_t     s_tgFeedbackQueue = nullptr;
 static constexpr UBaseType_t kTelegramFeedbackDrainPerTick = 2;
 
-struct WateringHistory24hSummary {
-    float pumpedMl = 0.0f;
-    float pumpedMlPerPot[kMaxPots] = {};
-    uint16_t events = 0;
-    uint16_t eventsPerPot[kMaxPots] = {};
-};
-
 // ============================================================================
 // Helpers — snapshot (thread-safe r/w)
 // ============================================================================
@@ -125,57 +112,22 @@ static void publishSnapshot(const SensorSnapshot& snap) {
     }
 }
 
-static SensorSnapshot readSnapshot() {
-    SensorSnapshot snap{};
+static void readSnapshot(SensorSnapshot& snap) {
+    snap = SensorSnapshot{};
     if (xSemaphoreTake(s_snapMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         snap = s_latestSnap;
         xSemaphoreGive(s_snapMutex);
     }
-    return snap;
-}
-
-static WateringHistory24hSummary summarizeWateringHistory24h(uint32_t nowMs) {
-    WateringHistory24hSummary summary{};
-    for (uint16_t i = 0; i < g_history.wateringLog.size(); ++i) {
-        const WateringRecord& rec = g_history.wateringLog.at(i);
-        if (rec.timestampMs == 0 || rec.timestampMs > nowMs) {
-            continue;
-        }
-        if ((nowMs - rec.timestampMs) > 86400000UL) {
-            continue;
-        }
-
-        float pumpedMl = rec.totalPumpedMl_x10 / 10.0f;
-        summary.pumpedMl += pumpedMl;
-        if (summary.events < 0xFFFFu) {
-            summary.events++;
-        }
-
-        if (rec.potIndex < kMaxPots) {
-            summary.pumpedMlPerPot[rec.potIndex] += pumpedMl;
-            if (summary.eventsPerPot[rec.potIndex] < 0xFFFFu) {
-                summary.eventsPerPot[rec.potIndex]++;
-            }
-        }
-    }
-    return summary;
 }
 
 static void publishSharedStateFromControl() {
     if (xSemaphoreTake(s_stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        WateringHistory24hSummary history24 = summarizeWateringHistory24h(millis());
         s_sharedState.config = g_config;
         s_sharedState.netConfig = g_netConfig;
         s_sharedState.budget = g_budget;
         memcpy(s_sharedState.cycles, g_cycles, sizeof(g_cycles));
         memcpy(s_sharedState.pumpStop, g_actuator.pumpStop, sizeof(g_actuator.pumpStop));
-        memcpy(s_sharedState.currentPumpOwner, g_actuator.currentPumpOwner, sizeof(g_actuator.currentPumpOwner));
-        memcpy(s_sharedState.lastPumpActivityMs, g_actuator.lastPumpActivityMs, sizeof(g_actuator.lastPumpActivityMs));
         memcpy(s_sharedState.lastCycleDoneMs, g_actuator.lastCycleDoneMs, sizeof(g_actuator.lastCycleDoneMs));
-        s_sharedState.pumped24hMl = history24.pumpedMl;
-        memcpy(s_sharedState.pumped24hMlPerPot, history24.pumpedMlPerPot, sizeof(history24.pumpedMlPerPot));
-        s_sharedState.wateringEvents24h = history24.events;
-        memcpy(s_sharedState.wateringEvents24hPerPot, history24.eventsPerPot, sizeof(history24.eventsPerPot));
         memcpy(s_sharedState.lastFeedbackSeq, g_actuator.lastFeedbackSeq, sizeof(g_actuator.lastFeedbackSeq));
         memcpy(s_sharedState.lastFeedbackCode, g_actuator.lastFeedbackCode, sizeof(g_actuator.lastFeedbackCode));
         memcpy(s_sharedState.lastFeedbackValue1, g_actuator.lastFeedbackValue1, sizeof(g_actuator.lastFeedbackValue1));
@@ -195,13 +147,12 @@ static void publishSharedNetStatus(bool wifiConnected) {
     }
 }
 
-static SharedState readSharedState() {
-    SharedState state{};
+static void readSharedState(SharedState& state) {
+    state = SharedState{};
     if (xSemaphoreTake(s_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         state = s_sharedState;
         xSemaphoreGive(s_stateMutex);
     }
-    return state;
 }
 
 static void setSelectedPotFromUi(uint8_t selectedPot) {
@@ -243,33 +194,6 @@ static const char* pumpOwnerName(PumpOwner owner) {
     }
 }
 
-static const char* lightStateName(LightSignalState state) {
-    switch (state) {
-        case LightSignalState::VALID: return "VALID";
-        case LightSignalState::STALE: return "STALE";
-        case LightSignalState::RECOVERING: return "RECOVERING";
-        case LightSignalState::UNKNOWN:
-        default:
-            return "UNKNOWN";
-    }
-}
-
-static const char* waterLevelStateName(WaterLevelState state) {
-    switch (state) {
-        case WaterLevelState::OK: return "OK";
-        case WaterLevelState::TRIGGERED: return "TRIG";
-        case WaterLevelState::UNKNOWN:
-        default:
-            return "UNK";
-    }
-}
-
-static const char* waterLevelPendingName(const WaterLevelStatus& status) {
-    if (status.pendingTrip) return "TRIP";
-    if (status.pendingClear) return "CLEAR";
-    return "-";
-}
-
 static float effectiveTargetForPot(const Config& cfg, uint8_t potIdx) {
     const PlantProfile& prof = getActiveProfile(cfg, potIdx);
     float target = prof.targetMoisturePct;
@@ -292,7 +216,6 @@ static const char* remoteWaterRejectMessage(const char* reason) {
     if (strcmp(reason, "pot_disabled") == 0) return "water request blocked: pot is disabled.";
     if (strcmp(reason, "mode_manual") == 0) return "water request blocked: mode is MANUAL.";
     if (strcmp(reason, "cycle_active") == 0) return "water request blocked: watering is already active.";
-    if (strcmp(reason, "pump_stopping") == 0) return "water request blocked: pump stop is still pending.";
     if (strcmp(reason, "cooldown") == 0) return "water request blocked: cooldown is still active.";
     if (strcmp(reason, "PUMP_CONFIG_INVALID") == 0) return "water request blocked: pump parameters are invalid.";
     if (strcmp(reason, "OVERFLOW_RISK") == 0) return "water request blocked: overflow sensor is triggered.";
@@ -386,18 +309,10 @@ static void publishWateringFeedback(const uint32_t* prevFeedbackSeq) {
                 queueTelegramFeedbackFmt("Pot %u: blocked by safety, fixed pump parameters are invalid.",
                                          static_cast<unsigned>(i + 1));
                 break;
-            case WateringFeedbackCode::SAFETY_BLOCK_PUMP_STOP_FAILED:
-                queueTelegramFeedbackFmt("Pot %u: pump stop failed, automatic retries are active and watering stays blocked.",
-                                         static_cast<unsigned>(i + 1));
-                break;
             case WateringFeedbackCode::HARD_TIMEOUT:
                 queueTelegramFeedbackFmt("Pot %u: hard timeout, pump forced OFF after %.0fms.",
                                          static_cast<unsigned>(i + 1),
                                          g_actuator.lastFeedbackValue1[i]);
-                break;
-            case WateringFeedbackCode::PUMP_STOP_RECOVERED:
-                queueTelegramFeedbackFmt("Pot %u: pump stop recovered after retry, control resumed.",
-                                         static_cast<unsigned>(i + 1));
                 break;
             case WateringFeedbackCode::SAFETY_UNBLOCK:
                 queueTelegramFeedbackFmt("Pot %u: safety block cleared.",
@@ -436,8 +351,6 @@ static uint32_t statusDigest(const SensorSnapshot& snap) {
     h = hashMix(h, bucket(snap.env.humidityPct, 3.0f));
     h = hashMix(h, bucket(snap.env.lux, 500.0f));
     h = hashMix(h, bucket(snap.env.pressureHpa, 1.0f));
-    h = hashMix(h, static_cast<uint32_t>(snap.env.lightState));
-    h = hashMix(h, snap.env.luxAgeMs / 30000u);
     h = hashMix(h, bucket(g_budget.reservoirCurrentMl, 25.0f));
     h = hashMix(h, bucket(g_budget.totalPumpedMl, 5.0f));
 
@@ -447,15 +360,6 @@ static uint32_t statusDigest(const SensorSnapshot& snap) {
         h = hashMix(h, i);
         h = hashMix(h, bucket(ps.moisturePct, 3.0f));
         h = hashMix(h, bucket(ps.moistureEma, 3.0f));
-        h = hashMix(h, static_cast<uint32_t>(ps.waterGuards.potMax));
-        h = hashMix(h, static_cast<uint32_t>(ps.waterGuards.reservoirMin));
-        h = hashMix(h, static_cast<uint32_t>(g_actuator.currentPumpOwner[i]));
-        h = hashMix(h, g_actuator.pumpStop[i].pending ? 1u : 0u);
-        h = hashMix(h, static_cast<uint32_t>(g_actuator.pumpStop[i].faultState));
-        h = hashMix(h, ps.waterGuards.potMaxStatus.pendingTrip ? 1u : 0u);
-        h = hashMix(h, ps.waterGuards.potMaxStatus.pendingClear ? 1u : 0u);
-        h = hashMix(h, ps.waterGuards.reservoirMinStatus.pendingTrip ? 1u : 0u);
-        h = hashMix(h, ps.waterGuards.reservoirMinStatus.pendingClear ? 1u : 0u);
     }
     return h;
 }
@@ -467,7 +371,6 @@ static uint32_t statusCriticalDigest(const SensorSnapshot& snap) {
     h = hashMix(h, g_config.vacationMode ? 1u : 0u);
     h = hashMix(h, g_budget.reservoirLow ? 1u : 0u);
     h = hashMix(h, static_cast<uint32_t>(g_duskDetector.phase));
-    h = hashMix(h, static_cast<uint32_t>(snap.env.lightState));
 
     for (uint8_t i = 0; i < g_config.numPots; ++i) {
         if (!g_config.pots[i].enabled) continue;
@@ -476,14 +379,8 @@ static uint32_t statusCriticalDigest(const SensorSnapshot& snap) {
         h = hashMix(h, i);
         h = hashMix(h, static_cast<uint32_t>(cyc.phase));
         h = hashMix(h, cyc.pulseCount);
-        h = hashMix(h, static_cast<uint32_t>(g_actuator.currentPumpOwner[i]));
-        h = hashMix(h, g_actuator.pumpStop[i].pending ? 1u : 0u);
-        h = hashMix(h, static_cast<uint32_t>(g_actuator.pumpStop[i].faultState));
-        h = hashMix(h, g_actuator.pumpStop[i].retryCount);
         h = hashMix(h, ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? 1u : 0u);
         h = hashMix(h, ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? 1u : 0u);
-        h = hashMix(h, ps.waterGuards.potMaxStatus.pendingTrip ? 1u : 0u);
-        h = hashMix(h, ps.waterGuards.reservoirMinStatus.pendingTrip ? 1u : 0u);
     }
     return h;
 }
@@ -621,14 +518,47 @@ static void saveRuntimeNow(uint32_t& lastSaveMs) {
     lastSaveMs = millis();
 }
 
-static void requestControlPumpStop(uint32_t nowMs,
+static bool controlHasActiveCycle(const WateringCycle& cycle) {
+    return cycle.phase != WateringPhase::IDLE && cycle.phase != WateringPhase::DONE;
+}
+
+static bool controlPumpStopActive(const PumpStopStatus& stop) {
+    return stop.pending || stop.faultState == PumpStopFaultState::STOP_FAILED_LATCHED;
+}
+
+static bool requestControlPumpStop(uint32_t nowMs,
                                    uint8_t potIdx,
-                                   const PumpStopRequest& request) {
-    requestPumpStop(nowMs, potIdx, request, g_actuator);
-    if (request.hasCycleContext) {
+                                   PumpStopReason reason,
+                                   bool hasCycleContext,
+                                   WateringPhase successCyclePhase = WateringPhase::IDLE,
+                                   bool clearCycleOnSuccess = false,
+                                   bool publishFailureFeedback = true,
+                                   bool publishRecoveryFeedback = true,
+                                   PumpOwner ownerOverride = PumpOwner::NONE) {
+    if (potIdx >= g_config.numPots) {
+        return false;
+    }
+
+    PumpStopRequest stopReq{};
+    stopReq.reason = reason;
+    stopReq.ownerAtRequest = ownerOverride != PumpOwner::NONE
+        ? ownerOverride
+        : (g_actuator.currentPumpOwner[potIdx] != PumpOwner::NONE
+            ? g_actuator.currentPumpOwner[potIdx]
+            : g_cycles[potIdx].source);
+    stopReq.accountRuntimeOnSuccess = g_hardware.pump(potIdx).isOn();
+    stopReq.hasCycleContext = hasCycleContext;
+    stopReq.successCyclePhase = successCyclePhase;
+    stopReq.clearCycleOnSuccess = clearCycleOnSuccess;
+    stopReq.publishFailureFeedback = publishFailureFeedback;
+    stopReq.publishRecoveryFeedback = publishRecoveryFeedback;
+
+    bool queued = requestPumpStop(nowMs, potIdx, stopReq, g_actuator);
+    if (queued && hasCycleContext && controlHasActiveCycle(g_cycles[potIdx])) {
         g_cycles[potIdx].phase = WateringPhase::STOPPING;
         g_cycles[potIdx].phaseStartMs = nowMs;
     }
+    return queued;
 }
 
 static bool startRemoteWateringPulse(uint32_t nowMs,
@@ -651,15 +581,6 @@ static bool startRemoteWateringPulse(uint32_t nowMs,
         Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=cycle_active phase=%d\n",
                       potIdx, static_cast<int>(g_cycles[potIdx].phase));
         if (rejectReason) *rejectReason = "cycle_active";
-        return false;
-    }
-    if (g_actuator.pumpStop[potIdx].pending
-        || g_actuator.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
-        Serial.printf("[POT%d] REMOTE_WATER_BLOCK reason=pump_stopping fault=%d retries=%u\n",
-                      potIdx,
-                      static_cast<int>(g_actuator.pumpStop[potIdx].faultState),
-                      static_cast<unsigned>(g_actuator.pumpStop[potIdx].retryCount));
-        if (rejectReason) *rejectReason = "pump_stopping";
         return false;
     }
 
@@ -842,32 +763,21 @@ static void controlTaskFn(void* /*param*/) {
 
     SensorSnapshot snap{};
     bool duskBootstrapped = false;  // one-shot lux-based phase check
-    uint32_t lastFailsafeOffMs[kMaxPots] = {};
     uint32_t lastUnexpectedPumpLogMs[kMaxPots] = {};
-    uint32_t lastPumpStopPublishMs = 0;
-
-    for (uint8_t i = 0; i < kMaxPots; ++i) {
-        PumpStopRequest startupStop{};
-        startupStop.reason = PumpStopReason::STARTUP_SAFE_OFF;
-        startupStop.ownerAtRequest = PumpOwner::NONE;
-        startupStop.accountRuntimeOnSuccess = false;
-        startupStop.hasCycleContext = false;
-        startupStop.successCyclePhase = WateringPhase::IDLE;
-        startupStop.clearCycleOnSuccess = false;
-        startupStop.publishFailureFeedback = true;
-        startupStop.publishRecoveryFeedback = true;
-        requestControlPumpStop(millis(), i, startupStop);
-    }
 
     for (;;) {
         uint32_t now = millis();
+
+        servicePumpStopRequests(now, g_config, g_cycles, g_budget,
+                                g_actuator, g_hardware);
 
         // --- Generuj ticki ---
         if (now - lastTick10ms >= 10) {
             lastTick10ms = now;
             // 10ms: odczyt Dual Button, manual pump
             DualButtonState dualBtn = g_hardware.dualButton().read(now);
-            SharedState shared = readSharedState();
+            SharedState shared{};
+            readSharedState(shared);
             manualPumpTick(now, dualBtn, snap, g_config, g_manual, g_actuator,
                            shared.selectedPot, g_budget, g_hardware);
         }
@@ -879,7 +789,7 @@ static void controlTaskFn(void* /*param*/) {
             g_hardware.readAllSensors(now, g_config, snap);
 
             // One-shot: bootstrap dusk phase from first valid lux reading
-            if (!duskBootstrapped && snap.env.lightState == LightSignalState::VALID) {
+            if (!duskBootstrapped && snap.env.lux > 0.0f) {
                 duskBootstrap(g_duskDetector, snap.env.lux, snap.env.lightState);
                 duskBootstrapped = true;
             }
@@ -910,19 +820,22 @@ static void controlTaskFn(void* /*param*/) {
             } else {
                 // Mode != AUTO → abort any active watering cycles
                 for (uint8_t i = 0; i < g_config.numPots; ++i) {
-                    bool cycleActive = g_cycles[i].phase != WateringPhase::IDLE;
-                    bool stopPending = g_actuator.pumpStop[i].pending;
-                    if ((cycleActive || g_hardware.pump(i).isOn()) && !stopPending) {
-                        PumpStopRequest stopReq{};
-                        stopReq.reason = PumpStopReason::MODE_SWITCH;
-                        stopReq.ownerAtRequest = g_actuator.currentPumpOwner[i];
-                        stopReq.accountRuntimeOnSuccess = g_hardware.pump(i).isOn();
-                        stopReq.hasCycleContext = cycleActive;
-                        stopReq.successCyclePhase = WateringPhase::IDLE;
-                        stopReq.clearCycleOnSuccess = cycleActive;
-                        stopReq.publishFailureFeedback = true;
-                        stopReq.publishRecoveryFeedback = true;
-                        requestControlPumpStop(now, i, stopReq);
+                    if (g_cycles[i].phase != WateringPhase::IDLE) {
+                        bool cycleActive = controlHasActiveCycle(g_cycles[i]);
+                        bool stopActive = controlPumpStopActive(g_actuator.pumpStop[i]);
+                        if (g_hardware.pump(i).isOn() || stopActive) {
+                            requestControlPumpStop(now, i,
+                                                   PumpStopReason::MODE_SWITCH,
+                                                   cycleActive,
+                                                   WateringPhase::IDLE,
+                                                   true,
+                                                   true,
+                                                   true);
+                        } else {
+                            g_cycles[i].reset();
+                            g_actuator.currentPumpOwner[i] = PumpOwner::NONE;
+                            g_actuator.lastCycleDoneMs[i] = now;
+                        }
                         Serial.printf("[POT%d] CYCLE_ABORT reason=mode_switch phase=%d\n",
                                       i, static_cast<int>(g_cycles[i].phase));
                         queueTelegramFeedbackFmt("Pot %u: cycle aborted because mode switched to MANUAL.",
@@ -934,41 +847,33 @@ static void controlTaskFn(void* /*param*/) {
             // Hardware-level pump safety — niezależnie od trybu/FSM
             for (uint8_t i = 0; i < g_config.numPots; ++i) {
                 PumpActuator& p = g_hardware.pump(i);
-                bool cycleActive = g_cycles[i].phase != WateringPhase::IDLE;
+                bool cycleActive = controlHasActiveCycle(g_cycles[i]);
+                bool stopActive = controlPumpStopActive(g_actuator.pumpStop[i]);
                 if (p.isOn() && p.onDuration(now) > g_config.pumpOnMsMax
-                    && !g_actuator.pumpStop[i].pending) {
-                    PumpStopRequest stopReq{};
-                    stopReq.reason = PumpStopReason::HW_SAFETY_TIMEOUT;
-                    stopReq.ownerAtRequest = g_actuator.currentPumpOwner[i];
-                    stopReq.accountRuntimeOnSuccess = true;
-                    stopReq.hasCycleContext = cycleActive;
-                    stopReq.successCyclePhase = cycleActive ? WateringPhase::BLOCKED : WateringPhase::IDLE;
-                    stopReq.clearCycleOnSuccess = false;
-                    stopReq.publishFailureFeedback = true;
-                    stopReq.publishRecoveryFeedback = true;
-                    requestControlPumpStop(now, i, stopReq);
+                    && g_actuator.pumpStop[i].reason != PumpStopReason::HW_SAFETY_TIMEOUT) {
+                    requestControlPumpStop(now, i,
+                                           PumpStopReason::HW_SAFETY_TIMEOUT,
+                                           cycleActive,
+                                           cycleActive ? WateringPhase::BLOCKED : WateringPhase::IDLE,
+                                           false,
+                                           true,
+                                           true);
                     Serial.printf("[POT%d] HW_SAFETY: pump stop requested after %dms\n",
                                   i, p.onDuration(now));
                 }
 
                 bool cycleOwnsPump = g_cycles[i].phase == WateringPhase::PULSE;
                 bool manualOwnsPump = g_manual.blueOwnsPump && g_manual.activePot == i;
-                bool stopPending = g_actuator.pumpStop[i].pending;
-                bool legalContext = cycleOwnsPump || manualOwnsPump || stopPending;
+                bool legalContext = cycleOwnsPump || manualOwnsPump || stopActive;
 
-                if (!legalContext && (now - lastFailsafeOffMs[i]) >= 1000
-                    && !g_actuator.pumpStop[i].pending) {
-                    lastFailsafeOffMs[i] = now;
-                    PumpStopRequest stopReq{};
-                    stopReq.reason = PumpStopReason::FAILSAFE_IDLE_OFF;
-                    stopReq.ownerAtRequest = g_actuator.currentPumpOwner[i];
-                    stopReq.accountRuntimeOnSuccess = p.isOn();
-                    stopReq.hasCycleContext = false;
-                    stopReq.successCyclePhase = WateringPhase::IDLE;
-                    stopReq.clearCycleOnSuccess = false;
-                    stopReq.publishFailureFeedback = true;
-                    stopReq.publishRecoveryFeedback = true;
-                    requestControlPumpStop(now, i, stopReq);
+                if (p.isOn() && !legalContext && !stopActive) {
+                    requestControlPumpStop(now, i,
+                                           PumpStopReason::FAILSAFE_IDLE_OFF,
+                                           cycleActive,
+                                           cycleActive ? WateringPhase::BLOCKED : WateringPhase::IDLE,
+                                           false,
+                                           true,
+                                           true);
                 }
 
                 if (!legalContext && p.isOn() && (now - lastUnexpectedPumpLogMs[i]) >= 2000) {
@@ -1063,12 +968,6 @@ static void controlTaskFn(void* /*param*/) {
             for (uint8_t i = 0; i < kMaxPots; ++i) {
                 if (g_hardware.pump(i).isOn())  sample.flags |= 0x04;
             }
-            if (snap.env.lightState != LightSignalState::VALID) {
-                sample.flags |= 0x08;
-            }
-            if (snap.env.lightState == LightSignalState::RECOVERING) {
-                sample.flags |= 0x10;
-            }
             if (historyTick(now, sample, g_history)) {
                 historyStateSave(now, g_history);
             }
@@ -1103,18 +1002,9 @@ static void controlTaskFn(void* /*param*/) {
                               g_config.numPots,
                               g_config.vacationMode ? "ON" : "OFF");
 
-                if (snap.env.lightState == LightSignalState::VALID) {
-                    Serial.printf("[ENV] temp=%.1fC hum=%.1f%% lux=%.0f press=%.1fhPa\n",
-                                  snap.env.tempC, snap.env.humidityPct,
-                                  snap.env.lux, snap.env.pressureHpa);
-                } else {
-                    Serial.printf("[ENV] temp=%.1fC hum=%.1f%% lux=%.0f state=%s age=%lus press=%.1fhPa\n",
-                                  snap.env.tempC, snap.env.humidityPct,
-                                  snap.env.lux,
-                                  lightStateName(snap.env.lightState),
-                                  static_cast<unsigned long>(snap.env.luxAgeMs / 1000UL),
-                                  snap.env.pressureHpa);
-                }
+                Serial.printf("[ENV] temp=%.1fC hum=%.1f%% lux=%.0f press=%.1fhPa\n",
+                              snap.env.tempC, snap.env.humidityPct,
+                              snap.env.lux, snap.env.pressureHpa);
 
                 for (uint8_t i = 0; i < g_config.numPots; ++i) {
                     if (!g_config.pots[i].enabled) continue;
@@ -1125,7 +1015,7 @@ static void controlTaskFn(void* /*param*/) {
                         case WateringPhase::IDLE:          phaseStr = "IDLE"; break;
                         case WateringPhase::EVALUATING:    phaseStr = "EVAL"; break;
                         case WateringPhase::PULSE:         phaseStr = "PULSE"; break;
-                        case WateringPhase::STOPPING:      phaseStr = "STOPPING"; break;
+                        case WateringPhase::STOPPING:      phaseStr = "STOP"; break;
                         case WateringPhase::SOAK:          phaseStr = "SOAK"; break;
                         case WateringPhase::MEASURING:     phaseStr = "MEAS"; break;
                         case WateringPhase::OVERFLOW_WAIT: phaseStr = "OFLOW"; break;
@@ -1139,12 +1029,6 @@ static void controlTaskFn(void* /*param*/) {
                                   i,
                                   pumpOwnerName(g_actuator.currentPumpOwner[i]),
                                   g_manual.locked ? "YES" : "no");
-                    Serial.printf("[POT%d] pump_stop pending=%s fault=%d retries=%u reason=%d\n",
-                                  i,
-                                  g_actuator.pumpStop[i].pending ? "yes" : "no",
-                                  static_cast<int>(g_actuator.pumpStop[i].faultState),
-                                  static_cast<unsigned>(g_actuator.pumpStop[i].retryCount),
-                                  static_cast<int>(g_actuator.pumpStop[i].reason));
 
                     if (cyc.phase == WateringPhase::IDLE && g_config.mode == Mode::AUTO) {
                         const PlantProfile& pr = getActiveProfile(g_config, i);
@@ -1182,14 +1066,12 @@ static void controlTaskFn(void* /*param*/) {
                         }
                     }
 
-                    Serial.printf("[POT%d] overflow=%s raw=%s pend=%s reservoir=%s raw=%s pend=%s\n",
+                    Serial.printf("[POT%d] overflow=%s reservoir=%s\n",
                                   i,
-                                  waterLevelStateName(ps.waterGuards.potMax),
-                                  waterLevelStateName(ps.waterGuards.potMaxStatus.rawState),
-                                  waterLevelPendingName(ps.waterGuards.potMaxStatus),
-                                  waterLevelStateName(ps.waterGuards.reservoirMin),
-                                  waterLevelStateName(ps.waterGuards.reservoirMinStatus.rawState),
-                                  waterLevelPendingName(ps.waterGuards.reservoirMinStatus));
+                                  ps.waterGuards.potMax == WaterLevelState::OK ? "OK" :
+                                  ps.waterGuards.potMax == WaterLevelState::TRIGGERED ? "TRIG" : "UNK",
+                                  ps.waterGuards.reservoirMin == WaterLevelState::OK ? "OK" :
+                                  ps.waterGuards.reservoirMin == WaterLevelState::TRIGGERED ? "TRIG" : "UNK");
                     if (cyc.phase != WateringPhase::IDLE && cyc.phase != WateringPhase::DONE) {
                         Serial.printf("[POT%d] pulse=%d/%d pumped=%.1fml phaseSince=%ds\n",
                                       i, cyc.pulseCount, cyc.maxPulses,
@@ -1217,9 +1099,8 @@ static void controlTaskFn(void* /*param*/) {
                     case DuskPhase::DAY:             duskStr = "DAY"; break;
                     case DuskPhase::DUSK_TRANSITION: duskStr = "DUSK_TR"; break;
                 }
-                Serial.printf("[DUSK] phase=%s dawnScore=%.2f duskScore=%.2f frozen=%s samples=%d\n",
+                Serial.printf("[DUSK] phase=%s dawnScore=%.2f duskScore=%.2f samples=%d\n",
                               duskStr, g_duskDetector.dawnScore, g_duskDetector.duskScore,
-                              g_duskDetector.learningFrozen ? "yes" : "no",
                               g_duskDetector.count);
                 if (g_solarClock.calibrated) {
                     Serial.printf("[SOLAR] day=%dh%dm night=%dh%dm cycles=%d\n",
@@ -1238,7 +1119,8 @@ static void controlTaskFn(void* /*param*/) {
         // Independent heartbeat (change-driven + sparse keepalive)
         if (now - lastCtrlAliveEvalMs >= 10000) {
             lastCtrlAliveEvalMs = now;
-            SharedState shared = readSharedState();
+            SharedState shared{};
+            readSharedState(shared);
             uint32_t freeHeap = ESP.getFreeHeap();
             uint32_t digest = ctrlAliveDigest(g_config.mode, shared.wifiConnected, freeHeap);
             bool changed = (!ctrlAliveDigestInit) || (digest != lastCtrlAliveDigest);
@@ -1420,25 +1302,27 @@ static void controlTaskFn(void* /*param*/) {
                 case EventType::REQUEST_PUMP_OFF: {
                     bool any = false;
                     for (uint8_t i = 0; i < g_config.numPots; ++i) {
-                        bool cycleActive = g_cycles[i].phase != WateringPhase::IDLE;
-                        bool pumpOn = g_hardware.pump(i).isOn();
-                        if (pumpOn || cycleActive || g_actuator.pumpStop[i].pending) {
+                        bool cycleActive = controlHasActiveCycle(g_cycles[i]);
+                        bool stopActive = controlPumpStopActive(g_actuator.pumpStop[i]);
+                        if (g_hardware.pump(i).isOn() || stopActive) {
                             any = true;
-                            PumpStopRequest stopReq{};
-                            stopReq.reason = PumpStopReason::REMOTE_STOP;
-                            stopReq.ownerAtRequest = g_actuator.currentPumpOwner[i];
-                            stopReq.accountRuntimeOnSuccess = pumpOn;
-                            stopReq.hasCycleContext = cycleActive;
-                            stopReq.successCyclePhase = WateringPhase::IDLE;
-                            stopReq.clearCycleOnSuccess = cycleActive;
-                            stopReq.publishFailureFeedback = true;
-                            stopReq.publishRecoveryFeedback = true;
-                            requestControlPumpStop(now, i, stopReq);
+                            requestControlPumpStop(now, i,
+                                                   PumpStopReason::REMOTE_STOP,
+                                                   cycleActive,
+                                                   WateringPhase::IDLE,
+                                                   cycleActive,
+                                                   true,
+                                                   true,
+                                                   PumpOwner::REMOTE);
+                        } else if (cycleActive) {
+                            any = true;
+                            g_cycles[i].reset();
+                            g_actuator.currentPumpOwner[i] = PumpOwner::NONE;
+                            g_actuator.lastCycleDoneMs[i] = now;
                         }
                     }
                     g_manual.blueHeldMs = 0;
                     g_manual.blueOwnsPump = false;
-                    g_manual.activePot = 0xFF;
                     g_manual.locked = true;
                     g_manual.lockUntilMs = now + 5000;
                     Serial.printf("[CTRL] event=remote_stop any=%s\n", any ? "yes" : "no");
@@ -1458,6 +1342,19 @@ static void controlTaskFn(void* /*param*/) {
                         startApNonBlocking(g_netConfig, g_netState);
                         publishSharedNetStatus(g_netState.wifiConnected);
                     }
+                    break;
+
+                case EventType::SYSTEM_BOOT:
+                    for (uint8_t i = 0; i < g_config.numPots; ++i) {
+                        requestControlPumpStop(now, i,
+                                               PumpStopReason::STARTUP_SAFE_OFF,
+                                               false,
+                                               WateringPhase::IDLE,
+                                               false,
+                                               false,
+                                               false);
+                    }
+                    publishSharedStateFromControl();
                     break;
 
                 case EventType::SYSTEM_FACTORY_RESET:
@@ -1482,26 +1379,6 @@ static void controlTaskFn(void* /*param*/) {
 
                 default:
                     break;
-            }
-        }
-
-        bool pumpStopWorkActive = false;
-        for (uint8_t i = 0; i < kMaxPots; ++i) {
-            if (g_actuator.pumpStop[i].pending || g_cycles[i].phase == WateringPhase::STOPPING) {
-                pumpStopWorkActive = true;
-                break;
-            }
-        }
-        if (pumpStopWorkActive) {
-            servicePumpStopRequests(now, g_config, g_cycles, g_budget, g_actuator, g_hardware);
-            if (g_budget.totalPumpedMl != prevTotalPumped) {
-                prevTotalPumped = g_budget.totalPumpedMl;
-                s_runtimeDirty = true;
-                saveRuntimeNow(lastRuntimeSave);
-            }
-            if ((now - lastPumpStopPublishMs) >= 25 || !pumpStopWorkActive) {
-                publishSharedStateFromControl();
-                lastPumpStopPublishMs = now;
             }
         }
 
@@ -1687,10 +1564,13 @@ static void uiTaskFn(void* /*param*/) {
     uiInit();
     setSelectedPotFromUi(g_uiState.selectedPot);
 
+    static SharedState shared{};
+    static UiSnap uSnap{};
+
     for (;;) {
         uint32_t now = millis();
         M5.update();
-        SharedState shared = readSharedState();
+        readSharedState(shared);
 
         // --- Factory reset check ---
         checkFactoryReset(now);
@@ -1756,11 +1636,9 @@ static void uiTaskFn(void* /*param*/) {
             (now - g_uiState.lastRedrawMs) >= UiState::kMinRedrawIntervalMs) {
 
             // Zbuduj UiSnap
-            UiSnap uSnap{};
-            uSnap.sensors       = readSnapshot();
+            readSnapshot(uSnap.sensors);
             memcpy(uSnap.cycles, shared.cycles, sizeof(shared.cycles));
             memcpy(uSnap.pumpStop, shared.pumpStop, sizeof(shared.pumpStop));
-            memcpy(uSnap.currentPumpOwner, shared.currentPumpOwner, sizeof(shared.currentPumpOwner));
             uSnap.budget        = shared.budget;
             uSnap.config        = shared.config;
             uSnap.netConfig     = shared.netConfig;
@@ -1788,11 +1666,9 @@ static void netTaskFn(void* /*param*/) {
     static SensorSnapshot latestSnap{};
     static DailyReportData rptData{};
     static TelegramStatusData tgData{};
-    static char heartbeatBuf[1024];
+    static char heartbeatBuf[512];
     static uint32_t s_lastFeedbackBacklogLogMs = 0;
     static uint32_t s_lastFeedbackDeferredLogMs = 0;
-    static constexpr uint32_t kStartupHeartbeatDelayMs = 5UL * 60 * 1000;
-    static constexpr uint32_t kStartupHeartbeatRetryMs = 5UL * 60 * 1000;
 
     for (;;) {
         uint32_t now = millis();
@@ -1802,15 +1678,12 @@ static void netTaskFn(void* /*param*/) {
 
         // Heartbeat check
         if (g_netState.wifiConnected && g_netState.telegramEnabled) {
-            shared = readSharedState();
-            latestSnap = readSnapshot();
+            readSharedState(shared);
+            readSnapshot(latestSnap);
 
             tgData.sensors = latestSnap;
             tgData.budget = shared.budget;
             memcpy(tgData.cycles, shared.cycles, sizeof(shared.cycles));
-            memcpy(tgData.pumpStop, shared.pumpStop, sizeof(shared.pumpStop));
-            memcpy(tgData.currentPumpOwner, shared.currentPumpOwner, sizeof(shared.currentPumpOwner));
-            memcpy(tgData.lastPumpActivityMs, shared.lastPumpActivityMs, sizeof(shared.lastPumpActivityMs));
             memcpy(tgData.lastCycleDoneMs, shared.lastCycleDoneMs, sizeof(shared.lastCycleDoneMs));
             memcpy(tgData.lastFeedbackSeq, shared.lastFeedbackSeq, sizeof(shared.lastFeedbackSeq));
             memcpy(tgData.lastFeedbackCode, shared.lastFeedbackCode, sizeof(shared.lastFeedbackCode));
@@ -1829,54 +1702,34 @@ static void netTaskFn(void* /*param*/) {
             // żeby backlog feedbacku nie opóźniał odpowiedzi inline.
             telegramPollCommands(now, g_netConfig, tgData);
 
-            auto sendHeartbeatReport = [&](DailyReportData::Kind kind, const char* typeLabel) {
+            uint32_t prevLastHeartbeatMs = g_netState.lastHeartbeatMs;
+            bool prevHeartbeatSentToday = g_netState.heartbeatSentToday;
+            if (isDailyHeartbeatTime(now, g_solarClock, g_duskDetector,
+                                     g_netState)) {
                 rptData.sensors  = latestSnap;
                 rptData.budget   = shared.budget;
                 memcpy(rptData.trends, shared.trends, sizeof(shared.trends));
-                memcpy(rptData.lastPumpActivityMs, shared.lastPumpActivityMs, sizeof(shared.lastPumpActivityMs));
-                memcpy(rptData.lastCycleDoneMs, shared.lastCycleDoneMs, sizeof(shared.lastCycleDoneMs));
-                rptData.pumped24hMl = shared.pumped24hMl;
-                memcpy(rptData.pumped24hMlPerPot, shared.pumped24hMlPerPot, sizeof(shared.pumped24hMlPerPot));
-                rptData.wateringEvents24h = shared.wateringEvents24h;
-                memcpy(rptData.wateringEvents24hPerPot, shared.wateringEvents24hPerPot,
-                       sizeof(shared.wateringEvents24hPerPot));
                 rptData.config   = shared.config;
-                rptData.duskPhase = shared.duskPhase;
-                rptData.solarCalibrated = g_solarClock.calibrated;
-                rptData.kind = kind;
                 rptData.uptimeMs = now;
 
                 formatDailyReport(rptData, heartbeatBuf, sizeof(heartbeatBuf));
-                bool sent = telegramSendInlineMessage(heartbeatBuf, tgData, g_netConfig);
-                if (sent) {
-                    Serial.printf("[NET] event=heartbeat_sent type=%s mode=inline\n", typeLabel);
+                bool sent = false;
+                if (telegramHasActivePanel()) {
+                    sent = telegramSendToActivePanel(heartbeatBuf, tgData, g_netConfig);
+                    if (sent) {
+                        Serial.println("[NET] event=heartbeat_sent mode=inline_panel");
+                    } else {
+                        Serial.println("[NET] event=heartbeat_deferred reason=panel_send_failed");
+                    }
                 } else {
-                    Serial.printf("[NET] event=heartbeat_deferred type=%s reason=inline_send_failed\n",
-                                  typeLabel);
+                    Serial.println("[NET] event=heartbeat_deferred reason=no_active_panel");
                 }
-                return sent;
-            };
-
-            if (!g_netState.startupHeartbeatSent
-                && now >= kStartupHeartbeatDelayMs
-                && (g_netState.lastStartupHeartbeatAttemptMs == 0
-                    || (now - g_netState.lastStartupHeartbeatAttemptMs) >= kStartupHeartbeatRetryMs)) {
-                g_netState.lastStartupHeartbeatAttemptMs = now;
-                if (sendHeartbeatReport(DailyReportData::Kind::STARTUP_CHECK, "startup")) {
-                    g_netState.startupHeartbeatSent = true;
-                }
-            }
-
-            uint32_t prevLastHeartbeatMs = g_netState.lastHeartbeatMs;
-            uint32_t prevLastDailyAnchorMs = g_netState.lastDailyAnchorMs;
-            if (isDailyHeartbeatTime(now, g_solarClock, g_duskDetector,
-                                     g_netState)) {
-                bool sent = sendHeartbeatReport(DailyReportData::Kind::DAILY, "daily");
 
                 if (sent) {
+                    g_netState.heartbeatSentToday = true;
                 } else {
                     g_netState.lastHeartbeatMs = prevLastHeartbeatMs;
-                    g_netState.lastDailyAnchorMs = prevLastDailyAnchorMs;
+                    g_netState.heartbeatSentToday = prevHeartbeatSentToday;
                 }
             }
 
@@ -1937,7 +1790,7 @@ static void netTaskFn(void* /*param*/) {
 // ============================================================================
 
 static constexpr uint32_t kControlStackSize = 12288;
-static constexpr uint32_t kUiStackSize      = 8192;
+static constexpr uint32_t kUiStackSize      = 16384;
 static constexpr uint32_t kNetStackSize     = 12288;
 static constexpr uint32_t kConfigStackSize  = 8192;
 

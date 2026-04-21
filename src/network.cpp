@@ -372,42 +372,6 @@ static void forEachChatId(const char* chatIds, Callback cb) {
     }
 }
 
-bool telegramSendInlineMessage(const char* msg,
-                               const TelegramStatusData& status,
-                               const NetConfig& netCfg) {
-    if (!msg || msg[0] == '\0') {
-        return false;
-    }
-    if (telegramHasActivePanel()) {
-        return telegramSendToActivePanel(msg, status, netCfg);
-    }
-    if (!chatIdListHasAny(netCfg.telegramChatIds) || WiFi.status() != WL_CONNECTED) {
-        return false;
-    }
-
-    buildTelegramPanelKeyboard(status,
-                               TelegramPanelView::MENU,
-                               status.selectedPot,
-                               g_tgKeyboardBuf,
-                               sizeof(g_tgKeyboardBuf));
-
-    bool anyOk = false;
-    forEachChatId(netCfg.telegramChatIds, [&](const char* token) {
-        bool sent = telegramSendInlineKeyboardToChat(String(token),
-                                                     msg,
-                                                     g_tgKeyboardBuf,
-                                                     netCfg,
-                                                     0,
-                                                     1,
-                                                     0,
-                                                     TelegramPanelView::MENU,
-                                                     status.selectedPot,
-                                                     false);
-        anyOk = anyOk || sent;
-    });
-    return anyOk;
-}
-
 void applyLocalTelegramConfig(NetConfig& netCfg) {
     const char* cfgName = netCfg.telegramBotName[0] ? netCfg.telegramBotName : AG_TELEGRAM_BOT_NAME;
     safeCopy(g_tgConfiguredBotName, sizeof(g_tgConfiguredBotName), cfgName);
@@ -507,14 +471,8 @@ static void formatLastFeedback(const TelegramStatusData& data,
         case WateringFeedbackCode::SAFETY_BLOCK_PUMP_CONFIG_INVALID:
             safeCopy(buf, bufSize, "blocked pump_config_invalid");
             break;
-        case WateringFeedbackCode::SAFETY_BLOCK_PUMP_STOP_FAILED:
-            safeCopy(buf, bufSize, "blocked pump_stop_failed");
-            break;
         case WateringFeedbackCode::HARD_TIMEOUT:
             snprintf(buf, bufSize, "hard_timeout %.0fms", data.lastFeedbackValue1[potIdx]);
-            break;
-        case WateringFeedbackCode::PUMP_STOP_RECOVERED:
-            safeCopy(buf, bufSize, "pump_stop_recovered");
             break;
         case WateringFeedbackCode::SAFETY_UNBLOCK:
             safeCopy(buf, bufSize, "safety_unblock");
@@ -547,16 +505,6 @@ static bool telegramWaterBlocked(const TelegramStatusData& status,
     }
     if (status.config.mode != Mode::AUTO) {
         safeCopy(reasonBuf, reasonBufSize, "Blocked: water requires AUTO mode.");
-        return true;
-    }
-
-    if (status.pumpStop[potIdx].pending
-        || status.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
-        safeCopy(reasonBuf,
-                 reasonBufSize,
-                 status.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED
-                     ? "Blocked: pump stop failed, retrying recovery."
-                     : "Blocked: pump stop pending.");
         return true;
     }
 
@@ -600,8 +548,7 @@ static bool telegramWaterBlocked(const TelegramStatusData& status,
             safeCopy(reasonBuf, reasonBufSize, "Blocked: overflow sensor triggered.");
             return true;
         }
-        if (status.config.waterLevelUnknownPolicy == UnknownPolicy::BLOCK
-            && pot.waterGuards.potMax == WaterLevelState::UNKNOWN) {
+        if (pot.waterGuards.potMax == WaterLevelState::UNKNOWN) {
             safeCopy(reasonBuf, reasonBufSize, "Blocked: overflow sensor unknown.");
             return true;
         }
@@ -609,8 +556,7 @@ static bool telegramWaterBlocked(const TelegramStatusData& status,
             safeCopy(reasonBuf, reasonBufSize, "Blocked: reservoir sensor triggered.");
             return true;
         }
-        if (status.config.waterLevelUnknownPolicy == UnknownPolicy::BLOCK
-            && pot.waterGuards.reservoirMin == WaterLevelState::UNKNOWN) {
+        if (pot.waterGuards.reservoirMin == WaterLevelState::UNKNOWN) {
             safeCopy(reasonBuf, reasonBufSize, "Blocked: reservoir sensor unknown.");
             return true;
         }
@@ -666,11 +612,7 @@ static void telegramWaterButtonLabel(const TelegramStatusData& status,
         return;
     }
 
-    if (status.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
-        safeCopy(buf, bufSize, "\xF0\x9F\x9A\xAB Stop fault");
-    } else if (status.cycles[potIdx].phase == WateringPhase::STOPPING) {
-        safeCopy(buf, bufSize, "\xE2\x8F\xB9 Stopping...");
-    } else if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
+    if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
         safeCopy(buf, bufSize, "\xF0\x9F\x92\xA7 Watering...");
     } else if (strstr(reason, "already wet") != nullptr || strstr(reason, "above max") != nullptr) {
         safeCopy(buf, bufSize, "\xE2\x9C\x85 Wet enough");
@@ -938,7 +880,7 @@ static void formatTelegramMenuSummary(const TelegramStatusData& data, char* buf,
         char actionLine[96] = {};
         char sinceBuf[24] = {};
         formatPotActionLine(data, i, actionLine, sizeof(actionLine));
-        formatElapsedShort(data.uptimeMs, data.lastPumpActivityMs[i], sinceBuf, sizeof(sinceBuf));
+        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
         float last1h = trendRecentAverage(data.trends[i], 1);
 
         pos = appendFmt(buf, bufSize, pos, "\n🪴 POT %u | %s%s\n",
@@ -953,7 +895,7 @@ static void formatTelegramMenuSummary(const TelegramStatusData& data, char* buf,
                         isnan(last1h) ? 0.0f : last1h);
         pos = appendFmt(buf, bufSize, pos,
                         "  action %s\n"
-                        "  ovf %s | pump %s\n",
+                        "  ovf %s | last %s\n",
                         actionLine,
                         telegramWaterLevelStateShort(data.sensors.pots[i].waterGuards.potMax),
                         sinceBuf);
@@ -1161,7 +1103,6 @@ static const char* telegramCyclePhaseShort(WateringPhase phase) {
         case WateringPhase::IDLE: return "IDLE";
         case WateringPhase::EVALUATING: return "EVAL";
         case WateringPhase::PULSE: return "PULSE";
-        case WateringPhase::STOPPING: return "STOP";
         case WateringPhase::SOAK: return "SOAK";
         case WateringPhase::MEASURING: return "MEAS";
         case WateringPhase::OVERFLOW_WAIT: return "OFLOW";
@@ -1274,11 +1215,7 @@ static void formatPotActionLine(const TelegramStatusData& status,
         return;
     }
 
-    if (status.pumpStop[potIdx].faultState == PumpStopFaultState::STOP_FAILED_LATCHED) {
-        safeCopy(buf, bufSize, "pump stop fault");
-    } else if (status.cycles[potIdx].phase == WateringPhase::STOPPING) {
-        safeCopy(buf, bufSize, "stopping pump");
-    } else if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
+    if (status.cycles[potIdx].phase != WateringPhase::IDLE) {
         safeCopy(buf, bufSize, "watering active");
     } else if (cooldownRemainingMs > 0) {
         snprintf(buf, bufSize, "cooldown / %lus left",
@@ -1515,7 +1452,7 @@ static void formatTelegramHistoryReport(const TelegramStatusData& data,
         const TrendState& ts = data.trends[i];
         const PlantProfile& prof = getActiveProfile(data.config, i);
         char sinceBuf[24] = {};
-        formatElapsedShort(data.uptimeMs, data.lastPumpActivityMs[i], sinceBuf, sizeof(sinceBuf));
+        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
 
         pos = appendFmt(buf, bufSize, pos, "\n🪴 POT %u | %s\n",
                         static_cast<unsigned>(i + 1),
@@ -1525,7 +1462,7 @@ static void formatTelegramHistoryReport(const TelegramStatusData& data,
                         data.sensors.pots[i].moisturePct,
                         data.sensors.pots[i].moistureEma,
                         data.budget.totalPumpedMlPerPot[i]);
-        pos = appendFmt(buf, bufSize, pos, "  last pump %s\n", sinceBuf);
+        pos = appendFmt(buf, bufSize, pos, "  last cycle %s\n", sinceBuf);
 
         if (ts.count > 0) {
             float last1h = trendRecentAverage(ts, 1);
@@ -1603,7 +1540,7 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
         char actionLine[96] = {};
         char lastState[64] = {};
         char sinceBuf[24] = {};
-        formatElapsedShort(data.uptimeMs, data.lastPumpActivityMs[i], sinceBuf, sizeof(sinceBuf));
+        formatElapsedShort(data.uptimeMs, data.lastCycleDoneMs[i], sinceBuf, sizeof(sinceBuf));
         formatPotActionLine(data, i, actionLine, sizeof(actionLine));
         formatLastFeedback(data, i, lastState, sizeof(lastState));
         if (data.config.vacationMode) {
@@ -1611,16 +1548,13 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
             if (targetPct < 5.0f) targetPct = 5.0f;
         }
         float last1h = trendRecentAverage(data.trends[i], 1);
-        const char* phaseShort = (data.pumpStop[i].pending && data.cycles[i].phase == WateringPhase::IDLE)
-            ? "STOP"
-            : telegramCyclePhaseShort(data.cycles[i].phase);
         pos = appendFmt(buf, bufSize, pos,
                 "\n🪴 POT %u | %s%s\n"
                         "  water %.1f%% | target %.1f%% | ema %.1f%%\n"
                         "  trend %s %.2f%%/h | raw %u | exp %.2f\n"
                         "  dry/wet %u/%u | phase %s | pulses %u\n"
                         "  action %s\n"
-                    "  ovf %s | res %s | pump %s (%s)\n",
+                        "  ovf %s | res %s | last %s (%s)\n",
                         static_cast<unsigned>(i + 1),
                         prof.name ? prof.name : "?",
                         (i == data.selectedPot) ? " [selected]" : "",
@@ -1633,7 +1567,7 @@ void formatTelegramStatusReport(const TelegramStatusData& data, char* buf, size_
                         data.config.pots[i].moistureCurveExponent,
                         data.config.pots[i].moistureDryRaw,
                         data.config.pots[i].moistureWetRaw,
-                        phaseShort,
+                        telegramCyclePhaseShort(data.cycles[i].phase),
                         data.cycles[i].pulseCount,
                         actionLine,
                         telegramWaterLevelStateShort(data.sensors.pots[i].waterGuards.potMax),
@@ -1662,7 +1596,7 @@ static bool pushConfigEvent(EventType type, uint8_t key, uint16_t valueU16, floa
 
 static bool anyWateringActive(const TelegramStatusData& status) {
     for (uint8_t i = 0; i < status.config.numPots; ++i) {
-        if (status.cycles[i].phase != WateringPhase::IDLE || status.pumpStop[i].pending) {
+        if (status.cycles[i].phase != WateringPhase::IDLE) {
             return true;
         }
     }
@@ -1862,12 +1796,9 @@ static bool handleTelegramCallback(const telegramMessage& message,
                          ? "Stop requested. Active watering is being forced OFF."
                          : "Stop requested, but nothing is active right now.");
             for (uint8_t i = 0; i < replyStatus.config.numPots; ++i) {
-                if (replyStatus.cycles[i].phase != WateringPhase::IDLE || replyStatus.currentPumpOwner[i] != PumpOwner::NONE) {
-                    replyStatus.cycles[i].phase = WateringPhase::STOPPING;
-                    replyStatus.cycles[i].phaseStartMs = replyStatus.uptimeMs;
-                    replyStatus.pumpStop[i].pending = true;
-                    replyStatus.pumpStop[i].faultState = PumpStopFaultState::STOP_PENDING;
-                    replyStatus.pumpStop[i].reason = PumpStopReason::REMOTE_STOP;
+                if (replyStatus.cycles[i].phase != WateringPhase::IDLE) {
+                    replyStatus.cycles[i].reset();
+                    replyStatus.lastCycleDoneMs[i] = replyStatus.uptimeMs;
                 }
             }
         } else {
@@ -2776,57 +2707,26 @@ void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize) {
     formatDurationCompact(data.uptimeMs, uptimeBuf, sizeof(uptimeBuf));
     formatDaysRemainingShort(data.budget.daysRemaining, daysBuf, sizeof(daysBuf));
 
-    float estimatedDays = NAN;
-    if (!isnan(data.budget.daysRemaining) && data.budget.daysRemaining < 900.0f) {
-        estimatedDays = data.budget.daysRemaining;
-    } else if (data.pumped24hMl > 1.0f) {
-        estimatedDays = data.budget.reservoirCurrentMl / data.pumped24hMl;
-    }
-
-    const char* title = (data.kind == DailyReportData::Kind::STARTUP_CHECK)
-        ? "▣ DAILY REPORT [startup check]\n"
-        : "▣ DAILY REPORT\n";
-
     pos = appendFmt(buf, bufSize, pos,
-                    "%s"
+                    "▣ DAILY REPORT\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
-                    "🪣 %.0f / %.0f ml%s\n"
-                    "📉 24h use %.0f ml / %u cycles | ",
-                    title,
+                    "🪣 %.0f / %.0f ml | left %s%s\n"
+                    "🌡 %.1fC | 💧 %.0f%% | ☀ %.0f lx\n"
+                    "⏱ %s\n",
                     data.budget.reservoirCurrentMl,
                     data.budget.reservoirCapacityMl,
+                    daysBuf,
                     data.budget.reservoirLow ? " | LOW" : "",
-                    data.pumped24hMl,
-                    static_cast<unsigned>(data.wateringEvents24h));
-
-    if (!isnan(estimatedDays)) {
-        pos = appendFmt(buf, bufSize, pos, "est %.1fd\n", estimatedDays);
-    } else {
-        pos = appendFmt(buf, bufSize, pos, "est learning\n");
-    }
-
-    pos = appendFmt(buf, bufSize, pos,
-                    "🌗 %s | solar %s | ⏱ %s\n"
-                    "🌡 %.1fC | 💧 %.0f%% | ☀ %.0f lx\n",
-                    telegramDuskPhasePretty(data.duskPhase),
-                    data.solarCalibrated ? "cal" : "learn",
-                    uptimeBuf,
                     data.sensors.env.tempC,
                     data.sensors.env.humidityPct,
-                    data.sensors.env.lux);
-
-    if (data.kind == DailyReportData::Kind::STARTUP_CHECK) {
-        pos = appendFmt(buf, bufSize, pos,
-                        "🕘 schedule boot+5m, then dawn+3h\n");
-    }
+                    data.sensors.env.lux,
+                    uptimeBuf);
 
     for (uint8_t i = 0; i < data.config.numPots; ++i) {
         if (!data.config.pots[i].enabled) continue;
         const PotSensorSnapshot& ps = data.sensors.pots[i];
         const PlantProfile& prof = getActiveProfile(data.config, i);
         const TrendState& ts = data.trends[i];
-        char sinceBuf[24] = {};
-        formatElapsedShort(data.uptimeMs, data.lastPumpActivityMs[i], sinceBuf, sizeof(sinceBuf));
         float targetPct = prof.targetMoisturePct;
         if (data.config.vacationMode) {
             targetPct -= data.config.vacationTargetReductionPct;
@@ -2835,26 +2735,19 @@ void formatDailyReport(const DailyReportData& data, char* buf, size_t bufSize) {
 
         pos = appendFmt(buf, bufSize, pos,
                 "\n🪴 POT %u | %s\n"
-                        "  water %.1f%% | target %.1f%% | ema %.1f%%\n"
-                    "  24h water %.0f ml / %u cycles | pump %s\n",
+                        "  water %.1f%% | target %.1f%% | ema %.1f%%\n",
                         static_cast<unsigned>(i + 1),
                         prof.name ? prof.name : "?",
                         ps.moisturePct,
                         targetPct,
-                        ps.moistureEma,
-                        data.pumped24hMlPerPot[i],
-                        static_cast<unsigned>(data.wateringEvents24hPerPot[i]),
-                        sinceBuf);
+                        ps.moistureEma);
 
         if (ts.baselineCalibrated && ts.count > 0) {
             uint8_t lastIdx = (ts.headIdx == 0) ? (TrendState::kHours - 1) : (ts.headIdx - 1);
-            float avg6h = trendRecentAverage(ts, 6);
             pos = appendFmt(buf, bufSize, pos,
-                            "  trend 1h %s %.2f | 6h %s %.2f | base %.2f %%/h\n",
+                            "  trend %s %.2f%%/h | base %.2f%%/h\n",
                             telegramTrendArrow(ts.hourlyDeltas[lastIdx]),
                             ts.hourlyDeltas[lastIdx],
-                            telegramTrendArrow(avg6h),
-                            avg6h,
                             ts.normalDryingRate);
         } else {
             pos = appendFmt(buf, bufSize, pos, "  trend learning baseline\n");
@@ -2870,53 +2763,34 @@ bool isDailyHeartbeatTime(uint32_t nowMs, const SolarClock& clk,
                           const DuskDetector& det,
                           NetworkState& ns)
 {
-    static constexpr uint32_t kDailyHeartbeatMinGapMs = 20UL * 3600 * 1000;
-    static constexpr uint32_t kDailyHeartbeatOffsetMs = 3UL * 3600 * 1000;
-    static constexpr uint32_t kDailyHeartbeatWindowMs = 10UL * 60 * 1000;
-
-    // Debounce: max 1 daily heartbeat per ~day window.
+    // Debounce: max 1 heartbeat per 20h
     if (ns.lastHeartbeatMs > 0 &&
-        (nowMs - ns.lastHeartbeatMs) < kDailyHeartbeatMinGapMs) {
+        (nowMs - ns.lastHeartbeatMs) < 20UL * 3600 * 1000) {
         return false;
     }
 
-    // Strategy 1: SolarClock (3h after dawn).
+    // Strategy 1: SolarClock (dawn + 30 min)
     if (clk.calibrated) {
-        uint32_t targetDawnMs = 0;
-        uint32_t targetMs = 0;
-
-        if ((det.phase == DuskPhase::DAY || det.phase == DuskPhase::DUSK_TRANSITION)
-            && det.lastDawnMs > 0) {
-            uint32_t todayTargetMs = det.lastDawnMs + kDailyHeartbeatOffsetMs;
-            if (nowMs <= (todayTargetMs + kDailyHeartbeatWindowMs)) {
-                targetDawnMs = det.lastDawnMs;
-                targetMs = todayTargetMs;
-            }
-        }
-
-        if (targetMs == 0) {
-            uint32_t estDawn = estimateNextDawn(det, clk, nowMs);
-            if (estDawn > 0) {
-                targetDawnMs = estDawn;
-                targetMs = estDawn + kDailyHeartbeatOffsetMs;
-            }
-        }
-
-        if (targetMs > 0) {
-            int32_t diff = static_cast<int32_t>(nowMs - targetMs);
-            if (abs(diff) <= static_cast<int32_t>(kDailyHeartbeatWindowMs)
-                && ns.lastDailyAnchorMs != targetDawnMs) {
-                ns.lastDailyAnchorMs = targetDawnMs;
-                ns.lastHeartbeatMs = nowMs;
-                return true;
+        uint32_t estDawn = estimateNextDawn(det, clk, nowMs);
+        if (estDawn > 0) {
+            uint32_t target = estDawn + 30UL * 60 * 1000;
+            int32_t diff = static_cast<int32_t>(nowMs - target);
+            if (abs(diff) < 5 * 60 * 1000) {
+                if (!ns.heartbeatSentToday) {
+                    ns.heartbeatSentToday = true;
+                    ns.lastHeartbeatMs = nowMs;
+                    return true;
+                }
+            } else {
+                ns.heartbeatSentToday = false;
             }
             return false;
         }
     }
 
-    // Strategy 2: fallback — every 24h of uptime.
+    // Strategy 2: fallback — every 24h from last heartbeat (or 5 min from boot)
     if (ns.lastHeartbeatMs == 0) {
-        if (nowMs >= 24UL * 3600 * 1000) {
+        if (nowMs > 5UL * 60 * 1000) {
             ns.lastHeartbeatMs = nowMs;
             return true;
         }

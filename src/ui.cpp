@@ -587,8 +587,9 @@ void uiInit() {
         C.setTextWrap(false);
         C.setTextColor(COL_TEXT);
     }
-    Serial.printf("[UI] sprite %s (%dx%d)\n",
-                  _canvasReady ? "OK" : "FAIL", SCR_W, SCR_H);
+    Serial.println(_canvasReady
+                       ? "[UI] event=sprite result=ok size=135x240"
+                       : "[UI] event=sprite result=fail size=135x240");
 }
 
 // ---------------------------------------------------------------------------

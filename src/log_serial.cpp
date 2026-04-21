@@ -7,6 +7,17 @@
 #include <cstdio>
 #include <cstring>
 
+struct LogScratch {
+    char printfBuffer[768];
+    char sanitized[768];
+    char escaped[768];
+    char normalized[832];
+    char payload[896];
+    char fullLine[1024];
+};
+
+static LogScratch s_logScratch;
+
 static bool containsEventKey(const char* s) {
     return s && strstr(s, "event=") != nullptr;
 }
@@ -110,7 +121,11 @@ static void escapeForQuotes(const char* in, char* out, size_t outSize) {
     out[w] = '\0';
 }
 
-static const char* normalizeLogLine(const char* in, char* out, size_t outSize) {
+static const char* normalizeLogLine(const char* in,
+                                    char* escaped,
+                                    size_t escapedSize,
+                                    char* out,
+                                    size_t outSize) {
     if (!in) {
         if (outSize > 0) out[0] = '\0';
         return out;
@@ -127,16 +142,14 @@ static const char* normalizeLogLine(const char* in, char* out, size_t outSize) {
             size_t tagLen = static_cast<size_t>(end - t + 1);
             const char* msg = skipSpaces(end + 1);
             if (*msg == ':' || *msg == '-') msg = skipSpaces(msg + 1);
-            char escaped[768];
-            escapeForQuotes(msg, escaped, sizeof(escaped));
+            escapeForQuotes(msg, escaped, escapedSize);
             snprintf(out, outSize, "%.*s event=msg text=\"%s\"",
                      static_cast<int>(tagLen), t, escaped);
             return out;
         }
     }
 
-    char escaped[768];
-    escapeForQuotes(t, escaped, sizeof(escaped));
+    escapeForQuotes(t, escaped, escapedSize);
     snprintf(out, outSize, "[LOG] event=msg text=\"%s\"", escaped);
     return out;
 }
@@ -163,59 +176,65 @@ static uint32_t nextLogSeq() {
     return seq;
 }
 
-static size_t writePrefixedLines(const char* text) {
+static bool takeLogMutex() {
+    ensureLogMutex();
+    if (!s_logMutex) {
+        return false;
+    }
+    xSemaphoreTake(s_logMutex, portMAX_DELAY);
+    return true;
+}
+
+static void giveLogMutex(bool locked) {
+    if (locked && s_logMutex) {
+        xSemaphoreGive(s_logMutex);
+    }
+}
+
+static size_t writePrefixedLinesLocked(const char* text) {
     if (!text) {
         return 0;
     }
 
-    ensureLogMutex();
-    bool locked = true;
-    if (s_logMutex) {
-        xSemaphoreTake(s_logMutex, portMAX_DELAY);
-    } else {
-        locked = false;
-    }
-
     size_t outBytes = 0;
-
-    char sanitized[768];
     bool hadEmbeddedNewline = false;
     bool truncated = false;
-    sanitizeLogRecord(text, sanitized, sizeof(sanitized), hadEmbeddedNewline, truncated);
+    sanitizeLogRecord(text,
+                      s_logScratch.sanitized,
+                      sizeof(s_logScratch.sanitized),
+                      hadEmbeddedNewline,
+                      truncated);
 
-    char normalized[832];
-    const char* finalLine = normalizeLogLine(sanitized, normalized, sizeof(normalized));
+    const char* finalLine = normalizeLogLine(s_logScratch.sanitized,
+                                             s_logScratch.escaped,
+                                             sizeof(s_logScratch.escaped),
+                                             s_logScratch.normalized,
+                                             sizeof(s_logScratch.normalized));
 
-    char payload[896];
-    int payloadLen = snprintf(payload, sizeof(payload), "%s", finalLine);
+    int payloadLen = snprintf(s_logScratch.payload, sizeof(s_logScratch.payload), "%s", finalLine);
     if (payloadLen < 0) {
-        payload[0] = '\0';
+        s_logScratch.payload[0] = '\0';
     }
     if (hadEmbeddedNewline) {
-        forceTailMarker(payload, sizeof(payload), " multiline=yes");
+        forceTailMarker(s_logScratch.payload, sizeof(s_logScratch.payload), " multiline=yes");
     }
-    if (truncated || payloadLen >= static_cast<int>(sizeof(payload))) {
-        forceTailMarker(payload, sizeof(payload), " trunc=yes");
+    if (truncated || payloadLen >= static_cast<int>(sizeof(s_logScratch.payload))) {
+        forceTailMarker(s_logScratch.payload, sizeof(s_logScratch.payload), " trunc=yes");
     }
 
-    char fullLine[1024];
-    int fullLen = snprintf(fullLine, sizeof(fullLine), "[%10lu|%06lu] %s\n",
+    int fullLen = snprintf(s_logScratch.fullLine, sizeof(s_logScratch.fullLine), "[%10lu|%06lu] %s\n",
                            static_cast<unsigned long>(millis()),
                            static_cast<unsigned long>(nextLogSeq()),
-                           payload[0] != '\0' ? payload : "[LOG] event=msg text=\"\"");
+                           s_logScratch.payload[0] != '\0' ? s_logScratch.payload : "[LOG] event=msg text=\"\"");
     if (fullLen > 0) {
         size_t writeLen = static_cast<size_t>(fullLen);
-        if (writeLen >= sizeof(fullLine)) {
-            writeLen = sizeof(fullLine) - 1;
-            fullLine[writeLen - 1] = '\n';
-            fullLine[writeLen] = '\0';
+        if (writeLen >= sizeof(s_logScratch.fullLine)) {
+            writeLen = sizeof(s_logScratch.fullLine) - 1;
+            s_logScratch.fullLine[writeLen - 1] = '\n';
+            s_logScratch.fullLine[writeLen] = '\0';
         }
-        ::Serial.write(reinterpret_cast<const uint8_t*>(fullLine), writeLen);
+        ::Serial.write(reinterpret_cast<const uint8_t*>(s_logScratch.fullLine), writeLen);
         outBytes += writeLen;
-    }
-
-    if (locked && s_logMutex) {
-        xSemaphoreGive(s_logMutex);
     }
 
     return outBytes;
@@ -241,7 +260,10 @@ size_t LogSerialProxy::println(const char* msg) {
     if (!msg) {
         msg = "";
     }
-    return writePrefixedLines(msg);
+    bool locked = takeLogMutex();
+    size_t outBytes = writePrefixedLinesLocked(msg);
+    giveLogMutex(locked);
+    return outBytes;
 }
 
 size_t LogSerialProxy::printf(const char* fmt, ...) {
@@ -249,22 +271,27 @@ size_t LogSerialProxy::printf(const char* fmt, ...) {
         return 0;
     }
 
-    char buffer[768];
+    bool locked = takeLogMutex();
     va_list args;
     va_start(args, fmt);
-    int n = vsnprintf(buffer, sizeof(buffer), fmt, args);
+    int n = vsnprintf(s_logScratch.printfBuffer, sizeof(s_logScratch.printfBuffer), fmt, args);
     va_end(args);
 
     if (n <= 0) {
+        giveLogMutex(locked);
         return 0;
     }
 
-    if (n >= static_cast<int>(sizeof(buffer))) {
-        buffer[sizeof(buffer) - 1] = '\0';
-        forceTailMarker(buffer, sizeof(buffer), " trunc=yes");
+    if (n >= static_cast<int>(sizeof(s_logScratch.printfBuffer))) {
+        s_logScratch.printfBuffer[sizeof(s_logScratch.printfBuffer) - 1] = '\0';
+        forceTailMarker(s_logScratch.printfBuffer,
+                        sizeof(s_logScratch.printfBuffer),
+                        " trunc=yes");
     }
 
-    return writePrefixedLines(buffer);
+    size_t outBytes = writePrefixedLinesLocked(s_logScratch.printfBuffer);
+    giveLogMutex(locked);
+    return outBytes;
 }
 
 LogSerialProxy AGSerial;
