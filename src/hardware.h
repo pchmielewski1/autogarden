@@ -116,6 +116,13 @@ public:
     // Sterowanie
     bool     digitalWrite(uint8_t channel, uint8_t pin, bool level);
 
+    // Odczyt zatrzaśniętego stanu ostatniego digitalWrite (cmd 0x00/0x01 jako READ
+    // zwraca gpio_digi_write_state[ch][cmd] z STM32 PbHUB — patrz
+    // docs/pbhub_v1.1_firmware_reference.md). Pozwala zweryfikować, czy write
+    // faktycznie dotarł do GPIO, bez zmiany trybu pinu (digitalRead przełączyłby
+    // go na INPUT).
+    bool     readDigitalWriteState(uint8_t channel, uint8_t pin, uint8_t& out);
+
 private:
     uint8_t  _addr = 0x61;
     uint8_t  _delayMs = 10;
@@ -223,6 +230,14 @@ public:
 
     uint32_t onSinceMs()  const { return _onSinceMs; }
     uint32_t onDuration(uint32_t nowMs) const;
+
+    // Defensywna weryfikacja stanu PUMP_EN na busie PbHUB, gdy firmware uważa
+    // że pompa jest OFF. Jeśli readback zwróci HIGH (stracony OFF-write,
+    // glitch I2C lub kolizja z długą operacją PbHUB-a), funkcja zaloguje
+    // [PUMP] SILENT_ON_DETECTED i wymusi ponowny write LOW. Powinna być
+    // wołana cyklicznie (~1 Hz) z głównej pętli bezpieczeństwa.
+    // Zwraca true jeśli wykryto i skorygowano niepożądany stan HIGH.
+    bool pollSilentOn(uint32_t nowMs);
 
 private:
     PbHubBus* _bus = nullptr;

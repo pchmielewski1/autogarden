@@ -764,6 +764,7 @@ static void controlTaskFn(void* /*param*/) {
     SensorSnapshot snap{};
     bool duskBootstrapped = false;  // one-shot lux-based phase check
     uint32_t lastUnexpectedPumpLogMs[kMaxPots] = {};
+    uint32_t lastPumpSilentPollMs[kMaxPots] = {};
 
     for (;;) {
         uint32_t now = millis();
@@ -883,6 +884,18 @@ static void controlTaskFn(void* /*param*/) {
                                   pumpOwnerName(g_actuator.currentPumpOwner[i]),
                                   static_cast<int>(g_cycles[i].phase),
                                   manualOwnsPump ? 1 : 0);
+                }
+
+                // Defensywny polling PbHUB: co ~1s, gdy firmware uważa pompę
+                // za OFF, weryfikuj zatrzaśnięty stan PUMP_EN w STM32 PbHUB.
+                // Wykrywa i koryguje sytuację, gdy OFF-write został zgubiony
+                // (glitch I2C / kolizja z długą operacją PbHUB-a / brown-out)
+                // — dotąd była to cicha awaria (pompa pracowała do następnego
+                // cyklu, ~500 ml wylane poza kontrolą logów).
+                if (!p.isOn() && !stopActive
+                    && (now - lastPumpSilentPollMs[i]) >= 1000) {
+                    lastPumpSilentPollMs[i] = now;
+                    p.pollSilentOn(now);
                 }
             }
 

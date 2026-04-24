@@ -190,6 +190,15 @@ bool PbHubBus::digitalWrite(uint8_t channel, uint8_t pin, bool level) {
     return i2cWrite(cmd, level ? 0x01 : 0x00);
 }
 
+bool PbHubBus::readDigitalWriteState(uint8_t channel, uint8_t pin, uint8_t& out) {
+    // cmd 0x00/0x01 w trybie READ (len==1) zwraca gpio_digi_write_state[ch][cmd]
+    // — zatrzaśnięty stan ostatniego write w STM32 PbHUB. NIE zmienia trybu pinu
+    // (w przeciwieństwie do cmd 0x04/0x05 które przełączają GPIO w INPUT).
+    if (channel >= 6) return false;
+    uint8_t cmd = kChBase[channel] + 0x00 + pin;
+    return i2cRead8(cmd, out);
+}
+
 // ===== SoilMoistureSensor ===================================================
 
 void SoilMoistureSensor::init(PbHubBus* bus, uint8_t channel) {
@@ -668,6 +677,35 @@ bool PumpActuator::off(uint32_t nowMs, const char* reason) {
                           _channel, _pin, reason ? reason : "none");
             return false;
         }
+
+        // Verify-after-write: potwierdź z PbHUB-a, że pin został faktycznie
+        // przełączony w LOW. ACK I2C nie gwarantuje wykonania (kolizja z długą
+        // operacją w Slave_Complete_Callback, glitch EMI, brown-out).
+        uint8_t readback = 0xFF;
+        if (_bus->readDigitalWriteState(_channel, _pin, readback)
+            && (readback & 0x01) != 0) {
+            Serial.printf("[PUMP] CH%d.pin%d OFF_VERIFY_MISMATCH readback=0x%02X reason=%s — retrying\n",
+                          _channel, _pin, readback, reason ? reason : "none");
+            // Pojedynczy retry — jeśli drugi write też nie zadziała, loguj
+            // LATCHED i ZWRÓĆ false, żeby wyższa warstwa (servicePumpStopRequests)
+            // wiedziała, że stop się NIE powiódł i ponowiła próbę.
+            bool retryWriteOk = _bus->digitalWrite(_channel, _pin, false);
+            uint8_t readback2 = 0xFF;
+            bool retryReadOk =
+                _bus->readDigitalWriteState(_channel, _pin, readback2);
+            if (!retryWriteOk || !retryReadOk || (readback2 & 0x01) != 0) {
+                Serial.printf("[PUMP] CH%d.pin%d OFF_VERIFY_FAIL_LATCHED write_ok=%d read_ok=%d readback=0x%02X reason=%s\n",
+                              _channel, _pin,
+                              retryWriteOk ? 1 : 0,
+                              retryReadOk ? 1 : 0,
+                              readback2,
+                              reason ? reason : "none");
+                // Nie zerujemy _isOn — wyższa warstwa zobaczy, że OFF się nie udał.
+                return false;
+            }
+            Serial.printf("[PUMP] CH%d.pin%d OFF_VERIFY_RECOVERED readback=0x%02X reason=%s\n",
+                          _channel, _pin, readback2, reason ? reason : "none");
+        }
     }
     uint32_t dur = _isOn ? (nowMs - _onSinceMs) : 0;
     _isOn = false;
@@ -684,6 +722,47 @@ bool PumpActuator::isOn() const { return _isOn; }
 uint32_t PumpActuator::onDuration(uint32_t nowMs) const {
     if (!_isOn) return 0;
     return nowMs - _onSinceMs;
+}
+
+bool PumpActuator::pollSilentOn(uint32_t nowMs) {
+    // Ta metoda wykrywa stan, w którym firmware uważa pompę za OFF (_isOn==false),
+    // ale fizyczny PUMP_EN na PbHUB-ie jest HIGH. Taka rozbieżność może wystąpić,
+    // gdy wcześniejszy OFF-write został zgubiony (glitch I2C, kolizja z długą
+    // operacją STM32 PbHUB, brown-out) — a bez tej weryfikacji pompa cicho
+    // pracuje aż do następnego cyklu.
+    //
+    // Jeśli _isOn==true, obsługą zajmuje się normalny servicePumpStopRequests /
+    // hardware safety timeout, więc nie robimy tu nic.
+    if (_isOn) return false;
+    if (!_bus) return false;
+
+    uint8_t readback = 0xFF;
+    if (!_bus->readDigitalWriteState(_channel, _pin, readback)) {
+        // Brak odpowiedzi z PbHUB — nie rób nic (inne ścieżki logują I2C fail).
+        return false;
+    }
+    if ((readback & 0x01) == 0) {
+        return false;  // pin faktycznie LOW — wszystko OK
+    }
+
+    Serial.printf("[PUMP] CH%d.pin%d SILENT_ON_DETECTED readback=0x%02X — forcing OFF\n",
+                  _channel, _pin, readback);
+
+    bool writeOk = _bus->digitalWrite(_channel, _pin, false);
+    uint8_t readback2 = 0xFF;
+    bool readOk = _bus->readDigitalWriteState(_channel, _pin, readback2);
+    if (!writeOk || !readOk || (readback2 & 0x01) != 0) {
+        Serial.printf("[PUMP] CH%d.pin%d SILENT_ON_LATCHED write_ok=%d read_ok=%d readback=0x%02X\n",
+                      _channel, _pin,
+                      writeOk ? 1 : 0,
+                      readOk ? 1 : 0,
+                      readback2);
+        return true;  // wykryto, ale nie udało się naprawić
+    }
+    Serial.printf("[PUMP] CH%d.pin%d SILENT_ON_RECOVERED readback=0x%02X\n",
+                  _channel, _pin, readback2);
+    (void)nowMs;
+    return true;
 }
 
 // ===== DualButton ===========================================================
